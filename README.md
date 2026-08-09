@@ -85,6 +85,8 @@ would otherwise defeat the point of encrypting the file:
 | `jsonyter-use-is-complete` | `t` | Ask the kernel whether input is complete before sending on RET. |
 | `jsonyter-exec-timeout` | `nil` | Kernel-silence timeout passed to the bridge; `nil` waits indefinitely (right for SAS's slow startup). |
 | `jsonyter-image-max-width` | `800` | Max pixel width for inline images. |
+| `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
+| `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
 | `jsonyter-insecure-tls` | `nil` | Skip TLS verification (self-signed remote servers). |
 | `jsonyter-shutdown-on-kill` | `t` | Shut the kernel down when the REPL buffer is killed. |
@@ -112,6 +114,7 @@ Keys in the REPL buffer:
 | `C-c C-r` | Restart the kernel |
 | `C-c C-q` | Shut the kernel down |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |
+| `C-c C-k` | Reset a REPL stuck at "kernel is busy" |
 | `C-c M-o` | Clear output above the prompt |
 
 Code that calls `input()` prompts in the minibuffer (passwords use
@@ -135,6 +138,15 @@ Insertion never steals point: a window scrolls with new output only if it
 was already at the end, so you can read back through the buffer while a
 cell is still running.
 
+Images taller than one text line are inserted **sliced**, one slice per
+line (the technique `doc-view` uses for page images). Emacs scrolls by
+whole lines, and an image inserted the ordinary way occupies a single
+line however tall it is — so a tall plot is all-or-nothing: scrolling
+either steps clean over it or lands mid-image showing only its bottom
+edge. Slicing lets ordinary line scrolling walk through a plot like
+normal text. Set `jsonyter-slice-images` to nil to opt out, or
+`jsonyter-image-max-height` to shrink tall plots to fit instead.
+
 ## Kernel state
 
 The mode line reports the kernel's real state, pushed from the bridge's
@@ -151,6 +163,35 @@ event subscription rather than polled:
 
 A kernel killed out from under the REPL (say, shut down from a notebook UI)
 reports itself as dead in the buffer instead of hanging the next execute.
+
+## Kernel quirks this handles
+
+Kernels vary in how faithfully they implement the messaging protocol, and
+two behaviours are worth knowing about because they used to break the
+REPL outright:
+
+- **`is_complete` is asked about newline-terminated code.** The SAS
+  kernel calls anything without a trailing newline "incomplete" —
+  including the empty string — so `RET` could never submit SAS at all.
+  Terminating the code first fixes SAS and also fixes Python, where
+  `def f():\n    return 1` reads as incomplete bare but complete when
+  terminated. Genuinely unfinished input still reports incomplete on
+  every kernel, so nothing is submitted early. Use `C-j` for a literal
+  newline, or `M-RET` to force-send.
+- **Short kernel requests carry an explicit timeout.** The bridge
+  serializes requests per kernel and waits forever by default, so a
+  kernel that never answers a message type would block that kernel's
+  worker permanently and queue every later execute behind it — the REPL
+  appearing hung with the kernel stuck "busy". SAS never answers
+  `history` and answers `inspect` with `aborted`, so this was reachable
+  in practice. `is_complete`/`complete`/`inspect` now bound the wait on
+  the bridge side and recover on their own. `C-c C-k` is the manual
+  escape hatch if a prompt still gets stuck.
+
+SAS is also slow on first contact: its first execute spends ~17s
+establishing the SAS subprocess before producing output. That is the
+kernel warming up, not a hang — streaming shows "SAS Connection
+established" as soon as it arrives.
 
 ## Architecture notes
 

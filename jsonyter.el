@@ -49,6 +49,7 @@
 ;;   C-c C-r    restart the kernel
 ;;   C-c C-q    shut the kernel down
 ;;   C-c C-d    show documentation for the thing at point
+;;   C-c C-k    reset a REPL stuck at "kernel is busy"
 ;;   C-c M-o    clear previous output from the buffer
 ;;
 ;; Output streams in as it is produced, so a long-running cell shows its
@@ -182,6 +183,25 @@ it; jsonyter.el also stops asking on its own after the first failure."
   "Maximum pixel width for inline images, or nil for no limit.
 Only honored when Emacs supports native image scaling."
   :type '(choice (const :tag "No limit" nil) integer))
+
+(defcustom jsonyter-image-max-height nil
+  "Maximum pixel height for inline images, or nil for no limit.
+Tall images are scrollable when `jsonyter-slice-images' is on, so this
+is usually unnecessary; set it if you would rather shrink huge plots to
+fit than scroll through them."
+  :type '(choice (const :tag "No limit" nil) integer))
+
+(defcustom jsonyter-slice-images t
+  "If non-nil, insert images as a stack of one-line-tall slices.
+
+Emacs scrolls by whole lines, and an image inserted the ordinary way
+occupies a single line however tall it is.  That makes a plot taller
+than the window all-or-nothing: scrolling either steps clean over it or
+lands mid-image showing only its bottom edge, and the image can never be
+brought fully into view.  Slicing it across as many lines as it is tall
+\(what `doc-view' does for page images) lets ordinary line scrolling walk
+through it like normal text."
+  :type 'boolean)
 
 (defcustom jsonyter-render-html t
   "If non-nil, render text/html output with shr when libxml is available."
@@ -468,6 +488,26 @@ replies to other requests) is dispatched normally while waiting."
         (error "jsonyter: %s" (or (plist-get err :message) err))))
     (plist-get reply :result)))
 
+(defun jsonyter--kernel-request (method params)
+  "Send short kernel METHOD with PARAMS, bounded on *both* sides.
+
+The bridge serializes requests per kernel, and its default reply timeout
+is nil, meaning wait forever.  So a kernel that never answers a given
+message type leaves that kernel's worker blocked permanently, and every
+later execute queues behind it — the REPL looks hung with the kernel
+stuck \"busy\" and nothing short of restarting it recovers.  This is not
+hypothetical: the SAS kernel never answers `history' at all, and answers
+`inspect' with `aborted'.
+
+Passing an explicit `timeout' makes the bridge give up and free the
+worker on its own.  Emacs waits a little longer than the bridge so the
+bridge always wins the race and we get a real error back rather than
+abandoning a request that is still live on the other side."
+  (jsonyter--request-sync
+   method
+   (append params (list :timeout jsonyter-request-timeout))
+   (+ jsonyter-request-timeout 5)))
+
 (defun jsonyter--live-p ()
   (and jsonyter--kernel-id (process-live-p jsonyter--process)))
 
@@ -515,6 +555,7 @@ default."
     (define-key map (kbd "C-c C-r") #'jsonyter-restart)
     (define-key map (kbd "C-c C-q") #'jsonyter-shutdown)
     (define-key map (kbd "C-c C-d") #'jsonyter-repl-inspect)
+    (define-key map (kbd "C-c C-k") #'jsonyter-reset)
     (define-key map (kbd "C-c M-o") #'jsonyter-repl-clear)
     map)
   "Keymap for `jsonyter-repl-mode'.")
@@ -620,6 +661,40 @@ Handles values that arrive as a list of line fragments."
         (insert (propertize rendered 'face face))
       (insert rendered))))
 
+(defun jsonyter--image-rows (image)
+  "How many text lines IMAGE should be sliced across, or nil for one.
+Returns nil when slicing is off, when there is no graphical display, or
+when the image's displayed size cannot be measured."
+  (and jsonyter-slice-images
+       (display-graphic-p)
+       (ignore-errors
+         (let ((pixel-height (cdr (image-size image t)))
+               (line-height (max 1 (default-font-height))))
+           (max 1 (ceiling pixel-height line-height))))))
+
+(defun jsonyter--insert-image (image alt)
+  "Insert IMAGE at point with ALT as its text fallback.
+Tall images are sliced one text line per row so that line-based
+scrolling can move through them; see `jsonyter-slice-images'."
+  (let ((rows (jsonyter--image-rows image)))
+    (if (and rows (> rows 1))
+        ;; `insert-sliced-image' repeats its string once per row, so it
+        ;; gets a single space (as `doc-view' does) rather than ALT --
+        ;; otherwise the buffer's real text, and anything copied out of
+        ;; it, is the alt text repeated once per slice. It also
+        ;; terminates each row with its own newline, so no trailing one
+        ;; is needed here.
+        (insert-sliced-image image " " nil rows 1)
+      (insert-image image alt)
+      (insert "\n"))))
+
+(defun jsonyter--image-scale-props ()
+  "Scaling properties to hand `create-image', per the size options."
+  (append (and jsonyter-image-max-width
+               (list :max-width jsonyter-image-max-width))
+          (and jsonyter-image-max-height
+               (list :max-height jsonyter-image-max-height))))
+
 (defun jsonyter--insert-encoded-image (base64-data type)
   "Insert an inline image of TYPE from BASE64-DATA, with a text fallback."
   (let* ((clean (replace-regexp-in-string "[ \t\r\n]" "" base64-data))
@@ -627,12 +702,10 @@ Handles values that arrive as a list of line fragments."
          (image (and raw
                      (ignore-errors
                        (apply #'create-image raw type t
-                              (and jsonyter-image-max-width
-                                   (list :max-width jsonyter-image-max-width)))))))
+                              (jsonyter--image-scale-props))))))
     (if (not image)
         (insert (format "[%s image: could not decode]\n" type))
-      (insert-image image (format "[%s image]" type))
-      (insert "\n"))))
+      (jsonyter--insert-image image (format "[%s image]" type)))))
 
 (defun jsonyter--insert-html (html)
   "Render HTML into the buffer with shr."
@@ -658,9 +731,10 @@ notebook front end uses."
     (jsonyter--insert-encoded-image (jsonyter--mime data :image/jpeg) 'jpeg))
    ((and (display-images-p) (image-type-available-p 'svg)
          (jsonyter--mime data :image/svg+xml))
-    (insert-image (create-image (jsonyter--mime data :image/svg+xml) 'svg t)
-                  "[svg image]")
-    (insert "\n"))
+    (jsonyter--insert-image
+     (apply #'create-image (jsonyter--mime data :image/svg+xml) 'svg t
+            (jsonyter--image-scale-props))
+     "[svg image]"))
    ((and jsonyter-render-html
          (fboundp 'libxml-parse-html-region)
          (jsonyter--mime data :text/html))
@@ -749,9 +823,18 @@ kernel that does not implement is_complete costs one round trip, not
 one per RET."
   (when (and jsonyter-use-is-complete jsonyter--is-complete-supported)
     (condition-case err
-        (jsonyter--request-sync "is_complete"
-                                (list :kernel_id jsonyter--kernel-id
-                                      :code code))
+        (jsonyter--kernel-request
+         "is_complete"
+         ;; Ask about the code as a *submitted* cell, i.e. newline
+         ;; terminated. Kernels key off that: the SAS kernel calls
+         ;; anything without a trailing newline "incomplete" (even the
+         ;; empty string), so without this RET could never send SAS at
+         ;; all. It also fixes Python, where "def f():\n    return 1"
+         ;; reads as incomplete bare but complete when terminated.
+         ;; Genuinely unfinished input ("if True:") still reports
+         ;; incomplete on every kernel, so nothing is sent early.
+         (list :kernel_id jsonyter--kernel-id
+               :code (concat code "\n")))
       (error
        (setq jsonyter--is-complete-supported nil)
        (message "jsonyter: is_complete unavailable (%s); RET now always sends"
@@ -871,7 +954,7 @@ one per RET."
     (let* ((code (jsonyter--current-input))
            (pos (- (point) jsonyter--input-start))
            (reply (ignore-errors
-                    (jsonyter--request-sync
+                    (jsonyter--kernel-request
                      "complete"
                      (list :kernel_id jsonyter--kernel-id
                            :code code :cursor_pos pos)))))
@@ -891,7 +974,7 @@ one per RET."
   (when jsonyter--busy (user-error "Kernel is busy"))
   (let* ((code (jsonyter--current-input))
          (pos (max 0 (min (length code) (- (point) jsonyter--input-start))))
-         (reply (jsonyter--request-sync
+         (reply (jsonyter--kernel-request
                  "inspect"
                  (list :kernel_id jsonyter--kernel-id
                        :code code :cursor_pos pos)))
@@ -964,6 +1047,20 @@ immediately even while an execute is still running."
           jsonyter--kernel-state "dead")
     (jsonyter--kill-process)
     (jsonyter--note "\n[kernel shut down]")))
+
+(defun jsonyter-reset ()
+  "Recover a REPL stuck at a \"kernel is busy\" prompt.
+Abandons any in-flight requests, clears the busy flag and draws a fresh
+prompt.  The kernel is left running: if it is genuinely still working,
+interrupt it with \\[jsonyter-interrupt] first, or this prompt will sit
+alongside output that is still on its way."
+  (interactive)
+  (when jsonyter--callbacks (clrhash jsonyter--callbacks))
+  (setq jsonyter--busy nil
+        jsonyter--clear-pending nil)
+  (force-mode-line-update)
+  (jsonyter--note "\n[repl reset — kernel left running]")
+  (jsonyter--insert-prompt))
 
 (defun jsonyter-repl-clear ()
   "Delete all output above the current prompt."
