@@ -260,7 +260,9 @@ is still running.")
 (defvar-local jsonyter--output-end nil "Marker where the next output is inserted.")
 (defvar-local jsonyter--clear-pending nil
   "Non-nil after a clear_output with wait=true, until the next output.")
-(defvar-local jsonyter--is-complete-supported t)
+(defvar-local jsonyter--is-complete-failures 0
+  "Consecutive `is_complete' failures in this buffer.
+At `jsonyter--is-complete-give-up' we stop asking; a success resets it.")
 (defvar-local jsonyter--history nil "List of previous inputs, newest first.")
 (defvar-local jsonyter--history-index -1)
 (defvar-local jsonyter--history-stash nil)
@@ -418,6 +420,8 @@ and `event' are out-of-band and leave the request pending."
        ;; shutdown_reply that told us it is gone — so once dead, stay dead
        ;; until a restart resubscribes.  A dropped socket is different: it
        ;; can come back on its own, and a status event is the proof.
+       ;; Current bridges suppress that trailing status themselves, which
+       ;; makes this a no-op there; it stays for older ones.
        (unless (equal jsonyter--kernel-state "dead")
          (setq jsonyter--kernel-state (plist-get event :execution_state))))
       ("dead"
@@ -491,18 +495,22 @@ replies to other requests) is dispatched normally while waiting."
 (defun jsonyter--kernel-request (method params)
   "Send short kernel METHOD with PARAMS, bounded on *both* sides.
 
-The bridge serializes requests per kernel, and its default reply timeout
-is nil, meaning wait forever.  So a kernel that never answers a given
-message type leaves that kernel's worker blocked permanently, and every
-later execute queues behind it — the REPL looks hung with the kernel
-stuck \"busy\" and nothing short of restarting it recovers.  This is not
-hypothetical: the SAS kernel never answers `history' at all, and answers
-`inspect' with `aborted'.
+The bridge serializes requests per kernel, so a kernel that never answers
+a given message type can block that kernel's worker and queue every later
+execute behind it — the REPL looking hung with the kernel stuck \"busy\".
+Not hypothetical: the SAS kernel never answers `history' at all, and
+answers `inspect' with `aborted'.
 
-Passing an explicit `timeout' makes the bridge give up and free the
-worker on its own.  Emacs waits a little longer than the bridge so the
-bridge always wins the race and we get a real error back rather than
-abandoning a request that is still live on the other side."
+Current jsonyter bridges defend against this themselves, bounding the
+introspection calls with their own `control_timeout' (30s) rather than
+waiting forever.  We still send an explicit per-call `timeout' anyway:
+it works the same on older bridges that lack that default, it keeps the
+bound at an interactive latency rather than 30s, and it means
+`jsonyter-request-timeout' is one knob that actually takes effect.
+
+Emacs waits a little longer than the bridge so the bridge always wins
+the race, and we get a real error back rather than abandoning a request
+that is still live on the other side."
   (jsonyter--request-sync
    method
    (append params (list :timeout jsonyter-request-timeout))
@@ -816,29 +824,42 @@ Point is expected to be at `jsonyter--output-end'."
                 (insert "\n" (or (plist-get reply :indent) "")))
             (jsonyter--execute code))))))))
 
+(defconst jsonyter--is-complete-give-up 2
+  "Consecutive `is_complete' failures before we stop asking.
+More than one, so a single hiccup on a remote server does not cost the
+buffer its multi-line editing for the rest of the session; few enough
+that a kernel which simply never answers stops being asked quickly.")
+
 (defun jsonyter--is-complete (code)
   "Ask the kernel whether CODE is complete input; nil if unavailable.
-Stops asking for the rest of the session after the first failure, so a
-kernel that does not implement is_complete costs one round trip, not
-one per RET."
-  (when (and jsonyter-use-is-complete jsonyter--is-complete-supported)
+After `jsonyter--is-complete-give-up' consecutive failures we stop
+asking, so a kernel that does not implement is_complete costs a couple
+of round trips rather than one per RET.  Any success resets the count."
+  (when (and jsonyter-use-is-complete
+             (< jsonyter--is-complete-failures jsonyter--is-complete-give-up))
     (condition-case err
-        (jsonyter--kernel-request
-         "is_complete"
-         ;; Ask about the code as a *submitted* cell, i.e. newline
-         ;; terminated. Kernels key off that: the SAS kernel calls
-         ;; anything without a trailing newline "incomplete" (even the
-         ;; empty string), so without this RET could never send SAS at
-         ;; all. It also fixes Python, where "def f():\n    return 1"
-         ;; reads as incomplete bare but complete when terminated.
-         ;; Genuinely unfinished input ("if True:") still reports
-         ;; incomplete on every kernel, so nothing is sent early.
-         (list :kernel_id jsonyter--kernel-id
-               :code (concat code "\n")))
+        (prog1 (jsonyter--kernel-request
+                "is_complete"
+                ;; Ask about the code as a *submitted* cell, i.e. newline
+                ;; terminated. Kernels key off that: the SAS kernel calls
+                ;; anything without a trailing newline "incomplete" (even
+                ;; the empty string), so without this RET could never send
+                ;; SAS at all. It also fixes Python, where
+                ;; "def f():\n    return 1" reads as incomplete bare but
+                ;; complete once terminated. Genuinely unfinished input
+                ;; ("if True:") still reports incomplete on every kernel,
+                ;; so nothing is sent early. The bridge deliberately does
+                ;; not append this for us — it is the front end's call.
+                (list :kernel_id jsonyter--kernel-id
+                      :code (concat code "\n")))
+          (setq jsonyter--is-complete-failures 0))
       (error
-       (setq jsonyter--is-complete-supported nil)
-       (message "jsonyter: is_complete unavailable (%s); RET now always sends"
-                (error-message-string err))
+       (cl-incf jsonyter--is-complete-failures)
+       (message
+        (if (< jsonyter--is-complete-failures jsonyter--is-complete-give-up)
+            "jsonyter: is_complete failed (%s); sending anyway, will retry"
+          "jsonyter: is_complete unavailable (%s); RET now always sends")
+        (error-message-string err))
        nil))))
 
 (defun jsonyter-repl-send ()

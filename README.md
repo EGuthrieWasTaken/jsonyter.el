@@ -17,6 +17,12 @@ Against an older 0.1 bridge the REPL still works; you lose live streaming
 and the kernel-state indicator, and interrupt is not serviced while a cell
 is running.
 
+Newer bridges add a `control_timeout` that bounds the introspection calls
+and a thread-safe `connect()`. jsonyter.el does not require either — it
+sends its own per-call timeouts, and its startup is sequenced so that no
+two connection-opening requests are ever in flight at once — but both are
+worth having, particularly if you drive the same bridge from other code.
+
 ## Setup
 
 ```elisp
@@ -179,14 +185,21 @@ REPL outright:
   every kernel, so nothing is submitted early. Use `C-j` for a literal
   newline, or `M-RET` to force-send.
 - **Short kernel requests carry an explicit timeout.** The bridge
-  serializes requests per kernel and waits forever by default, so a
-  kernel that never answers a message type would block that kernel's
-  worker permanently and queue every later execute behind it — the REPL
-  appearing hung with the kernel stuck "busy". SAS never answers
-  `history` and answers `inspect` with `aborted`, so this was reachable
-  in practice. `is_complete`/`complete`/`inspect` now bound the wait on
-  the bridge side and recover on their own. `C-c C-k` is the manual
-  escape hatch if a prompt still gets stuck.
+  serializes requests per kernel, so a kernel that never answers a
+  message type can block that kernel's worker and queue every later
+  execute behind it — the REPL appearing hung with the kernel stuck
+  "busy". SAS never answers `history` and answers `inspect` with
+  `aborted`, so this is reachable in practice. Current bridges bound the
+  introspection calls themselves via `control_timeout` (30s);
+  jsonyter.el additionally sends a per-call timeout, which works the
+  same on older bridges, keeps the bound at an interactive latency, and
+  makes `jsonyter-request-timeout` the one knob that takes effect.
+  `C-c C-k` is the manual escape hatch if a prompt still gets stuck.
+
+If `is_complete` fails twice in a row the REPL stops asking and `RET`
+simply always sends — one transient blip on a remote server won't cost
+you multi-line editing, and a kernel that never answers stops being
+asked almost immediately.
 
 SAS is also slow on first contact: its first execute spends ~17s
 establishing the SAS subprocess before producing output. That is the
