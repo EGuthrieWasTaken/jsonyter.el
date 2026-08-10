@@ -170,6 +170,53 @@ event subscription rather than polled:
 A kernel killed out from under the REPL (say, shut down from a notebook UI)
 reports itself as dead in the buffer instead of hanging the next execute.
 
+## Notebooks (.ipynb)
+
+Register the opener and `.ipynb` files render as notebooks instead of raw
+JSON:
+
+```elisp
+(add-to-list 'auto-mode-alist '("\\.ipynb\\'" . jsonyter-notebook-open))
+```
+
+Cell source is ordinary buffer text, edited in the notebook language's own
+major mode — `python-mode`, `ess-r-mode`, and so on, per
+`jsonyter-notebook-language-modes` — so syntax highlighting, indentation
+and completion are the language's own. Cell prompts and all output live in
+**overlays, not buffer text**. That is what lets outputs be read-only and
+invisible to undo: undo walks your edits and never your results, and no
+stray edit can corrupt an output region because there is no output region
+in the text to corrupt.
+
+| Key | Action |
+| --- | --- |
+| `C-RET` | Run the cell at point |
+| `S-RET` | Run the cell and advance to the next |
+| `C-c C-b` | Run every code cell in order |
+| `C-c C-n` / `C-c C-p` | Next / previous cell |
+| `C-c C-c` | Interrupt the kernel |
+| `C-c C-r` | Restart the kernel |
+| `C-c M-o` / `C-c M-O` | Clear this cell's output / all output |
+| `C-c C-k` | Start the kernel explicitly |
+
+Outputs stored in the file are rendered when it opens, including figures.
+Running a cell **replaces** its output rather than appending, and results
+are session-only — nothing is written back to the file.
+
+The kernel comes from the notebook's own `kernelspec` metadata and starts
+lazily on the first execution, so opening a notebook to read it costs
+nothing.
+
+### Not yet: saving
+
+Notebook **editing is session-only**. The buffer holds a rendered view
+rather than notebook JSON, so writing it out would destroy the file;
+`C-x C-s` refuses with an explanation instead. Cell source can be edited
+and re-run freely, but those edits are not persisted yet. Saving arrives
+with the editing phase, which round-trips through the jsonyter Python
+package's `write_notebook` so that stored outputs, cell ids and Jupyter's
+exact JSON formatting survive byte for byte.
+
 ## Kernel quirks this handles
 
 Kernels vary in how faithfully they implement the messaging protocol, and
