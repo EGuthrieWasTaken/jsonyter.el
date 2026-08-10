@@ -1403,9 +1403,21 @@ RUNNING marks a cell whose execution is still in flight."
 
 (defun jsonyter--nb-refresh-output (cell)
   "Update CELL's output overlay string from its stored rendered text."
-  (overlay-put cell 'after-string
-               (jsonyter--nb-outputs-string
-                (overlay-get cell 'jsonyter-output-string))))
+  (let ((body (jsonyter--nb-outputs-string
+               (overlay-get cell 'jsonyter-output-string))))
+    (overlay-put
+     cell 'after-string
+     (if (string-empty-p body)
+         ""
+       ;; Output must begin on a line of its own.  A notebook cell always
+       ;; ends with its own newline, but a script cell can end mid-line —
+       ;; the last cell of a file with no final newline — and an
+       ;; after-string there is displayed running on from the last line
+       ;; of code, which is exactly where print output must not appear.
+       (let ((end (overlay-end cell)))
+         (if (or (= end (point-min)) (eq (char-before end) ?\n))
+             body
+           (concat "\n" body)))))))
 
 (defun jsonyter--nb-make-cell (start end cell)
   "Create the overlay for CELL spanning START..END.
@@ -1479,6 +1491,13 @@ end of its last visible line still lands in the right cell."
 Passed back on save so an edit made outside Emacs is detected rather
 than silently clobbered.")
 
+(defvar-local jsonyter--nb-outputs-dirty nil
+  "Non-nil once a cell's output has changed in this session.
+Running a cell changes no buffer text, so Emacs considers the buffer
+unmodified and \\[save-buffer] short-circuits before any save hook runs.
+Without tracking this, re-running cells and saving looks like a silent
+failure — see `jsonyter-notebook-save-buffer'.")
+
 (defun jsonyter--nb-hash-file (path)
   "Return the sha256 of PATH's bytes, matching the bridge's `file_hash'.
 Read literally and unibyte so the digest is over raw bytes, not decoded
@@ -1497,29 +1516,45 @@ read can still be saved without ever contacting a Jupyter server."
     (setq jsonyter--process (jsonyter--start-bridge)))
   jsonyter--process)
 
-(defun jsonyter--nb-collect-cells ()
-  "The buffer's cells as a list of plists for `write_notebook'."
-  (mapcar (lambda (cell)
-            (list :id (or (overlay-get cell 'jsonyter-cell-id) :null)
-                  :cell_type (overlay-get cell 'jsonyter-cell-type)
-                  :source (jsonyter--nb-cell-source cell)))
-          (jsonyter--nb-cells)))
+(defun jsonyter--nb-collect-cells (&optional include-outputs)
+  "The buffer's cells as a list of plists for `write_notebook'.
 
-(defun jsonyter-notebook-save ()
-  "Write this notebook back to its file through the jsonyter bridge.
-Installed on `write-contents-functions', so \\[save-buffer] uses it."
-  (interactive)
+With INCLUDE-OUTPUTS, a cell touched this session — run, or explicitly
+cleared, since the notebook was opened — also carries its current
+`outputs'/`execution_count'.  A cell never touched omits the key
+entirely, which is what tells the bridge to leave its stored output on
+disk exactly as it was; see `jsonyter--nb-set-output'."
+  (mapcar
+   (lambda (cell)
+     (append
+      (list :id (or (overlay-get cell 'jsonyter-cell-id) :null)
+            :cell_type (overlay-get cell 'jsonyter-cell-type)
+            :source (jsonyter--nb-cell-source cell))
+      (and include-outputs
+           (overlay-get cell 'jsonyter-outputs-touched)
+           (list :outputs (vconcat (mapcar #'jsonyter--nb-output-to-spec
+                                           (overlay-get cell 'jsonyter-raw-outputs)))
+                 :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))))
+   (jsonyter--nb-cells)))
+
+(defun jsonyter--nb-do-save (include-outputs)
+  "Write this notebook's cell source, and outputs if INCLUDE-OUTPUTS, to
+its file through the jsonyter bridge.  Shared by `jsonyter-notebook-save'
+and `jsonyter-notebook-save-with-outputs'."
   (unless buffer-file-name
     (user-error "This notebook buffer isn't visiting a file"))
   (jsonyter--ensure-bridge)
-  (let* ((cells (jsonyter--nb-collect-cells))
+  (let* ((had-new-output jsonyter--nb-outputs-dirty)
+         (cells (jsonyter--nb-collect-cells include-outputs))
          (result
           (condition-case err
               (jsonyter--request-sync
                "write_notebook"
-               (list :path (expand-file-name buffer-file-name)
-                     :cells (vconcat cells)
-                     :expect_hash (or jsonyter--nb-file-hash :null))
+               (append
+                (list :path (expand-file-name buffer-file-name)
+                      :cells (vconcat cells)
+                      :expect_hash (or jsonyter--nb-file-hash :null))
+                (and include-outputs (list :include_outputs t)))
                jsonyter-startup-timeout)
             (error
              ;; A conflict is the one failure worth explaining, since the
@@ -1538,15 +1573,65 @@ Installed on `write-contents-functions', so \\[save-buffer] uses it."
       (cl-loop for cell in cell-overlays
                for id in ids
                do (overlay-put cell 'jsonyter-cell-id id)))
-    (setq jsonyter--nb-file-hash
-          (or (plist-get result :hash)
-              (jsonyter--nb-hash-file buffer-file-name)))
-    (set-buffer-modified-p nil)
-    (set-visited-file-modtime)
-    (message "jsonyter: wrote %s (%d cells)"
-             (file-name-nondirectory buffer-file-name) (length cells))
+    (let ((written 0))
+      (when include-outputs
+        (dolist (cell (jsonyter--nb-cells))
+          (when (overlay-get cell 'jsonyter-outputs-touched) (cl-incf written))
+          (overlay-put cell 'jsonyter-outputs-touched nil)
+          (overlay-put cell 'jsonyter-raw-outputs nil))
+        (setq jsonyter--nb-outputs-dirty nil))
+      (setq jsonyter--nb-file-hash
+            (or (plist-get result :hash)
+                (jsonyter--nb-hash-file buffer-file-name)))
+      (set-buffer-modified-p nil)
+      (set-visited-file-modtime)
+      (message
+       "jsonyter: wrote %s (%d cells%s)"
+       (file-name-nondirectory buffer-file-name) (length cells)
+       (cond (include-outputs (format ", %d with new output" written))
+             (had-new-output
+              " — source only; new outputs not saved (C-c C-s saves them too)")
+             (t ""))))
     ;; Non-nil tells Emacs the buffer has been written.
     t))
+
+(defun jsonyter-notebook-save ()
+  "Write this notebook's cell source back to its file.
+Installed on `write-contents-functions', so \\[save-buffer] uses it.
+Execution results are not included; see
+`jsonyter-notebook-save-with-outputs' to persist newly generated
+outputs too."
+  (interactive)
+  (jsonyter--nb-do-save nil))
+
+(defun jsonyter-notebook-save-with-outputs ()
+  "Write this notebook's cell source AND this session's new outputs.
+
+A cell run, or explicitly cleared, since the notebook was opened has its
+stored output replaced by what is now shown; every other cell's stored
+output is left exactly as it was.  Because only touched cells are
+rewritten, this still produces a small diff when just a few cells were
+actually re-run — but a real one for each of those, including any
+embedded images."
+  (interactive)
+  (jsonyter--nb-do-save t))
+
+(defun jsonyter-notebook-save-buffer ()
+  "Save this notebook, saying plainly when there is nothing to write.
+
+Running a cell changes no buffer text, so Emacs sees an unmodified
+buffer and \\[save-buffer] returns without calling any save hook.  That
+is indistinguishable from a save that failed, which is precisely how it
+looks after re-running cells to produce new figures.  Say so instead,
+and point at `jsonyter-notebook-save-with-outputs' if that is what was
+wanted."
+  (interactive)
+  (cond
+   ((buffer-modified-p) (save-buffer))
+   (jsonyter--nb-outputs-dirty
+    (message "jsonyter: nothing written — cell source is unchanged; %s to also save this session's new outputs"
+             (substitute-command-keys "\\[jsonyter-notebook-save-with-outputs]")))
+   (t (message "jsonyter: no changes to save"))))
 
 ;;; Execution
 
@@ -1567,18 +1652,67 @@ Installed on `write-contents-functions', so \\[save-buffer] uses it."
       (user-error "No kernel: M-x jsonyter-notebook-start-kernel"))
     (jsonyter-notebook-start-kernel)))
 
-(defun jsonyter--nb-set-output (cell rendered)
-  "Set CELL's rendered output text to RENDERED and redisplay it."
+(defun jsonyter--nb-set-output (cell rendered &optional raw touched)
+  "Set CELL's displayed output text to RENDERED.
+
+When TOUCHED, also record RAW — a list of kernel-shape output plists —
+as what this cell produced *this session*, which is what makes it
+eligible to have its stored output replaced by
+`jsonyter-notebook-save-with-outputs'.  Without TOUCHED, only the
+display changes and the cell's save-eligibility is left exactly as it
+was: e.g. a bridge-level failure message is not a real kernel result
+and must not be recorded as one."
   (overlay-put cell 'jsonyter-output-string rendered)
+  (when touched
+    (overlay-put cell 'jsonyter-raw-outputs raw)
+    (overlay-put cell 'jsonyter-outputs-touched t))
+  (unless (overlay-get cell 'jsonyter-script-cell)
+    (setq jsonyter--nb-outputs-dirty t))
   (jsonyter--nb-refresh-output cell))
 
 (defun jsonyter--nb-append-output (cell output)
   "Append one kernel OUTPUT to CELL, honoring clear_output."
   (if (equal (plist-get output :type) "clear_output")
-      (jsonyter--nb-set-output cell "")
+      (jsonyter--nb-set-output cell "" nil t)
     (jsonyter--nb-set-output
      cell (concat (or (overlay-get cell 'jsonyter-output-string) "")
-                  (jsonyter--nb-render-string output)))))
+                  (jsonyter--nb-render-string output))
+     (append (overlay-get cell 'jsonyter-raw-outputs) (list output))
+     t)))
+
+(defun jsonyter--nb-output-to-spec (output)
+  "Convert kernel-shape OUTPUT (as delivered by `execute') to the
+nbformat shape `write_notebook' expects with `include_outputs' — the
+inverse of `jsonyter--nb-adapt-output'.
+
+`update_display_data' has no independent slot in nbformat (it is meant
+to patch an existing `display_data' in place by display_id); stored as
+an ordinary `display_data' instead, a reasonable approximation for a
+plain saved file. Rich mimetypes whose data is a flat set of strings —
+images, HTML, plain text, the common case for a matplotlib figure —
+round-trip correctly; a mimetype whose JSON value nests further arrays
+does not, since data/metadata are carried through as read, and this
+library parses JSON arrays as lisp lists rather than vectors throughout.
+Not expected to matter for anything but exotic interactive-widget
+output."
+  (let ((type (plist-get output :type)))
+    (pcase type
+      ("stream" (list :output_type "stream"
+                      :name (or (plist-get output :name) "stdout")
+                      :text (or (plist-get output :text) "")))
+      ((or "display_data" "execute_result" "update_display_data")
+       (append (list :output_type (if (equal type "update_display_data")
+                                      "display_data" type)
+                     :data (or (plist-get output :data) (list))
+                     :metadata (or (plist-get output :metadata) (list)))
+               (and (equal type "execute_result")
+                    (list :execution_count (plist-get output :execution_count)))))
+      ("error" (list :output_type "error"
+                     :ename (or (plist-get output :ename) "")
+                     :evalue (or (plist-get output :evalue) "")
+                     :traceback (vconcat (plist-get output :traceback))))
+      (_ (list :output_type "stream" :name "stdout"
+              :text (format "[jsonyter: unrecognized output type %s]\n" type))))))
 
 (defun jsonyter-notebook-run-cell (&optional advance)
   "Execute the cell at point.  With ADVANCE, move to the next cell after."
@@ -1596,8 +1730,11 @@ Installed on `write-contents-functions', so \\[save-buffer] uses it."
         (if (string-blank-p code)
             (message "jsonyter: empty cell")
           ;; Re-running replaces the previous result outright, which is
-          ;; what makes outputs disposable rather than accumulating.
-          (jsonyter--nb-set-output cell "")
+          ;; what makes outputs disposable rather than accumulating. This
+          ;; also marks the cell touched, so it is what makes a freshly
+          ;; (re-)run cell eligible for `jsonyter-notebook-save-with-outputs'
+          ;; even if the run produces nothing further.
+          (jsonyter--nb-set-output cell "" nil t)
           (overlay-put cell 'jsonyter-running t)
           (jsonyter--nb-refresh-prompt cell)
           (setq jsonyter--busy t
@@ -1654,22 +1791,28 @@ Installed on `write-contents-functions', so \\[save-buffer] uses it."
           (accept-process-output jsonyter--process 0.05))))))
 
 (defun jsonyter-notebook-clear-cell-output ()
-  "Discard the output shown beneath the cell at point."
+  "Discard the output shown beneath the cell at point.
+Also marks the cell touched, so a subsequent
+`jsonyter-notebook-save-with-outputs' clears its stored output on disk
+rather than leaving a stale result behind."
   (interactive)
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
-    (jsonyter--nb-set-output cell "")))
+    (jsonyter--nb-set-output cell "" nil t)))
 
 (defun jsonyter-notebook-clear-all-output ()
   "Discard every output in this notebook and blank its execution counts.
 Leaves the notebook looking as though nothing has been run, which is what
-you want before running a project through cleanly."
+you want before running a project through cleanly.  Also marks every
+code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
   (interactive)
   (dolist (cell (jsonyter--nb-cells))
-    (jsonyter--nb-set-output cell "")
+    (unless (equal (overlay-get cell 'jsonyter-cell-type) "markdown")
+      (jsonyter--nb-set-output cell "" nil t))
     (overlay-put cell 'jsonyter-exec-count nil)
     (overlay-put cell 'jsonyter-running nil)
     (jsonyter--nb-refresh-prompt cell))
+  (setq jsonyter--nb-outputs-dirty nil)
   (message "jsonyter: cleared all output"))
 
 ;;;###autoload
@@ -1844,6 +1987,8 @@ position — the things that must travel with the text when cells move.")
     (define-key map (kbd "C-c C-t") #'jsonyter-notebook-change-cell-type)
     (define-key map (kbd "C-c <up>") #'jsonyter-notebook-move-cell-up)
     (define-key map (kbd "C-c <down>") #'jsonyter-notebook-move-cell-down)
+    (define-key map (kbd "C-x C-s") #'jsonyter-notebook-save-buffer)
+    (define-key map (kbd "C-c C-s") #'jsonyter-notebook-save-with-outputs)
     map)
   "Keymap for `jsonyter-notebook-mode'.")
 

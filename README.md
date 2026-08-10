@@ -202,6 +202,8 @@ in the text to corrupt.
 | `C-c C-w` | Delete the cell at point |
 | `C-c C-t` | Toggle the cell between code and markdown |
 | `C-c <up>` / `C-c <down>` | Move the cell up / down |
+| `C-x C-s` | Save cell source |
+| `C-c C-s` | Save cell source and this session's new outputs |
 
 `M-x jsonyter-clear` clears every output in the buffer and blanks the
 execution counts, leaving the notebook as though nothing had been run —
@@ -224,9 +226,24 @@ outputs, cell metadata, attachments and Jupyter's exact JSON formatting
 are preserved, so an unedited save is **byte-identical** and a one-line
 edit is a one-line diff rather than a whole-file rewrite.
 
-Execution results are still not persisted — only source, cell order, and
-cell types. If the file changed on disk since it was opened, the save is
-refused rather than clobbering the other change; revert to reload.
+`C-x C-s` (`jsonyter-notebook-save-buffer`) saves **source only** — cell
+text, order and type. Execution results are session-only by default, so
+re-running a cell to produce a new figure and then `C-x C-s` leaves that
+figure out of the file; because running a cell changes no buffer text,
+Emacs would otherwise consider the buffer unmodified and return silently,
+which is indistinguishable from a save that failed, so this says so
+explicitly instead.
+
+`C-c C-s` (`jsonyter-notebook-save-with-outputs`) saves source **and**
+this session's new outputs. A cell run, or explicitly cleared (`C-c M-o`
+/ `C-c M-O`), since the notebook was opened has its stored output
+replaced by what is currently shown; every other cell's stored output —
+anything not touched this session — is left exactly as it was. That
+means the diff is proportional to what you actually reran, not the whole
+file: rerun one cell and only that cell's output changes on disk.
+
+If the file changed on disk since it was opened, either save is refused
+rather than clobbering the other change; revert to reload.
 
 Saving is a local filesystem operation and does not need a kernel or a
 reachable Jupyter server — a notebook opened purely to read can still be
