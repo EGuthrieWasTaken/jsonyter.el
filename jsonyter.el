@@ -553,6 +553,52 @@ default."
                               do (push (plist-get spec :name) names))
                      (mapconcat #'identity (nreverse names) ", "))))))))
 
+;;;; The jsonyter marker mode
+
+(define-minor-mode jsonyter-mode
+  "Marker mode, on in every jsonyter buffer regardless of its kind.
+
+`jsonyter-repl-mode' (a REPL), `jsonyter-notebook-mode' (a rendered
+.ipynb) and `jsonyter-script-mode' (\"# %%\" cells in a script) all turn
+this on and never off — killing the buffer is what ends it.  It carries
+no keymap or behavior of its own; it exists purely so other code can
+ask \"is this any kind of jsonyter buffer\" with one check —
+`(bound-and-true-p jsonyter-mode)' — without caring which of the three
+it is or repeating that three-way test itself.
+
+`jsonyter-save-buffer' is built on exactly this and is the pattern to
+copy: dispatch on the specific mode only where the specific mode's
+buffer actually needs different handling, and treat `jsonyter-mode' as
+the umbrella everything else can hang off, e.g. a leader-key \"save\"
+binding that should do the right thing in a notebook without changing
+behavior anywhere else:
+
+  (defun my/save-buffer ()
+    (interactive)
+    (if (bound-and-true-p jsonyter-mode)
+        (jsonyter-save-buffer)
+      (save-buffer)))"
+  :init-value nil
+  :lighter nil)
+
+(defun jsonyter-save-buffer ()
+  "Save the current buffer the jsonyter way.
+
+In a notebook, delegates to `jsonyter-notebook-save-buffer', which
+explains itself rather than silently doing nothing when only this
+session's output changed \\(see `jsonyter-notebook-save-with-outputs' to
+save that too\\).  Everywhere else — a script-cells buffer, a REPL, or
+any ordinary buffer — delegates to `save-buffer' unchanged: a script
+buffer's cell output lives entirely in overlays, so its file is always
+just what `save-buffer' already saves.
+
+The one command to bind to a generic \"save\" key that should also do
+the right thing in a jsonyter notebook; see `jsonyter-mode'."
+  (interactive)
+  (if (bound-and-true-p jsonyter-notebook-mode)
+      (jsonyter-notebook-save-buffer)
+    (save-buffer)))
+
 ;;;; REPL buffer basics
 
 (defvar jsonyter-repl-mode-map
@@ -600,7 +646,8 @@ default."
   (setq-local scroll-conservatively 101)
   (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
   (add-hook 'completion-at-point-functions #'jsonyter-completion-at-point nil t)
-  (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t))
+  (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+  (jsonyter-mode 1))
 
 (defun jsonyter--insert-at (position renderer)
   "Call RENDERER with point at POSITION, then keep windows scrolled.
@@ -2011,9 +2058,11 @@ only the cell source.
         (set-marker-insertion-type jsonyter--output-end t)
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
         (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
-        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t))
+        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+        (jsonyter-mode 1))
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
-    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)))
+    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
+    (jsonyter-mode -1)))
 
 ;;;###autoload
 (defun jsonyter-notebook-open ()
@@ -2201,9 +2250,11 @@ actually save — is never touched.
       (progn
         (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
-        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t))
+        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+        (jsonyter-mode 1))
     (jsonyter-script-clear-all-output)
-    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)))
+    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
+    (jsonyter-mode -1)))
 
 ;;;###autoload
 (defun jsonyter-script-mode-maybe ()

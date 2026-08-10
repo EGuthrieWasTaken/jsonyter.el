@@ -269,6 +269,33 @@ Output appears inline in overlays, so **the file's text is never
 touched** and saving stays completely ordinary. The kernel language comes
 from the buffer's major mode via `jsonyter-script-languages`.
 
+## Extending jsonyter.el: `jsonyter-mode`
+
+`jsonyter-mode` is a marker minor mode, on in every jsonyter buffer —
+REPL, rendered notebook, or a script with `# %%` cells — regardless of
+which. It carries no keymap or behavior of its own; it exists so other
+code can ask "is this any kind of jsonyter buffer" with one check,
+`(bound-and-true-p jsonyter-mode)`, instead of testing all three
+specific modes itself.
+
+`jsonyter-save-buffer` is built on exactly this and is the pattern to
+copy: dispatch on a specific mode only where that mode's buffer actually
+needs different handling — a notebook needs `jsonyter-notebook-save-buffer`
+to avoid a silent no-op when only session output changed — and treat
+`jsonyter-mode` as the umbrella everything else hangs off:
+
+```elisp
+(defun my/save-buffer ()
+  (interactive)
+  (if (bound-and-true-p jsonyter-mode)
+      (jsonyter-save-buffer)
+    (save-buffer)))
+```
+
+That's a real, working example: it is what lets a single "save" key bound
+elsewhere in a config do the right thing in a jsonyter notebook without
+changing behavior anywhere else.
+
 ## Kernel quirks this handles
 
 Kernels vary in how faithfully they implement the messaging protocol, and
