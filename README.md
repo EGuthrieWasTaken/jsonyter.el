@@ -198,24 +198,59 @@ in the text to corrupt.
 | `C-c C-r` | Restart the kernel |
 | `C-c M-o` / `C-c M-O` | Clear this cell's output / all output |
 | `C-c C-k` | Start the kernel explicitly |
+| `C-c C-i` / `C-c C-a` | Insert a cell below / above (`C-u` for markdown) |
+| `C-c C-w` | Delete the cell at point |
+| `C-c C-t` | Toggle the cell between code and markdown |
+| `C-c <up>` / `C-c <down>` | Move the cell up / down |
+
+`M-x jsonyter-clear` clears every output in the buffer and blanks the
+execution counts, leaving the notebook as though nothing had been run —
+what you want before running a project through cleanly. It does the
+equivalent thing in a REPL or script buffer too.
 
 Outputs stored in the file are rendered when it opens, including figures.
 Running a cell **replaces** its output rather than appending, and results
-are session-only — nothing is written back to the file.
+are session-only — they are never written back to the file.
 
 The kernel comes from the notebook's own `kernelspec` metadata and starts
 lazily on the first execution, so opening a notebook to read it costs
 nothing.
 
-### Not yet: saving
+### Saving
 
-Notebook **editing is session-only**. The buffer holds a rendered view
-rather than notebook JSON, so writing it out would destroy the file;
-`C-x C-s` refuses with an explanation instead. Cell source can be edited
-and re-run freely, but those edits are not persisted yet. Saving arrives
-with the editing phase, which round-trips through the jsonyter Python
-package's `write_notebook` so that stored outputs, cell ids and Jupyter's
-exact JSON formatting survive byte for byte.
+`C-x C-s` writes cell source back through the jsonyter Python package's
+`write_notebook`, which merges it onto the file's own cells by id. Stored
+outputs, cell metadata, attachments and Jupyter's exact JSON formatting
+are preserved, so an unedited save is **byte-identical** and a one-line
+edit is a one-line diff rather than a whole-file rewrite.
+
+Execution results are still not persisted — only source, cell order, and
+cell types. If the file changed on disk since it was opened, the save is
+refused rather than clobbering the other change; revert to reload.
+
+Saving is a local filesystem operation and does not need a kernel or a
+reachable Jupyter server — a notebook opened purely to read can still be
+edited and saved offline.
+
+## Script cells (`# %%`)
+
+`jsonyter-script-mode` gives an ordinary `.py`/`.R`/`.jl`/`.sas` script the
+same execute-and-see-results-inline experience, with cells delimited by
+`# %%` markers (the Jupytext/VS Code/Spyder convention, and its comment
+variants, per `jsonyter-script-cell-regexp`).
+
+```elisp
+(add-hook 'python-mode-hook #'jsonyter-script-mode-maybe)
+```
+
+`jsonyter-script-mode-maybe` enables the mode only in buffers that
+actually contain cell markers. Keys mirror the notebook: `C-RET` run,
+`S-RET` run and advance, `C-c C-n`/`C-c C-p` to move between cells,
+`C-c C-c` interrupt, `C-c M-O` clear all output.
+
+Output appears inline in overlays, so **the file's text is never
+touched** and saving stays completely ordinary. The kernel language comes
+from the buffer's major mode via `jsonyter-script-languages`.
 
 ## Kernel quirks this handles
 

@@ -371,7 +371,7 @@ and `event' are out-of-band and leave the request pending."
                                     :null-object nil
                                     :false-object nil)
                (error
-                (jsonyter--note (format "[unparseable bridge output: %s]"
+                (jsonyter--announce (format "[unparseable bridge output: %s]"
                                         (error-message-string err)))
                 nil))))
     (when msg
@@ -395,7 +395,7 @@ and `event' are out-of-band and leave the request pending."
             (cond
              (handler (funcall handler msg))
              ((plist-get msg :error)
-              (jsonyter--note
+              (jsonyter--announce
                (format "[bridge error: %s]"
                        (plist-get (plist-get msg :error) :message))))))))))))
 
@@ -428,14 +428,14 @@ and `event' are out-of-band and leave the request pending."
        (cond
         ((eq (plist-get event :restart) t)
          (setq jsonyter--kernel-state "restarting")
-         (jsonyter--note "[kernel is restarting]"))
+         (jsonyter--announce "[kernel is restarting]"))
         (t
          (setq jsonyter--kernel-state "dead")
          (setq jsonyter--busy nil)
-         (jsonyter--note "[kernel died — C-c C-r to restart]"))))
+         (jsonyter--announce "[kernel died — C-c C-r to restart]"))))
       ("disconnected"
        (setq jsonyter--kernel-state "disconnected")
-       (jsonyter--note (format "[kernel connection lost: %s]"
+       (jsonyter--announce (format "[kernel connection lost: %s]"
                                (or (plist-get event :message) "unknown"))))
       (_ nil))
     (force-mode-line-update)))
@@ -448,7 +448,7 @@ and `event' are out-of-band and leave the request pending."
         (when (eq proc jsonyter--process)
           (setq jsonyter--busy nil
                 jsonyter--kernel-state "dead")
-          (jsonyter--note (format "\n[jsonyter bridge exited: %s]"
+          (jsonyter--announce (format "\n[jsonyter bridge exited: %s]"
                                   (string-trim event)))
           (force-mode-line-update))))))
 
@@ -459,6 +459,12 @@ HANDLERS is a plist: :result is called with the final reply plist,
   (unless (process-live-p jsonyter--process)
     (error "jsonyter: bridge process is not running (M-x jsonyter-start-%s to reconnect)"
            (or jsonyter--language "python")))
+  ;; Every mode that talks to a kernel sets this up, but a buffer can
+  ;; reach here without one — e.g. a notebook whose render failed, or a
+  ;; caller driving the bridge directly — and a missing table would fail
+  ;; far from the cause.
+  (unless jsonyter--callbacks
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql)))
   (let* ((id (cl-incf jsonyter--next-id))
          (request (if params
                       (list :id id :method method :params params)
@@ -619,6 +625,15 @@ reading further up."
    (lambda ()
      (unless (bolp) (insert "\n"))
      (insert (propertize text 'face 'jsonyter-note-face) "\n"))))
+
+(defun jsonyter--announce (text)
+  "Report TEXT wherever this buffer's kind of transcript lives.
+A REPL's transcript *is* its buffer text, so notes belong inline.  A
+notebook buffer's text is the notebook's own source — writing a note
+into it would corrupt the document — so those go to the echo area."
+  (if (derived-mode-p 'jsonyter-repl-mode)
+      (jsonyter--note text)
+    (message "jsonyter: %s" (string-trim (string-trim text) "\\[" "\\]"))))
 
 (defun jsonyter--insert-prompt ()
   "Freeze everything so far and insert a fresh input prompt at the end."
@@ -1052,8 +1067,7 @@ immediately even while an execute is still running."
           jsonyter--execution-count 0
           jsonyter--clear-pending nil)
     (jsonyter--subscribe)
-    (jsonyter--note "\n[kernel restarted]")
-    (jsonyter--insert-prompt)))
+    (jsonyter--after-kernel-reset "[kernel restarted]")))
 
 (defun jsonyter-shutdown ()
   "Shut the kernel down and stop the bridge process."
@@ -1067,7 +1081,7 @@ immediately even while an execute is still running."
           jsonyter--busy nil
           jsonyter--kernel-state "dead")
     (jsonyter--kill-process)
-    (jsonyter--note "\n[kernel shut down]")))
+    (jsonyter--announce "\n[kernel shut down]")))
 
 (defun jsonyter-reset ()
   "Recover a REPL stuck at a \"kernel is busy\" prompt.
@@ -1080,8 +1094,23 @@ alongside output that is still on its way."
   (setq jsonyter--busy nil
         jsonyter--clear-pending nil)
   (force-mode-line-update)
-  (jsonyter--note "\n[repl reset — kernel left running]")
-  (jsonyter--insert-prompt))
+  (jsonyter--after-kernel-reset "[reset — kernel left running]"))
+
+(defun jsonyter--after-kernel-reset (text)
+  "Put this buffer back in a usable state after a restart or reset.
+A REPL gets TEXT in its transcript and a fresh prompt.  A notebook gets
+neither — writing into its text would corrupt the document — but its
+cells' execution counts are blanked, since the kernel's counter has gone
+back to zero and the old numbers no longer mean anything."
+  (if (derived-mode-p 'jsonyter-repl-mode)
+      (progn (jsonyter--note (concat "\n" text))
+             (jsonyter--insert-prompt))
+    (when (bound-and-true-p jsonyter-notebook-mode)
+      (dolist (cell (jsonyter--nb-cells))
+        (overlay-put cell 'jsonyter-exec-count nil)
+        (overlay-put cell 'jsonyter-running nil)
+        (jsonyter--nb-refresh-prompt cell)))
+    (jsonyter--announce text)))
 
 (defun jsonyter-repl-clear ()
   "Delete all output above the current prompt."
@@ -1435,16 +1464,89 @@ end of its last visible line still lands in the right cell."
         (jsonyter--nb-make-cell start (point) cell)))
     (goto-char (point-min))))
 
-;;; Saving is deliberately not implemented yet
+;;; Saving
 
-(defun jsonyter--nb-refuse-save ()
-  "Refuse to save, loudly, rather than writing the rendered view to disk.
-The buffer holds a rendered view, not notebook JSON; writing it would
-destroy the file.  Notebook saving arrives with the editing phase, which
-round-trips through the jsonyter Python package so that stored outputs
-and formatting survive byte for byte."
-  (user-error
-   "jsonyter: saving notebooks isn't implemented yet — edits here are session-only"))
+;; The buffer holds a rendered view, not notebook JSON, so it can never
+;; be written to disk directly.  Saving instead hands the cell list to
+;; the jsonyter Python package's `write_notebook', which merges the new
+;; source onto the file's own cells by id — preserving stored outputs,
+;; metadata, attachments and Jupyter's exact JSON formatting, so an
+;; unedited save is byte-identical and a one-line edit is a one-line
+;; diff.
+
+(defvar-local jsonyter--nb-file-hash nil
+  "sha256 of the notebook file as it was last read or written.
+Passed back on save so an edit made outside Emacs is detected rather
+than silently clobbered.")
+
+(defun jsonyter--nb-hash-file (path)
+  "Return the sha256 of PATH's bytes, matching the bridge's `file_hash'.
+Read literally and unibyte so the digest is over raw bytes, not decoded
+characters."
+  (and path (file-exists-p path)
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (insert-file-contents-literally path)
+         (secure-hash 'sha256 (current-buffer)))))
+
+(defun jsonyter--ensure-bridge ()
+  "Make sure a bridge process is running, without starting a kernel.
+Saving is a local filesystem operation, so a notebook opened purely to
+read can still be saved without ever contacting a Jupyter server."
+  (unless (process-live-p jsonyter--process)
+    (setq jsonyter--process (jsonyter--start-bridge)))
+  jsonyter--process)
+
+(defun jsonyter--nb-collect-cells ()
+  "The buffer's cells as a list of plists for `write_notebook'."
+  (mapcar (lambda (cell)
+            (list :id (or (overlay-get cell 'jsonyter-cell-id) :null)
+                  :cell_type (overlay-get cell 'jsonyter-cell-type)
+                  :source (jsonyter--nb-cell-source cell)))
+          (jsonyter--nb-cells)))
+
+(defun jsonyter-notebook-save ()
+  "Write this notebook back to its file through the jsonyter bridge.
+Installed on `write-contents-functions', so \\[save-buffer] uses it."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "This notebook buffer isn't visiting a file"))
+  (jsonyter--ensure-bridge)
+  (let* ((cells (jsonyter--nb-collect-cells))
+         (result
+          (condition-case err
+              (jsonyter--request-sync
+               "write_notebook"
+               (list :path (expand-file-name buffer-file-name)
+                     :cells (vconcat cells)
+                     :expect_hash (or jsonyter--nb-file-hash :null))
+               jsonyter-startup-timeout)
+            (error
+             ;; A conflict is the one failure worth explaining, since the
+             ;; fix is to reload rather than to retry.
+             (if (string-match-p "NotebookConflict\\|has changed\\|changed on disk\\|hash"
+                                 (error-message-string err))
+                 (user-error
+                  "jsonyter: %s has changed on disk since it was opened; revert (%s) to reload"
+                  (file-name-nondirectory buffer-file-name)
+                  (substitute-command-keys "\\[revert-buffer]"))
+               (signal (car err) (cdr err)))))))
+    ;; Adopt the ids the bridge assigned, so cells created in this
+    ;; session match up on the next save instead of being recreated.
+    (let ((ids (append (plist-get result :cells) nil))
+          (cell-overlays (jsonyter--nb-cells)))
+      (cl-loop for cell in cell-overlays
+               for id in ids
+               do (overlay-put cell 'jsonyter-cell-id id)))
+    (setq jsonyter--nb-file-hash
+          (or (plist-get result :hash)
+              (jsonyter--nb-hash-file buffer-file-name)))
+    (set-buffer-modified-p nil)
+    (set-visited-file-modtime)
+    (message "jsonyter: wrote %s (%d cells)"
+             (file-name-nondirectory buffer-file-name) (length cells))
+    ;; Non-nil tells Emacs the buffer has been written.
+    t))
 
 ;;; Execution
 
@@ -1559,10 +1661,144 @@ and formatting survive byte for byte."
     (jsonyter--nb-set-output cell "")))
 
 (defun jsonyter-notebook-clear-all-output ()
-  "Discard every output shown in this notebook buffer."
+  "Discard every output in this notebook and blank its execution counts.
+Leaves the notebook looking as though nothing has been run, which is what
+you want before running a project through cleanly."
   (interactive)
   (dolist (cell (jsonyter--nb-cells))
-    (jsonyter--nb-set-output cell "")))
+    (jsonyter--nb-set-output cell "")
+    (overlay-put cell 'jsonyter-exec-count nil)
+    (overlay-put cell 'jsonyter-running nil)
+    (jsonyter--nb-refresh-prompt cell))
+  (message "jsonyter: cleared all output"))
+
+;;;###autoload
+(defun jsonyter-clear ()
+  "Clear output: every cell in a notebook, or the transcript in a REPL."
+  (interactive)
+  (cond
+   ((bound-and-true-p jsonyter-notebook-mode) (jsonyter-notebook-clear-all-output))
+   ((derived-mode-p 'jsonyter-repl-mode) (jsonyter-repl-clear))
+   ((bound-and-true-p jsonyter-script-mode) (jsonyter-script-clear-all-output))
+   (t (user-error "Not a jsonyter notebook, script or REPL buffer"))))
+
+;;; Cell management
+
+(defun jsonyter--nb-insert-cell (pos cell-type)
+  "Create a new empty CELL-TYPE cell whose source begins at POS."
+  (goto-char pos)
+  (let ((start (point)))
+    (insert "\n")
+    (jsonyter--nb-make-cell start (point)
+                            (list :id nil :cell_type cell-type :outputs nil))
+    (goto-char start)))
+
+(defun jsonyter-notebook-insert-cell-below (&optional markdown)
+  "Insert an empty code cell below the cell at point.
+With a prefix argument (MARKDOWN), insert a markdown cell instead."
+  (interactive "P")
+  (let ((cell (jsonyter--nb-cell-at)))
+    (jsonyter--nb-insert-cell (if cell (overlay-end cell) (point-max))
+                              (if markdown "markdown" "code"))))
+
+(defun jsonyter-notebook-insert-cell-above (&optional markdown)
+  "Insert an empty code cell above the cell at point.
+With a prefix argument (MARKDOWN), insert a markdown cell instead."
+  (interactive "P")
+  (let ((cell (jsonyter--nb-cell-at)))
+    (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
+                              (if markdown "markdown" "code"))))
+
+(defun jsonyter-notebook-delete-cell ()
+  "Delete the cell at point, source and output together."
+  (interactive)
+  (let ((cell (jsonyter--nb-cell-at)))
+    (unless cell (user-error "No cell at point"))
+    (when (or (string-blank-p (jsonyter--nb-cell-source cell))
+              (yes-or-no-p "Delete this cell? "))
+      (let ((start (overlay-start cell)) (end (overlay-end cell)))
+        (delete-overlay cell)
+        (delete-region start end)))))
+
+(defun jsonyter-notebook-change-cell-type ()
+  "Toggle the cell at point between code and markdown.
+A cell turned into markdown loses its output, since markdown cells
+cannot carry any — the same rule the bridge applies when writing."
+  (interactive)
+  (let ((cell (jsonyter--nb-cell-at)))
+    (unless cell (user-error "No cell at point"))
+    (let ((new (if (equal (overlay-get cell 'jsonyter-cell-type) "code")
+                   "markdown" "code")))
+      (overlay-put cell 'jsonyter-cell-type new)
+      (overlay-put cell 'jsonyter-exec-count nil)
+      (jsonyter--nb-set-output cell "")
+      (jsonyter--nb-refresh-prompt cell)
+      (message "jsonyter: cell is now %s" new))))
+
+(defconst jsonyter--nb-cell-props
+  '(jsonyter-cell-id jsonyter-cell-type jsonyter-exec-count
+    jsonyter-output-string)
+  "Overlay properties that make up a cell's identity, as opposed to its
+position — the things that must travel with the text when cells move.")
+
+(defun jsonyter--nb-swap-cells (a b)
+  "Exchange the text and identity of adjacent cells A and B (A before B)."
+  (let* ((cells (jsonyter--nb-cells))
+         ;; Every other cell's span is unchanged by a swap, since the two
+         ;; texts merely trade places. Snapshot them anyway: the
+         ;; intermediate delete collapses neighbouring overlays onto
+         ;; START, and the re-inserted text is then absorbed into
+         ;; whichever of them begins there — which silently stretched the
+         ;; following cell across the whole buffer before this was fixed.
+         (spans (mapcar (lambda (o) (list o (overlay-start o) (overlay-end o)))
+                        cells))
+         (a-text (buffer-substring (overlay-start a) (overlay-end a)))
+         (b-text (buffer-substring (overlay-start b) (overlay-end b)))
+         (a-props (mapcar (lambda (p) (cons p (overlay-get a p)))
+                          jsonyter--nb-cell-props))
+         (b-props (mapcar (lambda (p) (cons p (overlay-get b p)))
+                          jsonyter--nb-cell-props))
+         (start (overlay-start a))
+         (end (overlay-end b))
+         (boundary (+ start (length b-text))))
+    (delete-region start end)
+    (goto-char start)
+    (insert b-text a-text)
+    (dolist (span spans)
+      (let ((ov (nth 0 span)))
+        (cond ((eq ov a) (move-overlay ov start boundary))
+              ((eq ov b) (move-overlay ov boundary end))
+              (t (move-overlay ov (nth 1 span) (nth 2 span))))))
+    ;; The overlays keep their slots; the text moved, so the identities
+    ;; move with it.
+    (dolist (p b-props) (overlay-put a (car p) (cdr p)))
+    (dolist (p a-props) (overlay-put b (car p) (cdr p)))
+    (jsonyter--nb-refresh-prompt a) (jsonyter--nb-refresh-output a)
+    (jsonyter--nb-refresh-prompt b) (jsonyter--nb-refresh-output b)
+    (goto-char (overlay-start b))))
+
+(defun jsonyter-notebook-move-cell-down ()
+  "Move the cell at point below the following cell."
+  (interactive)
+  (let* ((cell (jsonyter--nb-cell-at))
+         (next (and cell (seq-find (lambda (o) (> (overlay-start o)
+                                                  (overlay-start cell)))
+                                   (jsonyter--nb-cells)))))
+    (unless cell (user-error "No cell at point"))
+    (if next (jsonyter--nb-swap-cells cell next)
+      (message "jsonyter: already the last cell"))))
+
+(defun jsonyter-notebook-move-cell-up ()
+  "Move the cell at point above the preceding cell."
+  (interactive)
+  (let* ((cell (jsonyter--nb-cell-at))
+         (prev (and cell (car (last (seq-filter
+                                     (lambda (o) (< (overlay-start o)
+                                                    (overlay-start cell)))
+                                     (jsonyter--nb-cells)))))))
+    (unless cell (user-error "No cell at point"))
+    (if prev (jsonyter--nb-swap-cells prev cell)
+      (message "jsonyter: already the first cell"))))
 
 ;;; Navigation
 
@@ -1602,6 +1838,12 @@ and formatting survive byte for byte."
     (define-key map (kbd "C-c M-o") #'jsonyter-notebook-clear-cell-output)
     (define-key map (kbd "C-c M-O") #'jsonyter-notebook-clear-all-output)
     (define-key map (kbd "C-c C-k") #'jsonyter-notebook-start-kernel)
+    (define-key map (kbd "C-c C-a") #'jsonyter-notebook-insert-cell-above)
+    (define-key map (kbd "C-c C-i") #'jsonyter-notebook-insert-cell-below)
+    (define-key map (kbd "C-c C-w") #'jsonyter-notebook-delete-cell)
+    (define-key map (kbd "C-c C-t") #'jsonyter-notebook-change-cell-type)
+    (define-key map (kbd "C-c <up>") #'jsonyter-notebook-move-cell-up)
+    (define-key map (kbd "C-c <down>") #'jsonyter-notebook-move-cell-down)
     map)
   "Keymap for `jsonyter-notebook-mode'.")
 
@@ -1623,9 +1865,9 @@ only the cell source.
         (setq-local jsonyter--output-end (make-marker))
         (set-marker-insertion-type jsonyter--output-end t)
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
-        (add-hook 'write-contents-functions #'jsonyter--nb-refuse-save nil t)
+        (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t))
-    (remove-hook 'write-contents-functions #'jsonyter--nb-refuse-save t)
+    (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)))
 
 ;;;###autoload
@@ -1649,7 +1891,8 @@ Intended for `auto-mode-alist':
     (jsonyter-notebook-mode 1)
     (setq jsonyter--nb-metadata metadata
           jsonyter--nb-format format
-          jsonyter--language language)
+          jsonyter--language language
+          jsonyter--nb-file-hash (jsonyter--nb-hash-file buffer-file-name))
     (jsonyter--nb-render notebook)
     (set-buffer-modified-p nil)
     (setq buffer-undo-list nil)
@@ -1657,6 +1900,176 @@ Intended for `auto-mode-alist':
      "jsonyter: %d cells, %s kernel — C-RET run · S-RET run+advance · C-c C-b run all%s"
      (length (plist-get notebook :cells)) language
      (if (display-images-p) "" " (no image display: text output only)"))))
+
+
+;;;; Script cells (# %%)
+
+;; The same execute-and-show-results-inline experience in an ordinary
+;; script.  Cells are delimited by `# %%' markers rather than by a
+;; notebook's structure, and outputs are overlays exactly as in a
+;; notebook — so a script buffer's text is never touched and saving it
+;; stays completely ordinary.
+
+(defcustom jsonyter-script-cell-regexp
+  "^[ \t]*\\(?:#\\|//\\|;;\\|%\\)+[ \t]*%%"
+  "Regexp matching a cell boundary in a script.
+Covers the `# %%' convention used by Jupytext, VS Code and Spyder, and
+its comment-syntax variants."
+  :type 'regexp)
+
+(defcustom jsonyter-script-languages
+  '((python-mode . "python")
+    (python-ts-mode . "python")
+    (ess-r-mode . "R")
+    (R-mode . "R")
+    (julia-mode . "julia")
+    (julia-ts-mode . "julia")
+    (SAS-mode . "sas")
+    (sas-mode . "sas"))
+  "Alist mapping a major mode to the kernel language to run its cells with."
+  :type '(alist :key-type symbol :value-type string))
+
+(defvar-local jsonyter--script-cells nil
+  "Overlays holding output for script cells, keyed by cell start.")
+
+(defun jsonyter--script-language ()
+  "Kernel language for this script buffer."
+  (or (cdr (assq major-mode jsonyter-script-languages))
+      (user-error "jsonyter: don't know which kernel runs %s" major-mode)))
+
+(defun jsonyter--script-cell-bounds ()
+  "Return (START . END) of the script cell surrounding point."
+  (save-excursion
+    (let* ((start (progn
+                    (end-of-line)
+                    (if (re-search-backward jsonyter-script-cell-regexp nil t)
+                        (progn (forward-line 1) (point))
+                      (point-min))))
+           (end (progn
+                  (goto-char start)
+                  (if (re-search-forward jsonyter-script-cell-regexp nil t)
+                      (line-beginning-position)
+                    (point-max)))))
+      (cons start end))))
+
+(defun jsonyter--script-output-overlay (start end)
+  "The output overlay for the cell spanning START..END, creating it once."
+  (or (seq-find (lambda (o) (overlay-get o 'jsonyter-script-cell))
+                (overlays-in (max (point-min) (1- end)) end))
+      (let ((ov (make-overlay (max start (1- end)) end)))
+        (overlay-put ov 'jsonyter-script-cell t)
+        (push ov jsonyter--script-cells)
+        ov)))
+
+(defun jsonyter-script-run-cell (&optional advance)
+  "Execute the script cell at point, showing its output inline.
+With ADVANCE, move to the next cell afterwards."
+  (interactive)
+  (when jsonyter--busy
+    (user-error "jsonyter: kernel is busy (C-c C-c to interrupt)"))
+  (unless (jsonyter--live-p)
+    (jsonyter--connect-kernel (jsonyter--script-language)))
+  (pcase-let* ((`(,start . ,end) (jsonyter--script-cell-bounds))
+               (code (string-trim (buffer-substring-no-properties start end)))
+               (ov (jsonyter--script-output-overlay start end)))
+    (if (string-blank-p code)
+        (message "jsonyter: empty cell")
+      (overlay-put ov 'jsonyter-output-string "")
+      (jsonyter--nb-refresh-output ov)
+      (setq jsonyter--busy t)
+      (force-mode-line-update)
+      (jsonyter--send
+       "execute"
+       (append (list :kernel_id jsonyter--kernel-id :code code)
+               (and jsonyter-stream-output '(:stream t)))
+       (list
+        :output (lambda (output) (jsonyter--nb-append-output ov output))
+        :result (lambda (msg)
+                  (setq jsonyter--busy nil)
+                  (force-mode-line-update)
+                  (let ((err (plist-get msg :error))
+                        (result (plist-get msg :result)))
+                    (cond
+                     (err (jsonyter--nb-set-output
+                           ov (format "[execute failed: %s]\n"
+                                      (plist-get err :message))))
+                     (result
+                      (let ((drawn (overlay-get ov 'jsonyter-output-string)))
+                        (when (and (or (null drawn) (string-empty-p drawn))
+                                   (plist-get result :outputs))
+                          (dolist (o (plist-get result :outputs))
+                            (jsonyter--nb-append-output ov o))))))))))))
+  (when advance (jsonyter-script-next-cell)))
+
+(defun jsonyter-script-run-cell-and-advance ()
+  "Execute the script cell at point, then move to the next one."
+  (interactive)
+  (jsonyter-script-run-cell t))
+
+(defun jsonyter-script-next-cell ()
+  "Move to the next script cell."
+  (interactive)
+  (end-of-line)
+  (if (re-search-forward jsonyter-script-cell-regexp nil t)
+      (forward-line 1)
+    (goto-char (point-max))))
+
+(defun jsonyter-script-previous-cell ()
+  "Move to the previous script cell."
+  (interactive)
+  (goto-char (car (jsonyter--script-cell-bounds)))
+  (forward-line -1)
+  (goto-char (car (jsonyter--script-cell-bounds))))
+
+(defun jsonyter-script-clear-all-output ()
+  "Discard every inline output in this script buffer."
+  (interactive)
+  (dolist (ov jsonyter--script-cells)
+    (when (overlay-buffer ov) (delete-overlay ov)))
+  (setq jsonyter--script-cells nil)
+  (message "jsonyter: cleared all output"))
+
+(defvar jsonyter-script-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "<C-return>") #'jsonyter-script-run-cell)
+    (define-key map (kbd "<S-return>") #'jsonyter-script-run-cell-and-advance)
+    (define-key map (kbd "C-c C-e") #'jsonyter-script-run-cell)
+    (define-key map (kbd "C-c C-n") #'jsonyter-script-next-cell)
+    (define-key map (kbd "C-c C-p") #'jsonyter-script-previous-cell)
+    (define-key map (kbd "C-c C-c") #'jsonyter-interrupt)
+    (define-key map (kbd "C-c C-r") #'jsonyter-restart)
+    (define-key map (kbd "C-c M-O") #'jsonyter-script-clear-all-output)
+    map)
+  "Keymap for `jsonyter-script-mode'.")
+
+;;;###autoload
+(define-minor-mode jsonyter-script-mode
+  "Run `# %%' cells in an ordinary script against a Jupyter kernel.
+
+Output is shown inline in overlays, so the buffer's text — the file you
+actually save — is never touched.
+
+\\{jsonyter-script-mode-map}"
+  :lighter " Cells"
+  :keymap jsonyter-script-mode-map
+  (if jsonyter-script-mode
+      (progn
+        (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+        (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
+        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t))
+    (jsonyter-script-clear-all-output)
+    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)))
+
+;;;###autoload
+(defun jsonyter-script-mode-maybe ()
+  "Enable `jsonyter-script-mode' if this buffer has any `# %%' markers.
+Suitable for a language mode hook."
+  (when (and buffer-file-name
+             (assq major-mode jsonyter-script-languages)
+             (save-excursion
+               (goto-char (point-min))
+               (re-search-forward jsonyter-script-cell-regexp nil t)))
+    (jsonyter-script-mode 1)))
 
 (provide 'jsonyter)
 ;;; jsonyter.el ends here
