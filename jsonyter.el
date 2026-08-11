@@ -428,7 +428,7 @@ and `event' are out-of-band and leave the request pending."
              ((plist-get msg :error)
               (jsonyter--announce
                (format "[bridge error: %s]"
-                       (plist-get (plist-get msg :error) :message))))))))))))
+                       (jsonyter--error-message (plist-get msg :error)))))))))))))
 
 (defun jsonyter--answer-input (proc id content)
   "Prompt for stdin requested by request ID and reply on PROC."
@@ -505,6 +505,21 @@ HANDLERS is a plist: :result is called with the final reply plist,
                          (concat (json-serialize request) "\n"))
     id))
 
+(defun jsonyter--error-message (err)
+  "Format bridge ERR (an `:error' plist) as a user-facing string.
+
+Appends a pointed hint for authentication failures (HTTP 401/403),
+which the Jupyter server and the bridge otherwise report as a bare
+\"Unauthorized\" or \"Forbidden\" with no indication of what actually
+fixes it — confirmed empirically: an unauthenticated request against a
+token-protected server returns exactly \"Forbidden\" and nothing else."
+  (let ((message (or (plist-get err :message) (format "%s" err)))
+        (status (plist-get err :status)))
+    (if (memq status '(401 403))
+        (format "%s (set `jsonyter-server-token' or `jsonyter-server-token-file' if %s requires a token)"
+               message (or (plist-get err :url) "the server"))
+      message)))
+
 (defun jsonyter--stderr-tail (proc &optional max-lines)
   "Last MAX-LINES (default 6) non-blank lines of PROC's bridge stderr.
 Tails rather than heads: a Python traceback's most diagnostic line —
@@ -553,7 +568,7 @@ replies to other requests) is dispatched normally while waiting."
               (t " (bridge process died)"))))
     (let ((err (plist-get reply :error)))
       (when err
-        (error "jsonyter: %s" (or (plist-get err :message) err))))
+        (error "jsonyter: %s" (jsonyter--error-message err))))
     (plist-get reply :result)))
 
 (defun jsonyter--kernel-request (method params)
@@ -1037,7 +1052,7 @@ of round trips rather than one per RET.  Any success resets the count."
           (cond
            (err
             (jsonyter--note (format "[execute failed: %s]"
-                                    (plist-get err :message))))
+                                    (jsonyter--error-message err))))
            (result
             (let ((n (plist-get result :execution_count)))
               (when n (setq jsonyter--execution-count n)))
@@ -1866,7 +1881,7 @@ output."
                  (err
                   (jsonyter--nb-set-output
                    cell (propertize (format "[execute failed: %s]\n"
-                                            (plist-get err :message))
+                                            (jsonyter--error-message err))
                                     'face 'jsonyter-stderr-face)))
                  (result
                   (overlay-put cell 'jsonyter-exec-count
@@ -2261,7 +2276,7 @@ With ADVANCE, move to the next cell afterwards."
                     (cond
                      (err (jsonyter--nb-set-output
                            ov (format "[execute failed: %s]\n"
-                                      (plist-get err :message))))
+                                      (jsonyter--error-message err))))
                      (result
                       (let ((drawn (overlay-get ov 'jsonyter-output-string)))
                         (when (and (or (null drawn) (string-empty-p drawn))
