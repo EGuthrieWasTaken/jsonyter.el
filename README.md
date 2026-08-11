@@ -1,37 +1,77 @@
 # jsonyter.el
 
-Interactive Jupyter REPL buffers for Emacs, backed by the
-[jsonyter](../jsonyter) Python package's JSON-over-stdio bridge. Each REPL
-buffer talks to a kernel on a local or remote Jupyter server, with live
-streaming output, inline image rendering, kernel-backed completion,
-documentation lookup, and `input()` support — no notebook files involved.
+Jupyter, natively in Emacs — REPLs, rendered `.ipynb` notebooks, and `# %%`
+script cells, all against Python, Julia, R or SAS kernels on a local or
+remote server, backed by the
+[jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python package's
+JSON-over-stdio bridge. Streaming output, inline images, kernel-backed
+completion and documentation lookup, `input()` support, and — for
+notebooks — lossless byte-identical saves that never touch stored outputs
+unless you ask.
+
+> **A note on how this was built.** The bulk of jsonyter.el was written by
+> Claude Fable 5, an Anthropic AI model, working iteratively with the
+> project's maintainer over the course of development — design decisions,
+> requirements and review were mine; the code, and much of the
+> exploratory verification behind it, were largely the model's.
 
 ## Requirements
 
 - Emacs 27.1+ (images need a graphical Emacs built with image support)
-- The `jsonyter` Python package, version 0.2 or newer (`pip install -e .` in
-  the jsonyter repo), plus a reachable Jupyter server
-  (`jupyter server --ServerApp.token=SECRET`)
+- The [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python
+  package, 1.0.0 or newer:
+  ```bash
+  pip install jsonyter
+  ```
+- A reachable Jupyter server: `pip install jupyter-server ipykernel` and
+  `jupyter server --ServerApp.token=SECRET`, local or remote
 
-Against an older 0.1 bridge the REPL still works; you lose live streaming
-and the kernel-state indicator, and interrupt is not serviced while a cell
-is running.
-
-Newer bridges add a `control_timeout` that bounds the introspection calls
-and a thread-safe `connect()`. jsonyter.el does not require either — it
-sends its own per-call timeouts, and its startup is sequenced so that no
-two connection-opening requests are ever in flight at once — but both are
-worth having, particularly if you drive the same bridge from other code.
+Missing Python, or the `jsonyter` package, is a clear error rather than a
+hang or a silent failure: if the bridge command can't be found at all,
+jsonyter.el names it and points at `pip install jsonyter`; if it's found
+but exits before answering (e.g. the interpreter it points at doesn't
+have the package), the actual Python error — usually `No module named
+jsonyter` — is surfaced directly rather than a generic "process died."
 
 ## Setup
+
+Pick whichever matches your Emacs package manager. All of these fetch
+straight from GitHub, so none of them need jsonyter.el to be listed on
+MELPA — though once it is, `:ensure t` alone will also work, no recipe
+needed.
+
+**[straight.el](https://github.com/radian-software/straight.el):**
+
+```elisp
+(straight-use-package
+ '(jsonyter :type git :host github :repo "EGuthrieWasTaken/jsonyter.el"))
+```
+
+**[elpaca](https://github.com/progfolio/elpaca):**
+
+```elisp
+(use-package jsonyter
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el"))
+```
+
+**package.el / use-package, via MELPA (once listed):**
+
+```elisp
+(use-package jsonyter
+  :ensure t)
+```
+
+**Manual:**
 
 ```elisp
 (add-to-list 'load-path "/path/to/jsonyter.el")
 (require 'jsonyter)  ; or autoload the jsonyter-start-* commands
 ```
 
-If the `jsonyter` entry-point script is not on Emacs's `exec-path`, point
-`jsonyter-command` at the module instead:
+Whichever you use, if the `jsonyter` console script isn't on Emacs's
+`exec-path` — a `pip install --user` puts it somewhere `pip` doesn't add
+to `PATH` on every system — point `jsonyter-command` at the module
+instead of the script:
 
 ```elisp
 (setq jsonyter-command '("python3" "-m" "jsonyter"))

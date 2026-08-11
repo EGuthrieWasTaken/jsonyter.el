@@ -1,16 +1,33 @@
 ;;; jsonyter.el --- Interactive Jupyter REPLs via the jsonyter bridge -*- lexical-binding: t; -*-
 
 ;; Author: Ethan Guthrie
-;; Version: 0.2.0
+;; Assisted-by: Claude:claude-fable-5
+;; Version: 1.0.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: languages, processes, jupyter
-;; URL: https://github.com/eguthrie/jsonyter.el
+;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
+
+;; Copyright (C) 2026 Ethan Guthrie
+
+;; This program is free software: you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
 ;; Interactive Jupyter REPL buffers for Emacs, backed by the `jsonyter'
-;; Python package (https://github.com/eguthrie/jsonyter), which exposes a
-;; Jupyter server as a line-oriented JSON protocol over stdin/stdout.
+;; Python package (https://github.com/EGuthrieWasTaken/jsonyter), which
+;; exposes a Jupyter server as a line-oriented JSON protocol over
+;; stdin/stdout.
 ;;
 ;; Entry points:
 ;;
@@ -130,7 +147,7 @@ Only consulted when `jsonyter-server-token' is nil."
 (defcustom jsonyter-command '("jsonyter")
   "Command (as a list) that runs the jsonyter stdio bridge.
 Use e.g. \\='(\"python3\" \"-m\" \"jsonyter\") if the entry point script
-is not on `exec-path'."
+is not on variable `exec-path'."
   :type '(repeat string))
 
 (defcustom jsonyter-insecure-tls nil
@@ -326,15 +343,29 @@ buffer records exactly how it was launched."
             (if (and token (eq transport 'env))
                 (cons (concat "JUPYTER_TOKEN=" token) process-environment)
               process-environment))
-           (proc (make-process
-                  :name "jsonyter"
-                  :command jsonyter--command
-                  :connection-type 'pipe
-                  :noquery t
-                  :coding 'utf-8-unix
-                  :stderr stderr-buffer
-                  :filter #'jsonyter--filter
-                  :sentinel #'jsonyter--sentinel)))
+           (proc (condition-case nil
+                     (make-process
+                      :name "jsonyter"
+                      :command jsonyter--command
+                      :connection-type 'pipe
+                      :noquery t
+                      :coding 'utf-8-unix
+                      :stderr stderr-buffer
+                      :filter #'jsonyter--filter
+                      :sentinel #'jsonyter--sentinel)
+                   ;; `make-process' signals this synchronously, before
+                   ;; any process exists, when the executable itself
+                   ;; can't be found on PATH — the state a fresh install
+                   ;; with no Python package yet is in by default, since
+                   ;; `jsonyter-command' defaults to the bare console
+                   ;; script name. Emacs's own message for this ("Searching
+                   ;; for program: No such file or directory, jsonyter")
+                   ;; never says what jsonyter actually is, so replace it.
+                   (file-missing
+                    (kill-buffer stderr-buffer)
+                    (user-error
+                     "jsonyter: bridge command %S not found on PATH — install the jsonyter Python package (`pip install jsonyter`), or set `jsonyter-command' to the interpreter that has it, e.g. '(\"python3\" \"-m\" \"jsonyter\")"
+                     (car jsonyter--command))))))
       (let ((stderr-proc (get-buffer-process stderr-buffer)))
         (when stderr-proc
           (set-process-query-on-exit-flag stderr-proc nil)))
@@ -474,6 +505,20 @@ HANDLERS is a plist: :result is called with the final reply plist,
                          (concat (json-serialize request) "\n"))
     id))
 
+(defun jsonyter--stderr-tail (proc &optional max-lines)
+  "Last MAX-LINES (default 6) non-blank lines of PROC's bridge stderr.
+Tails rather than heads: a Python traceback's most diagnostic line —
+the exception itself — is always last, and anything earlier tends to be
+import-time warning noise (this project's own dependencies produce
+some on certain Python builds).  Returns nil if there is nothing
+useful to show."
+  (let ((buf (process-get proc 'jsonyter-stderr-buffer)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (let* ((lines (split-string (buffer-string) "\n" t "[ \t]+"))
+               (tail (last lines (or max-lines 6))))
+          (and tail (mapconcat #'identity tail "\n")))))))
+
 (defun jsonyter--request-sync (method params &optional timeout)
   "Send METHOD/PARAMS and wait for the reply, returning its :result.
 Signals an error on a bridge error or timeout.  TIMEOUT defaults to
@@ -492,7 +537,20 @@ replies to other requests) is dispatched normally while waiting."
       (remhash id jsonyter--callbacks)
       (error "jsonyter: no reply to %s within %ss%s" method
              (or timeout jsonyter-request-timeout)
-             (if (process-live-p proc) "" " (bridge process died)")))
+             (cond
+              ((process-live-p proc) "")
+              ;; The bridge died before answering even its first
+              ;; request — e.g. the jsonyter Python package isn't
+              ;; installed for whatever interpreter `jsonyter-command'
+              ;; names. Python's own complaint about that is sitting
+              ;; right there in stderr; show it rather than the
+              ;; uninformative "died" this used to say on its own,
+              ;; since it usually names the actual fix directly (most
+              ;; commonly "No module named jsonyter").
+              ((jsonyter--stderr-tail proc)
+               (format " (bridge process died — %s)"
+                      (jsonyter--stderr-tail proc)))
+              (t " (bridge process died)"))))
     (let ((err (plist-get reply :error)))
       (when err
         (error "jsonyter: %s" (or (plist-get err :message) err))))
@@ -523,6 +581,7 @@ that is still live on the other side."
    (+ jsonyter-request-timeout 5)))
 
 (defun jsonyter--live-p ()
+  "Non-nil if this buffer has a kernel and a running bridge process."
   (and jsonyter--kernel-id (process-live-p jsonyter--process)))
 
 ;;;; Kernel spec resolution
@@ -702,6 +761,7 @@ into it would corrupt the document — so those go to the echo area."
     (goto-char (point-max))))
 
 (defun jsonyter--current-input ()
+  "Text of the input at the current prompt, or \"\" before one exists."
   (if (marker-position jsonyter--input-start)
       (buffer-substring-no-properties jsonyter--input-start (point-max))
     ""))
@@ -997,6 +1057,7 @@ of round trips rather than one per RET.  Any success resets the count."
 ;;;; History
 
 (defun jsonyter--history-add (code)
+  "Push CODE onto the input history, unless it repeats the last entry."
   (unless (equal code (car jsonyter--history))
     (push code jsonyter--history)
     (when (> (length jsonyter--history) jsonyter-history-size)
@@ -1534,7 +1595,7 @@ end of its last visible line still lands in the right cell."
 ;; diff.
 
 (defvar-local jsonyter--nb-file-hash nil
-  "sha256 of the notebook file as it was last read or written.
+  "SHA-256 of the notebook file as it was last read or written.
 Passed back on save so an edit made outside Emacs is detected rather
 than silently clobbered.")
 
@@ -1585,9 +1646,9 @@ disk exactly as it was; see `jsonyter--nb-set-output'."
    (jsonyter--nb-cells)))
 
 (defun jsonyter--nb-do-save (include-outputs)
-  "Write this notebook's cell source, and outputs if INCLUDE-OUTPUTS, to
-its file through the jsonyter bridge.  Shared by `jsonyter-notebook-save'
-and `jsonyter-notebook-save-with-outputs'."
+  "Write this notebook's cell source to its file through the bridge.
+Also writes outputs when INCLUDE-OUTPUTS is non-nil.  Shared by
+`jsonyter-notebook-save' and `jsonyter-notebook-save-with-outputs'."
   (unless buffer-file-name
     (user-error "This notebook buffer isn't visiting a file"))
   (jsonyter--ensure-bridge)
@@ -1728,18 +1789,19 @@ and must not be recorded as one."
      t)))
 
 (defun jsonyter--nb-output-to-spec (output)
-  "Convert kernel-shape OUTPUT (as delivered by `execute') to the
-nbformat shape `write_notebook' expects with `include_outputs' — the
-inverse of `jsonyter--nb-adapt-output'.
+  "Convert kernel-shape OUTPUT to the nbformat shape for saving.
+This is what `write_notebook' expects with `include_outputs' — the
+inverse of `jsonyter--nb-adapt-output', for an OUTPUT as delivered by
+`execute'.
 
 `update_display_data' has no independent slot in nbformat (it is meant
 to patch an existing `display_data' in place by display_id); stored as
 an ordinary `display_data' instead, a reasonable approximation for a
-plain saved file. Rich mimetypes whose data is a flat set of strings —
+plain saved file.  Rich mimetypes whose data is a flat set of strings —
 images, HTML, plain text, the common case for a matplotlib figure —
 round-trip correctly; a mimetype whose JSON value nests further arrays
 does not, since data/metadata are carried through as read, and this
-library parses JSON arrays as lisp lists rather than vectors throughout.
+library parses JSON arrays as Lisp lists rather than vectors throughout.
 Not expected to matter for anything but exotic interactive-widget
 output."
   (let ((type (plist-get output :type)))
@@ -1928,8 +1990,8 @@ cannot carry any — the same rule the bridge applies when writing."
 (defconst jsonyter--nb-cell-props
   '(jsonyter-cell-id jsonyter-cell-type jsonyter-exec-count
     jsonyter-output-string)
-  "Overlay properties that make up a cell's identity, as opposed to its
-position — the things that must travel with the text when cells move.")
+  "Overlay properties making up a cell's identity, as opposed to position.
+These are the things that must travel with the text when cells move.")
 
 (defun jsonyter--nb-swap-cells (a b)
   "Exchange the text and identity of adjacent cells A and B (A before B)."
@@ -2112,15 +2174,28 @@ its comment-syntax variants."
   :type 'regexp)
 
 (defcustom jsonyter-script-languages
-  '((python-mode . "python")
-    (python-ts-mode . "python")
-    (ess-r-mode . "R")
-    (R-mode . "R")
-    (julia-mode . "julia")
-    (julia-ts-mode . "julia")
-    (SAS-mode . "sas")
-    (sas-mode . "sas"))
-  "Alist mapping a major mode to the kernel language to run its cells with."
+  (append
+   '((python-mode . "python")
+     (ess-r-mode . "R")
+     (R-mode . "R")
+     (julia-mode . "julia")
+     (SAS-mode . "sas")
+     (sas-mode . "sas"))
+   ;; The tree-sitter major modes (Emacs 29+) are added only when they
+   ;; actually exist, and via `intern-soft' on a string rather than as
+   ;; literal symbols above, so this package's own Package-Requires can
+   ;; stay at 27.1 -- a literal `python-ts-mode' anywhere in the source
+   ;; would otherwise commit the whole package to requiring 29.1, for a
+   ;; default-value entry that does nothing at all on anything older.
+   (delq nil
+         (mapcar (lambda (name.lang)
+                   (let ((mode (intern-soft (car name.lang))))
+                     (and mode (fboundp mode) (cons mode (cdr name.lang)))))
+                 '(("python-ts-mode" . "python")
+                   ("julia-ts-mode" . "julia")))))
+  "Alist mapping a major mode to the kernel language to run its cells with.
+On Emacs 29 and newer this also includes `python-ts-mode' and
+`julia-ts-mode', so tree-sitter major modes work without configuration."
   :type '(alist :key-type symbol :value-type string))
 
 (defvar-local jsonyter--script-cells nil
