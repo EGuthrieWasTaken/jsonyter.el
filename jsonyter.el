@@ -203,9 +203,9 @@ Only honored when Emacs supports native image scaling."
 
 (defcustom jsonyter-image-max-height nil
   "Maximum pixel height for inline images, or nil for no limit.
-Tall images are scrollable when `jsonyter-slice-images' is on, so this
-is usually unnecessary; set it if you would rather shrink huge plots to
-fit than scroll through them."
+Tall images can be scrolled through where they are shown, so this is
+usually unnecessary; set it if you would rather shrink huge plots to fit
+than scroll through them."
   :type '(choice (const :tag "No limit" nil) integer))
 
 (defcustom jsonyter-slice-images t
@@ -217,7 +217,12 @@ than the window all-or-nothing: scrolling either steps clean over it or
 lands mid-image showing only its bottom edge, and the image can never be
 brought fully into view.  Slicing it across as many lines as it is tall
 \(what `doc-view' does for page images) lets ordinary line scrolling walk
-through it like normal text."
+through it like normal text.
+
+This applies to REPL buffers, whose output is the buffer's own text.  A
+notebook or script cell shows its output in an overlay string instead,
+and slicing cannot work there at all — see `jsonyter--string-output' —
+so those images are always inserted whole."
   :type 'boolean)
 
 (defcustom jsonyter-render-html t
@@ -790,6 +795,19 @@ into it would corrupt the document — so those go to the echo area."
 
 ;;;; Output rendering
 
+(defvar jsonyter--string-output nil
+  "Non-nil while rendering an output into a string rather than buffer text.
+
+A notebook or script cell shows its output in an overlay string, and an
+overlay string is a single buffer position however many newlines it
+contains: redisplay cannot begin part way into one.  The lines a sliced
+image is spread across are therefore not buffer lines there, and nothing
+— `next-line', `scroll-up-command', `recenter' — can move between them;
+a plot taller than the window pins `window-start' in front of it and the
+buffer cannot be scrolled past it at all.  A whole image is a single
+glyph on a single line instead, which Emacs does scroll through, by
+pixel.  So slicing is skipped when this is set.")
+
 (defun jsonyter--mime (data key)
   "Return the KEY entry of mimebundle DATA as a string, or nil.
 Handles values that arrive as a list of line fragments."
@@ -806,30 +824,56 @@ Handles values that arrive as a list of line fragments."
         (insert (propertize rendered 'face face))
       (insert rendered))))
 
-(defun jsonyter--image-rows (image)
+(defun jsonyter--image-rows (image line-height)
   "How many text lines IMAGE should be sliced across, or nil for one.
-Returns nil when slicing is off, when there is no graphical display, or
-when the image's displayed size cannot be measured."
+LINE-HEIGHT is the pixel height of a line in the buffer that will show
+it.  Returns nil when slicing is off, when the output is bound for an
+overlay string rather than for buffer text, when there is no graphical
+display, or when the image's displayed size cannot be measured."
   (and jsonyter-slice-images
+       (not jsonyter--string-output)
        (display-graphic-p)
        (ignore-errors
-         (let ((pixel-height (cdr (image-size image t)))
-               (line-height (max 1 (default-font-height))))
-           (max 1 (ceiling pixel-height line-height))))))
+         (max 1 (round (/ (float (cdr (image-size image t))) line-height))))))
+
+(defun jsonyter--fit-image-to-lines (image rows line-height)
+  "Resize IMAGE so that slicing it into ROWS lands on whole text lines.
+A slice is only as tall as its own share of the image, so unless the
+image's height is an exact multiple of LINE-HEIGHT every slice comes up
+short of the line it sits on, and the shortfall is drawn as a band of
+background — a stripe across the picture, once per slice.  Rounding the
+height to a whole number of lines removes the shortfall.
+
+Both dimensions are pinned rather than just the height because
+`:max-width' and `:max-height' would otherwise still be free to shrink
+the result to preserve the aspect ratio, undoing the fit; `:width' and
+`:height' take precedence over them."
+  (let* ((size (image-size image t))
+         (height (cdr size))
+         (target (* rows line-height)))
+    (unless (zerop height)
+      (setf (image-property image :width)
+            (max 1 (round (* (car size) (/ (float target) height))))
+            (image-property image :height) target))))
 
 (defun jsonyter--insert-image (image alt)
   "Insert IMAGE at point with ALT as its text fallback.
 Tall images are sliced one text line per row so that line-based
-scrolling can move through them; see `jsonyter-slice-images'."
-  (let ((rows (jsonyter--image-rows image)))
+scrolling can move through them; see `jsonyter-slice-images'.  Output
+bound for an overlay string is inserted whole instead, since slices
+would not be lines there at all — see `jsonyter--string-output'."
+  (let* ((line-height (max 1 (default-font-height)))
+         (rows (jsonyter--image-rows image line-height)))
     (if (and rows (> rows 1))
-        ;; `insert-sliced-image' repeats its string once per row, so it
-        ;; gets a single space (as `doc-view' does) rather than ALT --
-        ;; otherwise the buffer's real text, and anything copied out of
-        ;; it, is the alt text repeated once per slice. It also
-        ;; terminates each row with its own newline, so no trailing one
-        ;; is needed here.
-        (insert-sliced-image image " " nil rows 1)
+        (progn
+          (jsonyter--fit-image-to-lines image rows line-height)
+          ;; `insert-sliced-image' repeats its string once per row, so it
+          ;; gets a single space (as `doc-view' does) rather than ALT --
+          ;; otherwise the buffer's real text, and anything copied out of
+          ;; it, is the alt text repeated once per slice. It also
+          ;; terminates each row with its own newline, so no trailing one
+          ;; is needed here.
+          (insert-sliced-image image " " nil rows 1))
       (insert-image image alt)
       (insert "\n"))))
 
@@ -1474,18 +1518,23 @@ stores stream text as a list of lines."
 (defun jsonyter--nb-render-string (output)
   "Render one OUTPUT (already in kernel shape) to a propertized string.
 Rendering happens in a scratch buffer so the existing output renderer —
-images, sliced scrolling, ANSI, shr — can be reused verbatim; the
-resulting text, display properties and all, becomes an overlay string."
-  (with-temp-buffer
-    (setq-local jsonyter--clear-pending nil)
-    (setq-local jsonyter--output-start (copy-marker (point-min)))
-    (setq-local jsonyter--output-end (copy-marker (point-max) t))
-    (condition-case err
-        (jsonyter--render-output output)
-      (error (insert (format "[jsonyter: cannot render %s output: %s]\n"
-                             (plist-get output :type)
-                             (error-message-string err)))))
-    (buffer-string)))
+images, ANSI, shr — can be reused verbatim; the resulting text, display
+properties and all, becomes an overlay string.
+
+The renderer is told it is working for a string rather than for buffer
+text (see `jsonyter--string-output'), which is what keeps it from
+slicing images across lines that an overlay string does not have."
+  (let ((jsonyter--string-output t))
+    (with-temp-buffer
+      (setq-local jsonyter--clear-pending nil)
+      (setq-local jsonyter--output-start (copy-marker (point-min)))
+      (setq-local jsonyter--output-end (copy-marker (point-max) t))
+      (condition-case err
+          (jsonyter--render-output output)
+        (error (insert (format "[jsonyter: cannot render %s output: %s]\n"
+                               (plist-get output :type)
+                               (error-message-string err)))))
+      (buffer-string))))
 
 (defun jsonyter--nb-outputs-string (rendered)
   "Wrap RENDERED output text for display beneath a cell."
