@@ -159,6 +159,9 @@ Keys in the REPL buffer:
 | `C-c C-c` | Interrupt the kernel |
 | `C-c C-r` | Restart the kernel |
 | `C-c C-q` | Shut the kernel down |
+| `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
+| `C-c C-j` | Attach this buffer to any kernel running on the server |
+| `C-c M-h` | Show the kernel's most recent commands |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |
 | `C-c C-k` | Reset a REPL stuck at "kernel is busy" |
 | `C-c M-o` | Clear output above the prompt |
@@ -204,11 +207,68 @@ event subscription rather than polled:
 | `:run` | running your cell |
 | `:run[ext]` | busy on behalf of another client attached to the same kernel |
 | `:starting` / `:restarting` | coming up |
-| `:offline` | the bridge's websocket dropped (it reconnects on the next send) |
+| `:offline` | the bridge's websocket dropped — `C-c C-l` to reconnect |
 | `:dead` | the kernel is gone — `C-c C-r` to restart |
 
 A kernel killed out from under the REPL (say, shut down from a notebook UI)
 reports itself as dead in the buffer instead of hanging the next execute.
+
+## Reconnecting after a dropped connection
+
+Against a remote server, a laptop that sleeps or loses its network leaves
+the bridge's websocket to the kernel half-open: the socket still reports
+itself connected, so nothing reconnects on its own, and the buffer waits
+on a reply that can never arrive. `C-c C-l` (`jsonyter-kernel-reconnect`)
+is the way out — it closes the dead socket and opens a fresh one to the
+same kernel.
+
+**The kernel never went anywhere.** It kept running on the server the
+whole time with every variable it had, so reconnecting costs you nothing
+but output that was in flight. This is not `C-c C-r`, which restarts the
+kernel and throws that state away.
+
+`C-c C-j` (`jsonyter-kernel-connect`) is the same operation aimed
+anywhere: it lists the kernels the server is running — most recently
+active first, with this buffer's own marked `*` — and attaches the buffer
+to the one you pick. Both work in any jsonyter buffer: a REPL, a rendered
+notebook, or a script with `jsonyter-script-mode` on. Two uses beyond
+recovery:
+
+- Point a script's `# %%` cells at the kernel a notebook already has
+  warm, so both see the same variables.
+- Adopt a kernel started by JupyterLab or another editor.
+
+A kernel you attach to this way is **not** shut down when the buffer is
+killed, whatever `jsonyter-shutdown-on-kill` says — it was not this
+buffer's to end. What a buffer does shut down is the kernel it started
+itself, whether or not that is the one it is attached to when it dies, so
+wandering off to a colleague's kernel neither adopts theirs nor abandons
+your own. Nothing changes for the ordinary case of one buffer, one
+kernel.
+
+A REPL gets a fresh prompt on reconnect, since anything still outstanding
+is abandoned. Its number can lag what the kernel is really counting —
+the kernel kept working while you were away — and resyncs on the next
+execution.
+
+### Seeing what a kernel has run
+
+`C-c M-h` (`jsonyter-kernel-history`) lists a kernel's most recent
+commands in a help buffer — how to recover what a REPL ran when you have
+lost the transcript, or to work out what a kernel is being used for
+before adopting it. It defaults to `jsonyter-kernel-history-count`
+commands and this buffer's own kernel; a numeric prefix sets the count
+(`C-u 100 C-c M-h`), and a bare `C-u` prompts for both, which is how to
+read the history of a kernel you are not attached to.
+
+Note that how far back this reaches, and whose commands come back, is up
+to the kernel. IPython's history is one SQLite database per profile,
+shared by every kernel using it, so a tail can include commands run by a
+*different* kernel — a brand-new kernel that has executed nothing still
+answers with the last things its neighbours ran. Entries are grouped and
+labelled by session for that reason. Not every kernel implements history
+at all (SAS never answers), so this can time out where a REPL against the
+same kernel works fine.
 
 ## Notebooks (.ipynb)
 
@@ -236,6 +296,9 @@ in the text to corrupt.
 | `C-c C-n` / `C-c C-p` | Next / previous cell |
 | `C-c C-c` | Interrupt the kernel |
 | `C-c C-r` | Restart the kernel |
+| `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
+| `C-c C-j` | Attach this buffer to any kernel running on the server |
+| `C-c M-h` | Show the kernel's most recent commands |
 | `C-c M-o` / `C-c M-O` | Clear this cell's output / all output |
 | `C-c C-k` | Start the kernel explicitly |
 | `C-c C-i` / `C-c C-a` | Insert a cell below / above (`C-u` for markdown) |
@@ -303,7 +366,8 @@ variants, per `jsonyter-script-cell-regexp`).
 `jsonyter-script-mode-maybe` enables the mode only in buffers that
 actually contain cell markers. Keys mirror the notebook: `C-RET` run,
 `S-RET` run and advance, `C-c C-n`/`C-c C-p` to move between cells,
-`C-c C-c` interrupt, `C-c M-O` clear all output.
+`C-c C-c` interrupt, `C-c M-O` clear all output, `C-c C-l`/`C-c C-j`
+reconnect or attach to a kernel.
 
 Output appears inline in overlays, so **the file's text is never
 touched** and saving stays completely ordinary. The kernel language comes
