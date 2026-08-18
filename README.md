@@ -26,19 +26,9 @@ unless you ask.
 - A reachable Jupyter server: `pip install jupyter-server ipykernel` and
   `jupyter server --ServerApp.token=SECRET`, local or remote
 
-Missing Python, or the `jsonyter` package, is a clear error rather than a
-hang or a silent failure: if the bridge command can't be found at all,
-jsonyter.el names it and points at `pip install jsonyter`; if it's found
-but exits before answering (e.g. the interpreter it points at doesn't
-have the package), the actual Python error — usually `No module named
-jsonyter` — is surfaced directly rather than a generic "process died."
-
 ## Setup
 
-Pick whichever matches your Emacs package manager. All of these fetch
-straight from GitHub, so none of them need jsonyter.el to be listed on
-MELPA — though once it is, `:ensure t` alone will also work, no recipe
-needed.
+Pick whichever matches your package manager.
 
 **[straight.el](https://github.com/radian-software/straight.el):**
 
@@ -54,7 +44,7 @@ needed.
   :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el"))
 ```
 
-**package.el / use-package, via MELPA (once listed):**
+**package.el / use-package, once on MELPA:**
 
 ```elisp
 (use-package jsonyter
@@ -111,8 +101,7 @@ server needs no configuration at all.
 ### How the token reaches the bridge
 
 `jsonyter-token-transport` controls this. The default keeps the secret off
-the command line, where `ps` would expose it to every local user — which
-would otherwise defeat the point of encrypting the file:
+the command line, where `ps` would expose it to every local user:
 
 | Value | Mechanism |
 | --- | --- |
@@ -188,13 +177,10 @@ was already at the end, so you can read back through the buffer while a
 cell is still running.
 
 Images taller than one text line are inserted **sliced**, one slice per
-line (the technique `doc-view` uses for page images). Emacs scrolls by
-whole lines, and an image inserted the ordinary way occupies a single
-line however tall it is — so a tall plot is all-or-nothing: scrolling
-either steps clean over it or lands mid-image showing only its bottom
-edge. Slicing lets ordinary line scrolling walk through a plot like
-normal text. Set `jsonyter-slice-images` to nil to opt out, or
-`jsonyter-image-max-height` to shrink tall plots to fit instead.
+line, so ordinary line scrolling walks through a tall plot like normal
+text instead of stepping over it in a single jump. Set
+`jsonyter-slice-images` to nil to opt out, or `jsonyter-image-max-height`
+to shrink tall plots to fit instead.
 
 ## Kernel state
 
@@ -222,10 +208,10 @@ on a reply that can never arrive. `C-c C-l` (`jsonyter-kernel-reconnect`)
 is the way out — it closes the dead socket and opens a fresh one to the
 same kernel.
 
-**The kernel never went anywhere.** It kept running on the server the
-whole time with every variable it had, so reconnecting costs you nothing
-but output that was in flight. This is not `C-c C-r`, which restarts the
-kernel and throws that state away.
+The kernel itself is unaffected — it keeps running on the server with all
+of its state — so reconnecting costs nothing but output that was in
+flight. This is not `C-c C-r`, which restarts the kernel and discards
+that state.
 
 `C-c C-j` (`jsonyter-kernel-connect`) is the same operation aimed
 anywhere: it lists the kernels the server is running — most recently
@@ -238,13 +224,9 @@ recovery:
   warm, so both see the same variables.
 - Adopt a kernel started by JupyterLab or another editor.
 
-A kernel you attach to this way is **not** shut down when the buffer is
-killed, whatever `jsonyter-shutdown-on-kill` says — it was not this
-buffer's to end. What a buffer does shut down is the kernel it started
-itself, whether or not that is the one it is attached to when it dies, so
-wandering off to a colleague's kernel neither adopts theirs nor abandons
-your own. Nothing changes for the ordinary case of one buffer, one
-kernel.
+A buffer shuts down only the kernel it started itself, whether or not
+that is the one it is attached to when it is killed. A kernel you attach
+to is never shut down for you, whatever `jsonyter-shutdown-on-kill` says.
 
 A REPL gets a fresh prompt on reconnect, since anything still outstanding
 is abandoned. Its number can lag what the kernel is really counting —
@@ -261,9 +243,9 @@ commands and this buffer's own kernel; a numeric prefix sets the count
 (`C-u 100 C-c M-h`), and a bare `C-u` prompts for both, which is how to
 read the history of a kernel you are not attached to.
 
-Note that how far back this reaches, and whose commands come back, is up
-to the kernel. IPython's history is one SQLite database per profile,
-shared by every kernel using it, so a tail can include commands run by a
+How far back this reaches, and whose commands come back, is up to the
+kernel. IPython's history is one SQLite database per profile, shared by
+every kernel using it, so a tail can include commands run by a
 *different* kernel — a brand-new kernel that has executed nothing still
 answers with the last things its neighbours ran. Entries are grouped and
 labelled by session for that reason. Not every kernel implements history
@@ -309,9 +291,8 @@ in the text to corrupt.
 | `C-c C-s` | Save cell source and this session's new outputs |
 
 `M-x jsonyter-clear` clears every output in the buffer and blanks the
-execution counts, leaving the notebook as though nothing had been run —
-what you want before running a project through cleanly. It does the
-equivalent thing in a REPL or script buffer too.
+execution counts, leaving the notebook as though nothing had been run. It
+does the equivalent thing in a REPL or script buffer too.
 
 Outputs stored in the file are rendered when it opens, including figures.
 Running a cell **replaces** its output rather than appending, and results
@@ -332,10 +313,9 @@ edit is a one-line diff rather than a whole-file rewrite.
 `C-x C-s` (`jsonyter-notebook-save-buffer`) saves **source only** — cell
 text, order and type. Execution results are session-only by default, so
 re-running a cell to produce a new figure and then `C-x C-s` leaves that
-figure out of the file; because running a cell changes no buffer text,
-Emacs would otherwise consider the buffer unmodified and return silently,
-which is indistinguishable from a save that failed, so this says so
-explicitly instead.
+figure out of the file. Running a cell changes no buffer text, so Emacs
+would otherwise consider the buffer unmodified and return silently; this
+says what it did instead.
 
 `C-c C-s` (`jsonyter-notebook-save-with-outputs`) saves source **and**
 this session's new outputs. A cell run, or explicitly cleared (`C-c M-o`
@@ -382,10 +362,10 @@ code can ask "is this any kind of jsonyter buffer" with one check,
 `(bound-and-true-p jsonyter-mode)`, instead of testing all three
 specific modes itself.
 
-`jsonyter-save-buffer` is built on exactly this and is the pattern to
-copy: dispatch on a specific mode only where that mode's buffer actually
-needs different handling — a notebook needs `jsonyter-notebook-save-buffer`
-to avoid a silent no-op when only session output changed — and treat
+`jsonyter-save-buffer` is built on this and is the pattern to copy:
+dispatch on a specific mode only where that mode's buffer actually needs
+different handling — a notebook needs `jsonyter-notebook-save-buffer` to
+avoid a silent no-op when only session output changed — and treat
 `jsonyter-mode` as the umbrella everything else hangs off:
 
 ```elisp
@@ -396,40 +376,34 @@ to avoid a silent no-op when only session output changed — and treat
     (save-buffer)))
 ```
 
-That's a real, working example: it is what lets a single "save" key bound
-elsewhere in a config do the right thing in a jsonyter notebook without
-changing behavior anywhere else.
+This lets a single "save" key bound elsewhere in a config do the right
+thing in a jsonyter notebook without changing behavior anywhere else.
 
 ## Kernel quirks this handles
 
-Kernels vary in how faithfully they implement the messaging protocol, and
-two behaviours are worth knowing about because they used to break the
-REPL outright:
+Kernels vary in how faithfully they implement the messaging protocol.
+Two behaviours are worth knowing about:
 
 - **`is_complete` is asked about newline-terminated code.** The SAS
-  kernel calls anything without a trailing newline "incomplete" —
-  including the empty string — so `RET` could never submit SAS at all.
-  Terminating the code first fixes SAS and also fixes Python, where
-  `def f():\n    return 1` reads as incomplete bare but complete when
-  terminated. Genuinely unfinished input still reports incomplete on
-  every kernel, so nothing is submitted early. Use `C-j` for a literal
-  newline, or `M-RET` to force-send.
+  kernel calls anything without a trailing newline "incomplete",
+  including the empty string. Terminating the code first handles that,
+  and also handles Python, where `def f():\n    return 1` reads as
+  incomplete bare but complete when terminated. Genuinely unfinished
+  input still reports incomplete on every kernel, so nothing is
+  submitted early. Use `C-j` for a literal newline, or `M-RET` to
+  force-send.
 - **Short kernel requests carry an explicit timeout.** The bridge
   serializes requests per kernel, so a kernel that never answers a
   message type can block that kernel's worker and queue every later
   execute behind it — the REPL appearing hung with the kernel stuck
   "busy". SAS never answers `history` and answers `inspect` with
-  `aborted`, so this is reachable in practice. Current bridges bound the
-  introspection calls themselves via `control_timeout` (30s);
-  jsonyter.el additionally sends a per-call timeout, which works the
-  same on older bridges, keeps the bound at an interactive latency, and
-  makes `jsonyter-request-timeout` the one knob that takes effect.
-  `C-c C-k` is the manual escape hatch if a prompt still gets stuck.
+  `aborted`, so this is reachable in practice. jsonyter.el bounds these
+  calls with `jsonyter-request-timeout` so one unanswered request cannot
+  wedge the queue. `C-c C-k` is the manual escape hatch if a prompt
+  still gets stuck.
 
 If `is_complete` fails twice in a row the REPL stops asking and `RET`
-simply always sends — one transient blip on a remote server won't cost
-you multi-line editing, and a kernel that never answers stops being
-asked almost immediately.
+always sends.
 
 SAS is also slow on first contact: its first execute spends ~17s
 establishing the SAS subprocess before producing output. That is the
@@ -448,5 +422,4 @@ the JSON protocol on stdout.
 
 Streaming and the final reply are reconciled by count: the bridge repeats
 every streamed output in the final `outputs` list, so jsonyter.el renders
-only the tail past what it already drew — which also means an older bridge
-that streams nothing renders correctly at the end.
+only the tail past what it already drew.
