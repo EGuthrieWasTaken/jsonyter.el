@@ -290,6 +290,32 @@ in the text to corrupt.
 | `C-x C-s` | Save cell source |
 | `C-c C-s` | Save cell source and this session's new outputs |
 
+The cell-editing commands are autoloaded under stable public names, so you
+can bind them in your own keymap instead of relying on the defaults above:
+
+| Command | Default key |
+| --- | --- |
+| `jsonyter-insert-cell-below` | `C-c C-i` |
+| `jsonyter-insert-cell-above` | `C-c C-a` |
+| `jsonyter-delete-cell` | `C-c C-w` |
+| `jsonyter-toggle-cell-type` | `C-c C-t` |
+| `jsonyter-move-cell-up` | `C-c <up>` |
+| `jsonyter-move-cell-down` | `C-c <down>` |
+
+Both insert commands take a prefix argument to insert a markdown cell. All
+six require a notebook buffer and signal an error elsewhere, so they are
+safe to bind globally:
+
+```elisp
+(use-package jsonyter
+  :bind (("C-c n i" . jsonyter-insert-cell-below)
+         ("C-c n a" . jsonyter-insert-cell-above)
+         ("C-c n w" . jsonyter-delete-cell)))
+```
+
+These were named `jsonyter-notebook-insert-cell-below` and so on through
+1.0.0. The old names still work as obsolete aliases.
+
 `M-x jsonyter-clear` clears every output in the buffer and blanks the
 execution counts, leaving the notebook as though nothing had been run. It
 does the equivalent thing in a REPL or script buffer too.

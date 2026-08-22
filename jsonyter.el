@@ -2,7 +2,7 @@
 
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
-;; Version: 1.0.0
+;; Version: 1.2.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -2429,25 +2429,39 @@ code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
                             (list :id nil :cell_type cell-type :outputs nil))
     (goto-char start)))
 
-(defun jsonyter-notebook-insert-cell-below (&optional markdown)
+(defun jsonyter--nb-ensure-notebook ()
+  "Signal an error unless the current buffer is a rendered notebook.
+The cell-editing commands are autoloaded and may be bound outside
+`jsonyter-notebook-mode-map', so they check rather than trusting the
+keymap they were reached through."
+  (unless (bound-and-true-p jsonyter-notebook-mode)
+    (user-error "Not in a jsonyter notebook buffer")))
+
+;;;###autoload
+(defun jsonyter-insert-cell-below (&optional markdown)
   "Insert an empty code cell below the cell at point.
 With a prefix argument (MARKDOWN), insert a markdown cell instead."
   (interactive "P")
+  (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (jsonyter--nb-insert-cell (if cell (overlay-end cell) (point-max))
                               (if markdown "markdown" "code"))))
 
-(defun jsonyter-notebook-insert-cell-above (&optional markdown)
+;;;###autoload
+(defun jsonyter-insert-cell-above (&optional markdown)
   "Insert an empty code cell above the cell at point.
 With a prefix argument (MARKDOWN), insert a markdown cell instead."
   (interactive "P")
+  (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
                               (if markdown "markdown" "code"))))
 
-(defun jsonyter-notebook-delete-cell ()
+;;;###autoload
+(defun jsonyter-delete-cell ()
   "Delete the cell at point, source and output together."
   (interactive)
+  (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
     (when (or (string-blank-p (jsonyter--nb-cell-source cell))
@@ -2456,11 +2470,13 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
         (delete-overlay cell)
         (delete-region start end)))))
 
-(defun jsonyter-notebook-change-cell-type ()
+;;;###autoload
+(defun jsonyter-toggle-cell-type ()
   "Toggle the cell at point between code and markdown.
 A cell turned into markdown loses its output, since markdown cells
 cannot carry any — the same rule the bridge applies when writing."
   (interactive)
+  (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
     (let ((new (if (equal (overlay-get cell 'jsonyter-cell-type) "code")
@@ -2513,9 +2529,11 @@ These are the things that must travel with the text when cells move.")
     (jsonyter--nb-refresh-prompt b) (jsonyter--nb-refresh-output b)
     (goto-char (overlay-start b))))
 
-(defun jsonyter-notebook-move-cell-down ()
+;;;###autoload
+(defun jsonyter-move-cell-down ()
   "Move the cell at point below the following cell."
   (interactive)
+  (jsonyter--nb-ensure-notebook)
   (let* ((cell (jsonyter--nb-cell-at))
          (next (and cell (seq-find (lambda (o) (> (overlay-start o)
                                                   (overlay-start cell)))
@@ -2524,9 +2542,11 @@ These are the things that must travel with the text when cells move.")
     (if next (jsonyter--nb-swap-cells cell next)
       (message "jsonyter: already the last cell"))))
 
-(defun jsonyter-notebook-move-cell-up ()
+;;;###autoload
+(defun jsonyter-move-cell-up ()
   "Move the cell at point above the preceding cell."
   (interactive)
+  (jsonyter--nb-ensure-notebook)
   (let* ((cell (jsonyter--nb-cell-at))
          (prev (and cell (car (last (seq-filter
                                      (lambda (o) (< (overlay-start o)
@@ -2535,6 +2555,29 @@ These are the things that must travel with the text when cells move.")
     (unless cell (user-error "No cell at point"))
     (if prev (jsonyter--nb-swap-cells prev cell)
       (message "jsonyter: already the first cell"))))
+
+;; Through 1.0.0 these commands were named `jsonyter-notebook-*'.  They
+;; now carry shorter public names, which is what the keymap below binds;
+;; the old names stay working as obsolete aliases.
+
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-insert-cell-below
+  #'jsonyter-insert-cell-below "1.2.0")
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-insert-cell-above
+  #'jsonyter-insert-cell-above "1.2.0")
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-delete-cell
+  #'jsonyter-delete-cell "1.2.0")
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-change-cell-type
+  #'jsonyter-toggle-cell-type "1.2.0")
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-move-cell-down
+  #'jsonyter-move-cell-down "1.2.0")
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-notebook-move-cell-up
+  #'jsonyter-move-cell-up "1.2.0")
 
 ;;; Navigation
 
@@ -2577,12 +2620,12 @@ These are the things that must travel with the text when cells move.")
     (define-key map (kbd "C-c M-o") #'jsonyter-notebook-clear-cell-output)
     (define-key map (kbd "C-c M-O") #'jsonyter-notebook-clear-all-output)
     (define-key map (kbd "C-c C-k") #'jsonyter-notebook-start-kernel)
-    (define-key map (kbd "C-c C-a") #'jsonyter-notebook-insert-cell-above)
-    (define-key map (kbd "C-c C-i") #'jsonyter-notebook-insert-cell-below)
-    (define-key map (kbd "C-c C-w") #'jsonyter-notebook-delete-cell)
-    (define-key map (kbd "C-c C-t") #'jsonyter-notebook-change-cell-type)
-    (define-key map (kbd "C-c <up>") #'jsonyter-notebook-move-cell-up)
-    (define-key map (kbd "C-c <down>") #'jsonyter-notebook-move-cell-down)
+    (define-key map (kbd "C-c C-a") #'jsonyter-insert-cell-above)
+    (define-key map (kbd "C-c C-i") #'jsonyter-insert-cell-below)
+    (define-key map (kbd "C-c C-w") #'jsonyter-delete-cell)
+    (define-key map (kbd "C-c C-t") #'jsonyter-toggle-cell-type)
+    (define-key map (kbd "C-c <up>") #'jsonyter-move-cell-up)
+    (define-key map (kbd "C-c <down>") #'jsonyter-move-cell-down)
     (define-key map (kbd "C-x C-s") #'jsonyter-notebook-save-buffer)
     (define-key map (kbd "C-c C-s") #'jsonyter-notebook-save-with-outputs)
     map)
