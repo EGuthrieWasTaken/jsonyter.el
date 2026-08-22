@@ -176,11 +176,45 @@ Insertion never steals point: a window scrolls with new output only if it
 was already at the end, so you can read back through the buffer while a
 cell is still running.
 
+In notebook and `# %%` script buffers, each output block is **framed**
+above and below by a labelled rule, so where a cell's code ends and its
+results begin stays clear however long the output runs. A cell with no
+output has no frame at all. Edit a cell's source after it has run and its
+frame changes face and reads `output (stale)`, flagging results that may
+no longer match the code in front of you; re-running the cell clears it,
+and so does undoing back to the source that produced the output. The
+check is a hash of that one cell's source per edit, so it costs nothing
+even on cells with very large outputs.
+
 Images taller than one text line are inserted **sliced**, one slice per
 line, so ordinary line scrolling walks through a tall plot like normal
 text instead of stepping over it in a single jump. Set
 `jsonyter-slice-images` to nil to opt out, or `jsonyter-image-max-height`
 to shrink tall plots to fit instead.
+
+### Faces
+
+Everything jsonyter draws is themable rather than hardcoded — customize
+any of these:
+
+| Face | What it colors |
+| --- | --- |
+| `jsonyter-prompt-face` | REPL input prompts |
+| `jsonyter-output-prompt-face` | `Out[n]:` result prompts |
+| `jsonyter-stderr-face` | stderr stream output |
+| `jsonyter-note-face` | jsonyter's own informational notes |
+| `jsonyter-code-cell-face` | the boundary label of a code cell |
+| `jsonyter-markdown-cell-face` | the boundary label of a markdown cell |
+| `jsonyter-raw-cell-face` | the boundary label of a raw cell |
+| `jsonyter-notebook-rule-face` | the rule drawn beside a cell boundary |
+| `jsonyter-output-border-face` | the frame around an output block |
+| `jsonyter-output-border-stale-face` | that frame when the cell's source has been edited since the output was produced |
+
+```elisp
+(custom-set-faces
+ '(jsonyter-markdown-cell-face ((t :inherit font-lock-comment-face :slant italic)))
+ '(jsonyter-output-border-stale-face ((t :foreground "orange3"))))
+```
 
 ## Kernel state
 
@@ -264,11 +298,18 @@ JSON:
 Cell source is ordinary buffer text, edited in the notebook language's own
 major mode — `python-mode`, `ess-r-mode`, and so on, per
 `jsonyter-notebook-language-modes` — so syntax highlighting, indentation
-and completion are the language's own. Cell prompts and all output live in
-**overlays, not buffer text**. That is what lets outputs be read-only and
-invisible to undo: undo walks your edits and never your results, and no
-stray edit can corrupt an output region because there is no output region
-in the text to corrupt.
+and completion are the language's own. Cell prompts, cell boundaries and
+all output live in **overlays, not buffer text**. That is what lets
+outputs be read-only and invisible to undo: undo walks your edits and
+never your results, and no stray edit can corrupt an output region
+because there is no output region in the text to corrupt.
+
+Every cell opens with a boundary line naming its type — `code` (with the
+notebook's kernel language), `Markdown` or `Raw` — so where one cell ends
+and the next begins, and what kind of cell you are looking at, is visible
+at a glance even where cells sit back to back. Boundaries follow inserts,
+deletes, moves and type toggles on their own; there is nothing to
+refresh.
 
 | Key | Action |
 | --- | --- |
@@ -353,6 +394,16 @@ file: rerun one cell and only that cell's output changes on disk.
 
 If the file changed on disk since it was opened, either save is refused
 rather than clobbering the other change; revert to reload.
+
+> **Note for notebooks saved before 1.2.0.** Through 1.1.0, inserting a
+> cell prepended a blank line to the following cell's source, and saving
+> wrote that blank line to the file. 1.2.0 fixes the insert path, but it
+> cannot retroactively clean cells already saved that way: a notebook
+> that picked up stray leading blank lines keeps them until you delete
+> them by hand. They are harmless for plain Python, but they shift the
+> line numbers a kernel reports in a traceback, and they break anything
+> that has to be a cell's first line — `%%cell` magics, `#!` lines, and
+> some non-Python kernels.
 
 Saving is a local filesystem operation and does not need a kernel or a
 reachable Jupyter server — a notebook opened purely to read can still be

@@ -1871,12 +1871,43 @@ With nil, `jsonyter-notebook-start-kernel' must be called explicitly."
   '((t :inherit shadow))
   "Face for the rule drawn beside a cell prompt.")
 
+(defface jsonyter-code-cell-face
+  '((t :inherit jsonyter-notebook-cell-face))
+  "Face for the boundary label of a code cell.")
+
+(defface jsonyter-markdown-cell-face
+  '((t :inherit jsonyter-notebook-markdown-face))
+  "Face for the boundary label of a markdown cell.")
+
+(defface jsonyter-raw-cell-face
+  '((t :inherit shadow :weight bold))
+  "Face for the boundary label of a raw cell.")
+
+(defface jsonyter-output-border-face
+  '((t :inherit jsonyter-notebook-rule-face))
+  "Face for the rules framing a cell's rendered output.")
+
+(defface jsonyter-output-border-stale-face
+  '((t :inherit warning))
+  "Face for the output frame of a cell edited since its output was made.
+Flags output that may no longer match the cell's current source; the
+frame reverts to `jsonyter-output-border-face' when the cell is re-run
+\(or the edit is undone).")
+
 (defvar-local jsonyter--nb-metadata nil
   "The notebook's top-level metadata plist, as read from the file.")
 (defvar-local jsonyter--nb-format nil
   "Cons of (NBFORMAT . NBFORMAT-MINOR) as read from the file.")
 (defvar-local jsonyter--nb-running-cell nil
   "Overlay of the cell currently executing, if any.")
+
+(defvar jsonyter--nb-cell-surgery nil
+  "Non-nil while a cell command is rearranging buffer text.
+The staleness tracker (`jsonyter--nb-stale-after-change') stands down
+while this is bound: mid-surgery the text and the overlays are
+transiently inconsistent — a neighbour's overlay can momentarily hold
+text that is not its own — and a staleness verdict taken then would
+stick after the command has put everything back.")
 
 ;;; Reading the file
 
@@ -1956,32 +1987,66 @@ slicing images across lines that an overlay string does not have."
                                (error-message-string err)))))
       (buffer-string))))
 
-(defun jsonyter--nb-outputs-string (rendered)
-  "Wrap RENDERED output text for display beneath a cell."
+(defun jsonyter--nb-outputs-string (rendered &optional stale)
+  "Wrap RENDERED output text for display beneath a cell.
+The block is framed above and below by a rule, so where a cell's code
+ends and its output begins is visible at a glance however long the
+output runs.  With STALE the frame takes
+`jsonyter-output-border-stale-face' and says so in its label: the
+cell's source has been edited since this output was produced, so the
+two may no longer correspond.  A cell with no output gets no frame."
   (if (or (null rendered) (string-empty-p rendered))
       ""
-    (concat (propertize rendered
-                        'read-only t
-                        'front-sticky '(read-only)
-                        'rear-nonsticky t)
-            (if (string-suffix-p "\n" rendered) "" "\n"))))
+    (let* ((face (if stale 'jsonyter-output-border-stale-face
+                   'jsonyter-output-border-face))
+           (label (if stale "output (stale)" "output"))
+           (help (and stale
+                      "Source edited since this output was produced — re-run the cell to refresh it"))
+           (rule (make-string (max 4 (- jsonyter-notebook-separator-width
+                                        (1+ (length label))))
+                              ?─)))
+      (concat
+       (propertize (concat label " " rule "\n") 'face face 'help-echo help)
+       (propertize rendered
+                   'read-only t
+                   'front-sticky '(read-only)
+                   'rear-nonsticky t)
+       (if (string-suffix-p "\n" rendered) "" "\n")
+       (propertize
+        (concat (make-string jsonyter-notebook-separator-width ?─) "\n")
+        'face face 'help-echo help)))))
 
 ;;; Cell overlays
 
+(defun jsonyter--nb-cell-type-face (cell-type)
+  "Face for the boundary label of a CELL-TYPE cell."
+  (pcase cell-type
+    ("markdown" 'jsonyter-markdown-cell-face)
+    ("raw" 'jsonyter-raw-cell-face)
+    (_ 'jsonyter-code-cell-face)))
+
 (defun jsonyter--nb-prompt (cell-type exec-count &optional running)
   "Prompt string shown above a cell of CELL-TYPE with EXEC-COUNT.
-RUNNING marks a cell whose execution is still in flight."
-  (let* ((markdown (equal cell-type "markdown"))
-         (label (cond (markdown "Markdown")
-                      (running "In [*]:")
-                      (t (format "In [%s]:" (or exec-count " ")))))
+RUNNING marks a cell whose execution is still in flight.
+
+The line is the cell's visible boundary: it names the cell's type —
+and, for a code cell, the notebook's kernel language — and its label
+takes that type's own face (`jsonyter-code-cell-face',
+`jsonyter-markdown-cell-face', `jsonyter-raw-cell-face'), so adjacent
+cells of different kinds are tellable apart at a glance."
+  (let* ((label (pcase cell-type
+                  ("markdown" "Markdown")
+                  ("raw" "Raw")
+                  (_ (concat (if running "In [*]:"
+                               (format "In [%s]:" (or exec-count " ")))
+                             " code"
+                             (and jsonyter--language
+                                  (format " (%s)" jsonyter--language))))))
          (rule (make-string (max 4 (- jsonyter-notebook-separator-width
                                       (length label)))
                             ?─)))
     (concat "\n"
-            (propertize label 'face (if markdown
-                                        'jsonyter-notebook-markdown-face
-                                      'jsonyter-notebook-cell-face))
+            (propertize label 'face (jsonyter--nb-cell-type-face cell-type))
             " "
             (propertize rule 'face 'jsonyter-notebook-rule-face)
             "\n")))
@@ -1996,7 +2061,8 @@ RUNNING marks a cell whose execution is still in flight."
 (defun jsonyter--nb-refresh-output (cell)
   "Update CELL's output overlay string from its stored rendered text."
   (let ((body (jsonyter--nb-outputs-string
-               (overlay-get cell 'jsonyter-output-string))))
+               (overlay-get cell 'jsonyter-output-string)
+               (overlay-get cell 'jsonyter-output-stale))))
     (overlay-put
      cell 'after-string
      (if (string-empty-p body)
@@ -2030,6 +2096,11 @@ end of its last visible line still lands in the right cell."
                                (plist-get cell :outputs) "")))
       (overlay-put ov 'jsonyter-output-string rendered)
       (jsonyter--nb-refresh-output ov))
+    ;; The outputs on display were produced by the source as it reads
+    ;; right now; record that pairing so later edits can be flagged as
+    ;; making the output stale.
+    (overlay-put ov 'jsonyter-source-hash
+                 (jsonyter--source-hash (jsonyter--nb-cell-source ov)))
     ov))
 
 (defun jsonyter--nb-cells ()
@@ -2055,16 +2126,67 @@ end of its last visible line still lands in the right cell."
                                               (overlay-end cell))))
     (if (string-suffix-p "\n" text) (substring text 0 -1) text)))
 
+;;; Staleness of shown output
+
+;; An output on display was produced by the cell's source as it read at
+;; run time (or as it was saved in the file).  That pairing is recorded
+;; as a hash on the overlay, and an after-change hook compares it with
+;; the live source, so an edited cell's output frame flips to
+;; `jsonyter-output-border-stale-face' the moment the two part ways —
+;; and back again if the edit is undone.  Only a change of verdict
+;; re-renders the frame; every other keystroke costs one hash of that
+;; one cell's source, so large outputs add nothing to typing latency.
+
+(defun jsonyter--source-hash (code)
+  "Hash of CODE, as stored on an overlay to detect later source edits."
+  (secure-hash 'sha1 code))
+
+(defun jsonyter--output-update-stale (ov source)
+  "Recompute whether OV's shown output is stale against SOURCE.
+Refreshes OV's output display only when the verdict actually changes.
+An overlay with no output, or with no recorded source hash, is never
+marked stale."
+  (let ((output (overlay-get ov 'jsonyter-output-string)))
+    (when (and output (not (string-empty-p output)))
+      (let* ((hash (overlay-get ov 'jsonyter-source-hash))
+             (stale (and hash
+                         (not (equal hash (jsonyter--source-hash source)))
+                         t)))
+        (unless (eq stale (overlay-get ov 'jsonyter-output-stale))
+          (overlay-put ov 'jsonyter-output-stale stale)
+          (jsonyter--nb-refresh-output ov))))))
+
+(defun jsonyter--nb-stale-after-change (beg end _len)
+  "After an edit from BEG to END, re-judge the affected cells' outputs.
+On `after-change-functions' in notebook buffers.  Stands down during
+cell surgery (see `jsonyter--nb-cell-surgery'), whose transient
+intermediate states are not edits to any cell's source."
+  (unless jsonyter--nb-cell-surgery
+    (dolist (cell (delete-dups (delq nil (list (jsonyter--nb-cell-at beg)
+                                               (jsonyter--nb-cell-at end)))))
+      (jsonyter--output-update-stale cell (jsonyter--nb-cell-source cell)))))
+
 ;;; Building the buffer
 
 (defun jsonyter--nb-render (notebook)
   "Replace the current buffer with a rendered view of NOTEBOOK."
-  (let ((inhibit-read-only t))
+  (let ((inhibit-read-only t)
+        (jsonyter--nb-cell-surgery t))
     (erase-buffer)
     (dolist (cell (plist-get notebook :cells))
       (let ((start (point)))
         (insert (jsonyter--nb-text (plist-get cell :source)))
-        (unless (bolp) (insert "\n"))
+        ;; Every cell owns at least its own newline.  A cell with empty
+        ;; source — what saving a freshly inserted cell writes — would
+        ;; otherwise land at `bolp' without having moved point, giving it
+        ;; a zero-length overlay: no line of its own in the buffer, and a
+        ;; start position shared with the cell after it, so
+        ;; `overlays-at' there reports two cells and document order comes
+        ;; down to a tie in the sort.  Same invariant the insert path
+        ;; keeps (see `jsonyter--nb-insert-cell'), which is what makes a
+        ;; save-and-reopen round trip a fixed point.
+        (when (or (= (point) start) (not (bolp)))
+          (insert "\n"))
         (jsonyter--nb-make-cell start (point) cell)))
     (goto-char (point-min))))
 
@@ -2313,8 +2435,9 @@ output."
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
     (cond
-     ((equal (overlay-get cell 'jsonyter-cell-type) "markdown")
-      (message "jsonyter: markdown cell — nothing to execute"))
+     ((member (overlay-get cell 'jsonyter-cell-type) '("markdown" "raw"))
+      (message "jsonyter: %s cell — nothing to execute"
+               (overlay-get cell 'jsonyter-cell-type)))
      (jsonyter--busy
       (message "jsonyter: kernel is busy (C-c C-c to interrupt)"))
      (t
@@ -2322,6 +2445,11 @@ output."
       (let ((code (jsonyter--nb-cell-source cell)))
         (if (string-blank-p code)
             (message "jsonyter: empty cell")
+          ;; The output about to arrive belongs to the source being sent;
+          ;; record that pairing so later edits flag the output stale.
+          (overlay-put cell 'jsonyter-source-hash
+                       (jsonyter--source-hash code))
+          (overlay-put cell 'jsonyter-output-stale nil)
           ;; Re-running replaces the previous result outright, which is
           ;; what makes outputs disposable rather than accumulating. This
           ;; also marks the cell touched, so it is what makes a freshly
@@ -2376,7 +2504,7 @@ output."
   (interactive)
   (jsonyter--nb-ensure-kernel)
   (dolist (cell (jsonyter--nb-cells))
-    (unless (equal (overlay-get cell 'jsonyter-cell-type) "markdown")
+    (when (equal (overlay-get cell 'jsonyter-cell-type) "code")
       (goto-char (overlay-start cell))
       (jsonyter-notebook-run-cell)
       (let ((deadline (+ (float-time) 3600)))
@@ -2400,7 +2528,7 @@ you want before running a project through cleanly.  Also marks every
 code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
   (interactive)
   (dolist (cell (jsonyter--nb-cells))
-    (unless (equal (overlay-get cell 'jsonyter-cell-type) "markdown")
+    (when (equal (overlay-get cell 'jsonyter-cell-type) "code")
       (jsonyter--nb-set-output cell "" nil t))
     (overlay-put cell 'jsonyter-exec-count nil)
     (overlay-put cell 'jsonyter-running nil)
@@ -2423,8 +2551,19 @@ code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
 (defun jsonyter--nb-insert-cell (pos cell-type)
   "Create a new empty CELL-TYPE cell whose source begins at POS."
   (goto-char pos)
-  (let ((start (point)))
+  (let* ((jsonyter--nb-cell-surgery t)
+         (start (point))
+         ;; A cell beginning exactly here would absorb the newline
+         ;; inserted below: `make-overlay's FRONT-ADVANCE is nil, so text
+         ;; inserted at an overlay's start falls inside it, silently
+         ;; prepending a blank line to that cell's source.  Nudge such a
+         ;; cell past the insertion instead, so it and the new cell stay
+         ;; back to back — the front-boundary counterpart of the
+         ;; rear-boundary hazard documented in `jsonyter--nb-make-cell'.
+         (adjacent (seq-filter (lambda (o) (= (overlay-start o) start))
+                               (jsonyter--nb-cells))))
     (insert "\n")
+    (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
     (jsonyter--nb-make-cell start (point)
                             (list :id nil :cell_type cell-type :outputs nil))
     (goto-char start)))
@@ -2466,7 +2605,8 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (unless cell (user-error "No cell at point"))
     (when (or (string-blank-p (jsonyter--nb-cell-source cell))
               (yes-or-no-p "Delete this cell? "))
-      (let ((start (overlay-start cell)) (end (overlay-end cell)))
+      (let ((jsonyter--nb-cell-surgery t)
+            (start (overlay-start cell)) (end (overlay-end cell)))
         (delete-overlay cell)
         (delete-region start end)))))
 
@@ -2489,13 +2629,19 @@ cannot carry any — the same rule the bridge applies when writing."
 
 (defconst jsonyter--nb-cell-props
   '(jsonyter-cell-id jsonyter-cell-type jsonyter-exec-count
-    jsonyter-output-string)
+    jsonyter-output-string jsonyter-raw-outputs jsonyter-outputs-touched
+    jsonyter-source-hash jsonyter-output-stale)
   "Overlay properties making up a cell's identity, as opposed to position.
-These are the things that must travel with the text when cells move.")
+These are the things that must travel with the text when cells move —
+including this session's raw outputs and their touched flag, which
+`jsonyter-notebook-save-with-outputs' writes by cell: left behind on a
+move, they would be saved under whichever cell took over the old
+position.")
 
 (defun jsonyter--nb-swap-cells (a b)
   "Exchange the text and identity of adjacent cells A and B (A before B)."
-  (let* ((cells (jsonyter--nb-cells))
+  (let* ((jsonyter--nb-cell-surgery t)
+         (cells (jsonyter--nb-cells))
          ;; Every other cell's span is unchanged by a swap, since the two
          ;; texts merely trade places. Snapshot them anyway: the
          ;; intermediate delete collapses neighbouring overlays onto
@@ -2651,9 +2797,12 @@ only the cell source.
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
         (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+        (add-hook 'after-change-functions
+                  #'jsonyter--nb-stale-after-change nil t)
         (jsonyter-mode 1))
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
+    (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
     (jsonyter-mode -1)))
 
 ;;;###autoload
@@ -2751,14 +2900,37 @@ On Emacs 29 and newer this also includes `python-ts-mode' and
                     (point-max)))))
       (cons start end))))
 
+(defun jsonyter--script-cell-output-overlay (end)
+  "The existing output overlay of the script cell ending at END, or nil."
+  (seq-find (lambda (o) (overlay-get o 'jsonyter-script-cell))
+            (overlays-in (max (point-min) (1- end)) end)))
+
 (defun jsonyter--script-output-overlay (start end)
   "The output overlay for the cell spanning START..END, creating it once."
-  (or (seq-find (lambda (o) (overlay-get o 'jsonyter-script-cell))
-                (overlays-in (max (point-min) (1- end)) end))
+  (or (jsonyter--script-cell-output-overlay end)
       (let ((ov (make-overlay (max start (1- end)) end)))
         (overlay-put ov 'jsonyter-script-cell t)
         (push ov jsonyter--script-cells)
         ov)))
+
+(defun jsonyter--script-stale-after-change (beg end _len)
+  "After an edit from BEG to END, re-judge the affected cells' outputs.
+On `after-change-functions' in `jsonyter-script-mode' buffers; a no-op
+until some cell has produced output.  The source is trimmed exactly as
+`jsonyter-script-run-cell' trims it before executing, so an edit to
+nothing but surrounding blank lines is not called a change."
+  (when jsonyter--script-cells
+    (save-excursion
+      (let (seen)
+        (dolist (pos (list beg end))
+          (goto-char pos)
+          (pcase-let* ((`(,start . ,cell-end) (jsonyter--script-cell-bounds))
+                       (ov (jsonyter--script-cell-output-overlay cell-end)))
+            (when (and ov (not (memq ov seen)))
+              (push ov seen)
+              (jsonyter--output-update-stale
+               ov (string-trim
+                   (buffer-substring-no-properties start cell-end))))))))))
 
 (defun jsonyter-script-run-cell (&optional advance)
   "Execute the script cell at point, showing its output inline.
@@ -2773,6 +2945,10 @@ With ADVANCE, move to the next cell afterwards."
                (ov (jsonyter--script-output-overlay start end)))
     (if (string-blank-p code)
         (message "jsonyter: empty cell")
+      ;; Pair the output about to arrive with the source being sent, so
+      ;; later edits flag the output stale.
+      (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash code))
+      (overlay-put ov 'jsonyter-output-stale nil)
       (overlay-put ov 'jsonyter-output-string "")
       (jsonyter--nb-refresh-output ov)
       (setq jsonyter--busy t)
@@ -2859,9 +3035,12 @@ actually save — is never touched.
         (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+        (add-hook 'after-change-functions
+                  #'jsonyter--script-stale-after-change nil t)
         (jsonyter-mode 1))
     (jsonyter-script-clear-all-output)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
+    (remove-hook 'after-change-functions #'jsonyter--script-stale-after-change t)
     (jsonyter-mode -1)))
 
 ;;;###autoload
