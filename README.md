@@ -121,7 +121,7 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-exec-timeout` | `nil` | Kernel-silence timeout passed to the bridge; `nil` waits indefinitely (right for SAS's slow startup). |
 | `jsonyter-image-max-width` | `800` | Max pixel width for inline images. |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
-| `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll. |
+| `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
 | `jsonyter-insecure-tls` | `nil` | Skip TLS verification (self-signed remote servers). |
 | `jsonyter-shutdown-on-kill` | `t` | Shut the kernel down when the REPL buffer is killed. |
@@ -188,9 +188,15 @@ even on cells with very large outputs.
 
 Images taller than one text line are inserted **sliced**, one slice per
 line, so ordinary line scrolling walks through a tall plot like normal
-text instead of stepping over it in a single jump. Set
-`jsonyter-slice-images` to nil to opt out, or `jsonyter-image-max-height`
-to shrink tall plots to fit instead.
+text instead of stepping over it in a single jump. This works in REPL
+buffers and in notebooks, whose cell output is buffer text of its own.
+It cannot in a `# %%` script buffer: that buffer's text is exactly the
+file you save, so its output has to live in an overlay string, and an
+overlay string is one buffer position however many lines it draws —
+there is nothing there for scrolling to stop at. Script cells show tall
+images whole, and Emacs scrolls those by pixel. Set
+`jsonyter-slice-images` to nil to opt out everywhere, or
+`jsonyter-image-max-height` to shrink tall plots to fit instead.
 
 ### Faces
 
@@ -298,11 +304,20 @@ JSON:
 Cell source is ordinary buffer text, edited in the notebook language's own
 major mode — `python-mode`, `ess-r-mode`, and so on, per
 `jsonyter-notebook-language-modes` — so syntax highlighting, indentation
-and completion are the language's own. Cell prompts, cell boundaries and
-all output live in **overlays, not buffer text**. That is what lets
-outputs be read-only and invisible to undo: undo walks your edits and
-never your results, and no stray edit can corrupt an output region
-because there is no output region in the text to corrupt.
+and completion are the language's own. Cell prompts and cell boundaries
+live in **overlays**; a cell's **output is buffer text**, written in
+after its source, which is what lets point move through it — and so lets
+a plot taller than the window be scrolled through a line at a time
+rather than jumped over.
+
+Output being text does not make it part of the document. It is
+`read-only`, so no stray edit can corrupt it (selecting and copying it
+are unaffected); it is written without touching the undo history or the
+buffer's modified flag, so undo still walks your edits and never your
+results; the language's own font-lock is kept off it, so a traceback is
+never recoloured as code; and saving reads only the source side of each
+cell, so what reaches the `.ipynb` file is the code you typed and
+nothing else.
 
 Every cell opens with a boundary line naming its type — `code` (with the
 notebook's kernel language), `Markdown` or `Raw` — so where one cell ends
@@ -427,8 +442,11 @@ actually contain cell markers. Keys mirror the notebook: `C-RET` run,
 reconnect or attach to a kernel.
 
 Output appears inline in overlays, so **the file's text is never
-touched** and saving stays completely ordinary. The kernel language comes
-from the buffer's major mode via `jsonyter-script-languages`.
+touched** and saving stays completely ordinary. That is also the one
+thing script cells give up against notebooks: an overlay string cannot
+be scrolled into, so a tall image is shown whole here rather than sliced
+across lines. The kernel language comes from the buffer's major mode via
+`jsonyter-script-languages`.
 
 ## Extending jsonyter.el: `jsonyter-mode`
 

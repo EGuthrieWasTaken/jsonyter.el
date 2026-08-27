@@ -2,7 +2,7 @@
 
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
-;; Version: 1.2.0
+;; Version: 1.3.0
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -219,10 +219,12 @@ brought fully into view.  Slicing it across as many lines as it is tall
 \(what `doc-view' does for page images) lets ordinary line scrolling walk
 through it like normal text.
 
-This applies to REPL buffers, whose output is the buffer's own text.  A
-notebook or script cell shows its output in an overlay string instead,
-and slicing cannot work there at all — see `jsonyter--string-output' —
-so those images are always inserted whole."
+This applies wherever output is the buffer's own text: a REPL buffer,
+and a notebook cell, whose output is written into the buffer after its
+source.  A `# %%' script cell is the exception — its buffer's text is
+the file you save, so its output has to stay an overlay string, where
+slices would not be lines at all and images are inserted whole; see
+`jsonyter--string-output'."
   :type 'boolean)
 
 (defcustom jsonyter-render-html t
@@ -831,7 +833,7 @@ into it would corrupt the document — so those go to the echo area."
 (defvar jsonyter--string-output nil
   "Non-nil while rendering an output into a string rather than buffer text.
 
-A notebook or script cell shows its output in an overlay string, and an
+A `# %%' script cell shows its output in an overlay string, and an
 overlay string is a single buffer position however many newlines it
 contains: redisplay cannot begin part way into one.  The lines a sliced
 image is spread across are therefore not buffer lines there, and nothing
@@ -839,7 +841,12 @@ image is spread across are therefore not buffer lines there, and nothing
 a plot taller than the window pins `window-start' in front of it and the
 buffer cannot be scrolled past it at all.  A whole image is a single
 glyph on a single line instead, which Emacs does scroll through, by
-pixel.  So slicing is skipped when this is set.")
+pixel.  So slicing is skipped when this is set.
+
+Only script cells need it.  A script buffer's text is exactly the file
+being saved, so nothing may be written into it; a notebook buffer is a
+rendered view, so its cell output is real buffer text with real lines
+and is sliced like a REPL's — see `jsonyter--nb-show-output-as-text'.")
 
 (defun jsonyter--mime (data key)
   "Return the KEY entry of mimebundle DATA as a string, or nil.
@@ -860,9 +867,10 @@ Handles values that arrive as a list of line fragments."
 (defun jsonyter--image-rows (image line-height)
   "How many text lines IMAGE should be sliced across, or nil for one.
 LINE-HEIGHT is the pixel height of a line in the buffer that will show
-it.  Returns nil when slicing is off, when the output is bound for an
-overlay string rather than for buffer text, when there is no graphical
-display, or when the image's displayed size cannot be measured."
+it.  Returns nil when slicing is off, when the output is bound for a
+script cell's overlay string rather than for buffer text, when there is
+no graphical display, or when the image's displayed size cannot be
+measured."
   (and jsonyter-slice-images
        (not jsonyter--string-output)
        (display-graphic-p)
@@ -893,8 +901,9 @@ the result to preserve the aspect ratio, undoing the fit; `:width' and
   "Insert IMAGE at point with ALT as its text fallback.
 Tall images are sliced one text line per row so that line-based
 scrolling can move through them; see `jsonyter-slice-images'.  Output
-bound for an overlay string is inserted whole instead, since slices
-would not be lines there at all — see `jsonyter--string-output'."
+bound for a script cell's overlay string is inserted whole instead,
+since slices would not be lines there at all — see
+`jsonyter--string-output'."
   (let* ((line-height (max 1 (default-font-height)))
          (rows (jsonyter--image-rows image line-height)))
     (if (and rows (> rows 1))
@@ -1834,12 +1843,25 @@ LANGUAGE is a language name such as \"python\", \"julia\", \"R\" or
 
 ;;;; Notebooks (.ipynb)
 
-;; A notebook buffer holds nothing but the cells' source text.  Prompts,
-;; separators and every rendered output live in overlay strings instead,
-;; which is what lets outputs be read-only and invisible to undo while
-;; the source stays ordinary, editable, font-locked text: undo walks
-;; your edits and never your results, and no edit can corrupt an output
-;; region because there is no output region in the text to corrupt.
+;; A notebook buffer holds the cells' source text and, after each
+;; cell's source, that cell's rendered output.  Prompts and separators
+;; are overlay strings; output is not, because point cannot be put
+;; inside an overlay string — a plot taller than the window could then
+;; never be scrolled through, only stepped over in one jump.
+;;
+;; What the overlay string gave outputs for free, buffer text has to be
+;; given deliberately.  Output is written under
+;; `with-silent-modifications', so it stays out of the undo history and
+;; out of the buffer's modified flag; it is `read-only', so no edit can
+;; corrupt it; and `jsonyter--nb-fontify-region' and
+;; `jsonyter--nb-unfontify-region' keep the language's font-lock off it
+;; in both directions.  Undo still walks your edits and never your
+;; results.
+;;
+;; Each cell overlay therefore spans two regions, told apart by its
+;; `jsonyter-source-end' marker: the source, which is the document, and
+;; the output, which is a result.  Everything that saves, hashes or
+;; executes a cell reads only the first — see `jsonyter--nb-cell-source'.
 ;;
 ;; The mode is a *minor* mode layered on the notebook language's own
 ;; major mode, so syntax highlighting, indentation and completion come
@@ -1900,6 +1922,48 @@ frame reverts to `jsonyter-output-border-face' when the cell is re-run
   "Cons of (NBFORMAT . NBFORMAT-MINOR) as read from the file.")
 (defvar-local jsonyter--nb-running-cell nil
   "Overlay of the cell currently executing, if any.")
+
+(defun jsonyter--undo-entry-before-p (entry position)
+  "Non-nil if ENTRY of `buffer-undo-list' names no position at or past POSITION.
+Entries naming no buffer position at all — an undo boundary, a
+modification-time stamp, a marker adjustment — qualify trivially.  An
+entry whose positions cannot be read, which is any `apply' form that
+does not declare its range, does not: it cannot be shown to be safe."
+  (pcase entry
+    ('nil t)                                       ; boundary
+    (`(t . ,_) t)                                  ; visited-file modtime
+    ((pred integerp) (< entry position))           ; point was here
+    (`(,(pred markerp) . ,_) t)                    ; marker adjustment
+    (`(apply ,(pred integerp) ,beg ,end . ,_)      ; change with a range
+     (and (< beg position) (< end position)))
+    (`(nil ,_ ,_ ,beg . ,end)                      ; text-property change
+     (and (< beg position) (< end position)))
+    (`(,(and beg (pred integerp)) . ,(and end (pred integerp)))
+     (and (< beg position) (< end position)))      ; text inserted
+    (`(,(pred stringp) . ,(and pos (pred integerp)))
+     (< (abs pos) position))                       ; text deleted
+    (_ nil)))
+
+(defun jsonyter--forget-undo-after (position)
+  "Drop undo entries that refer to buffer text at or after POSITION.
+
+A cell's output is written into the buffer without being recorded in the
+undo history (see `jsonyter--nb-show-output-as-text'), so text after it
+shifts without undo noticing.  Entries recorded before that shift which
+point past POSITION would then be replayed against text that has moved —
+rewriting some unrelated cell, silently.  Dropping them is the cost of
+keeping results out of the history.
+
+`buffer-undo-list' is replayed newest first, and an entry may only be
+undone once every entry before it has been, so the list is cut at the
+first unsafe entry rather than having that entry picked out of it.  Edits
+to a cell all sit before its own output, so editing a cell and then
+running it — the usual way round — loses nothing."
+  (unless (eq buffer-undo-list t)
+    (setq buffer-undo-list
+          (seq-take-while (lambda (entry)
+                            (jsonyter--undo-entry-before-p entry position))
+                          buffer-undo-list))))
 
 (defvar jsonyter--nb-cell-surgery nil
   "Non-nil while a cell command is rearranging buffer text.
@@ -1966,16 +2030,18 @@ stores stream text as a list of lines."
                       :traceback (plist-get output :traceback)))
        (_ nil)))))
 
-(defun jsonyter--nb-render-string (output)
+(defun jsonyter--nb-render-string (output &optional overlay-string)
   "Render one OUTPUT (already in kernel shape) to a propertized string.
 Rendering happens in a scratch buffer so the existing output renderer —
-images, ANSI, shr — can be reused verbatim; the resulting text, display
-properties and all, becomes an overlay string.
+images, sliced scrolling, ANSI, shr — can be reused verbatim; the
+resulting text, display properties and all, is then either written into
+the buffer (a notebook cell) or hung off an overlay (a script cell).
 
-The renderer is told it is working for a string rather than for buffer
-text (see `jsonyter--string-output'), which is what keeps it from
-slicing images across lines that an overlay string does not have."
-  (let ((jsonyter--string-output t))
+With OVERLAY-STRING the renderer is told it is working for a string
+rather than for buffer text (see `jsonyter--string-output'), which is
+what keeps it from slicing images across lines that an overlay string
+does not have.  Only script cells pass it."
+  (let ((jsonyter--string-output overlay-string))
     (with-temp-buffer
       (setq-local jsonyter--clear-pending nil)
       (setq-local jsonyter--output-start (copy-marker (point-min)))
@@ -1994,7 +2060,12 @@ ends and its output begins is visible at a glance however long the
 output runs.  With STALE the frame takes
 `jsonyter-output-border-stale-face' and says so in its label: the
 cell's source has been edited since this output was produced, so the
-two may no longer correspond.  A cell with no output gets no frame."
+two may no longer correspond.  A cell with no output gets no frame.
+
+The block carries no read-only protection of its own: as an overlay
+string there is nothing to protect, and as buffer text the whole span
+— frame included — is made read-only where it is inserted, by
+`jsonyter--nb-show-output-as-text'."
   (if (or (null rendered) (string-empty-p rendered))
       ""
     (let* ((face (if stale 'jsonyter-output-border-stale-face
@@ -2007,10 +2078,7 @@ two may no longer correspond.  A cell with no output gets no frame."
                               ?─)))
       (concat
        (propertize (concat label " " rule "\n") 'face face 'help-echo help)
-       (propertize rendered
-                   'read-only t
-                   'front-sticky '(read-only)
-                   'rear-nonsticky t)
+       rendered
        (if (string-suffix-p "\n" rendered) "" "\n")
        (propertize
         (concat (make-string jsonyter-notebook-separator-width ?─) "\n")
@@ -2059,7 +2127,21 @@ cells of different kinds are tellable apart at a glance."
                                     (overlay-get cell 'jsonyter-running))))
 
 (defun jsonyter--nb-refresh-output (cell)
-  "Update CELL's output overlay string from its stored rendered text."
+  "Update CELL's shown output from its stored rendered text.
+
+Where the output goes depends on what the buffer's text is.  A notebook
+buffer is a rendered view, so a cell's output is written into it as
+buffer text: point can then move through it, which is what lets a tall
+image sliced one line per row be scrolled through a line at a time.  A
+script buffer's text is exactly the file being saved, so nothing may be
+written into it and its output stays an overlay string — where slices
+would not be lines at all, and images are shown whole instead."
+  (if (overlay-get cell 'jsonyter-script-cell)
+      (jsonyter--nb-show-output-as-string cell)
+    (jsonyter--nb-show-output-as-text cell)))
+
+(defun jsonyter--nb-show-output-as-string (cell)
+  "Hang CELL's rendered output off its overlay as an `after-string'."
   (let ((body (jsonyter--nb-outputs-string
                (overlay-get cell 'jsonyter-output-string)
                (overlay-get cell 'jsonyter-output-stale))))
@@ -2067,18 +2149,81 @@ cells of different kinds are tellable apart at a glance."
      cell 'after-string
      (if (string-empty-p body)
          ""
-       ;; Output must begin on a line of its own.  A notebook cell always
-       ;; ends with its own newline, but a script cell can end mid-line —
-       ;; the last cell of a file with no final newline — and an
-       ;; after-string there is displayed running on from the last line
-       ;; of code, which is exactly where print output must not appear.
+       ;; Output must begin on a line of its own.  A script cell can end
+       ;; mid-line — the last cell of a file with no final newline — and
+       ;; an after-string there is displayed running on from the last
+       ;; line of code, which is exactly where print output must not
+       ;; appear.
        (let ((end (overlay-end cell)))
          (if (or (= end (point-min)) (eq (char-before end) ?\n))
              body
            (concat "\n" body)))))))
 
+(defun jsonyter--nb-show-output-as-text (cell)
+  "Rewrite CELL's output region in the buffer from its rendered text.
+
+CELL spans its source and then its output; the boundary between the two
+is its `jsonyter-source-end' marker, and everything from there to the
+overlay's end is output, replaced wholesale here.  The marker's
+insertion type is nil, so text inserted at the boundary — this
+function's own — falls on the output side of it and never silently joins
+the cell's source.
+
+The block is made `read-only', front-sticky so nothing can be typed into
+it and rear-nonsticky so the next cell's source can still begin directly
+after it.  Selecting and copying it are unaffected.
+
+`with-silent-modifications' keeps the rewrite out of the undo history
+and out of the buffer's modified flag — output is a result, not part of
+the document, exactly as it was when it lived in an overlay string — and
+stands `after-change-functions' down for the same reason
+`jsonyter--nb-cell-surgery' does."
+  (let* ((body (jsonyter--nb-outputs-string
+                (overlay-get cell 'jsonyter-output-string)
+                (overlay-get cell 'jsonyter-output-stale)))
+         (src-end (marker-position (overlay-get cell 'jsonyter-source-end)))
+         (out-end (overlay-end cell))
+         ;; A cell beginning where this one's output ends collapses onto
+         ;; the insertion point when the old output is deleted, and
+         ;; `make-overlay's FRONT-ADVANCE being nil would then let it
+         ;; swallow the replacement whole — the same hazard
+         ;; `jsonyter--nb-insert-cell' guards against at its own end.
+         (adjacent (seq-filter (lambda (o)
+                                 (and (overlay-get o 'jsonyter-cell)
+                                      (= (overlay-start o) out-end)))
+                               (overlays-at out-end)))
+         (new-end
+          (let ((jsonyter--nb-cell-surgery t))
+            (with-silent-modifications
+              (save-excursion
+                (delete-region src-end out-end)
+                (goto-char src-end)
+                (unless (string-empty-p body)
+                  ;; Output must begin on a line of its own.  A notebook
+                  ;; cell owns its trailing newline, so this only fires
+                  ;; for a cell whose own has been edited away; the
+                  ;; newline stays outside the read-only span so that
+                  ;; typing at the end of that line still works.
+                  (unless (bolp) (insert "\n"))
+                  (let ((start (point)))
+                    (insert body)
+                    (add-text-properties
+                     start (point)
+                     '(read-only t front-sticky (read-only) rear-nonsticky t))))
+                (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
+                (move-overlay cell (overlay-start cell) (point))
+                (point))))))
+    (unless (= new-end out-end)
+      (jsonyter--forget-undo-after src-end))))
+
 (defun jsonyter--nb-make-cell (start end cell)
-  "Create the overlay for CELL spanning START..END.
+  "Create the overlay for CELL whose source spans START..END.
+Returns the overlay, which by the time this returns reaches past END:
+the cell's rendered output is buffer text written in after its source,
+and the overlay covers both.  `jsonyter-source-end' marks the boundary,
+and is what tells the cell's source from its results ever after — see
+`jsonyter--nb-cell-source'.
+
 Rear-advance is deliberately off: cells are laid down back to back, so
 an overlay that grew at its end would swallow every cell rendered after
 it.  A cell's trailing newline is inside the overlay, so typing at the
@@ -2089,6 +2234,11 @@ end of its last visible line still lands in the right cell."
     (overlay-put ov 'jsonyter-cell-type (plist-get cell :cell_type))
     (overlay-put ov 'jsonyter-exec-count (plist-get cell :execution_count))
     (overlay-put ov 'evaporate nil)
+    ;; Insertion type nil: output written at the boundary stays on the
+    ;; output side of it.  With the marker advancing instead, the very
+    ;; first refresh would sweep the whole rendered block into what the
+    ;; cell calls its source, and the next save would write it to disk.
+    (overlay-put ov 'jsonyter-source-end (copy-marker end))
     (jsonyter--nb-refresh-prompt ov)
     (let ((rendered (mapconcat (lambda (o)
                                  (jsonyter--nb-render-string
@@ -2121,9 +2271,18 @@ end of its last visible line still lands in the right cell."
              (seq-find cell-p (overlays-at (1- pos)))))))
 
 (defun jsonyter--nb-cell-source (cell)
-  "The source text of CELL, without its trailing newline."
-  (let ((text (buffer-substring-no-properties (overlay-start cell)
-                                              (overlay-end cell))))
+  "The source text of CELL, without its trailing newline.
+
+A cell's overlay spans its source and then its rendered output, so only
+the text before `jsonyter-source-end' is source.  Reading to the
+overlay's end instead would call the output source too — and this is
+what `jsonyter--nb-collect-cells' writes back to the `.ipynb' file, so
+every save after a run would append that run's frame rules, resolved
+ANSI text and image placeholder characters to the cell's own code."
+  (let ((text (buffer-substring-no-properties
+               (overlay-start cell)
+               (or (overlay-get cell 'jsonyter-source-end)
+                   (overlay-end cell)))))
     (if (string-suffix-p "\n" text) (substring text 0 -1) text)))
 
 ;;; Staleness of shown output
@@ -2136,6 +2295,67 @@ end of its last visible line still lands in the right cell."
 ;; and back again if the edit is undone.  Only a change of verdict
 ;; re-renders the frame; every other keystroke costs one hash of that
 ;; one cell's source, so large outputs add nothing to typing latency.
+
+(defun jsonyter--nb-output-spans (beg end)
+  "Rendered-output spans overlapping BEG..END, in buffer order.
+Each is a cons of the position its output starts at and the one just
+past its end; a cell showing no output contributes none."
+  (sort (delq nil
+              (mapcar
+               (lambda (o)
+                 (let ((source-end (and (overlay-get o 'jsonyter-cell)
+                                        (overlay-get o 'jsonyter-source-end))))
+                   (and source-end
+                        (< (marker-position source-end) (overlay-end o))
+                        (cons (marker-position source-end) (overlay-end o)))))
+               (overlays-in beg end)))
+        #'car-less-than-car))
+
+(defun jsonyter--nb-map-source-runs (beg end fn)
+  "Call FN with the bounds of each run of source text between BEG and END.
+The rendered output spans in between are skipped."
+  (let ((pos beg))
+    (dolist (span (jsonyter--nb-output-spans beg end))
+      (when (< pos (car span))
+        (funcall fn pos (min end (car span))))
+      (setq pos (max pos (min end (cdr span)))))
+    (when (< pos end)
+      (funcall fn pos end))))
+
+(defun jsonyter--nb-fontify-region (beg end loudly)
+  "Fontify BEG..END as source, leaving rendered cell output alone.
+LOUDLY is passed through to `font-lock-default-fontify-region'.
+
+On `font-lock-fontify-region-function' in notebook buffers.  A cell's
+output is buffer text, so the notebook language's own font-lock would
+otherwise read a traceback or a printed string as code: it strips the
+`face' properties the renderer put there — the resolved ANSI colours,
+the stderr red, the frame around the block — and paints its own over
+what is left.  Only the source between the outputs is handed on.
+
+Nothing needs to hold `font-lock-extend-region-functions' back at the
+seams: a cell owns its trailing newline and an output block ends with
+its closing rule's, so every run of source both begins and ends at the
+beginning of a line, and whole-line extension has nowhere to reach."
+  (jsonyter--nb-map-source-runs
+   beg end
+   (lambda (from to) (font-lock-default-fontify-region from to loudly)))
+  ;; The output spans inside the region are finished, not pending, so
+  ;; report the whole of it as done rather than leaving jit-lock to come
+  ;; back for them on every redisplay.
+  `(jit-lock-bounds ,beg . ,end))
+
+(defun jsonyter--nb-unfontify-region (beg end)
+  "Strip font-lock's faces from BEG..END, leaving rendered cell output alone.
+
+On `font-lock-unfontify-region-function' in notebook buffers, and the
+necessary other half of `jsonyter--nb-fontify-region': output text is
+not font-lock's to paint, so it is not font-lock's to strip either.
+Without this, anything that unfontifies wholesale — \\[font-lock-update],
+turning the mode off and on, a major-mode change — would take the
+renderer's own colours with it and never put them back, since
+refontifying deliberately skips the output."
+  (jsonyter--nb-map-source-runs beg end #'font-lock-default-unfontify-region))
 
 (defun jsonyter--source-hash (code)
   "Hash of CODE, as stored on an overlay to detect later source edits."
@@ -2187,7 +2407,10 @@ intermediate states are not edits to any cell's source."
         ;; save-and-reopen round trip a fixed point.
         (when (or (= (point) start) (not (bolp)))
           (insert "\n"))
-        (jsonyter--nb-make-cell start (point) cell)))
+        ;; The cell's overlay reaches past its source, over the output
+        ;; text `jsonyter--nb-make-cell' writes in after it, so the next
+        ;; cell begins at the overlay's end and not at the source's.
+        (goto-char (overlay-end (jsonyter--nb-make-cell start (point) cell)))))
     (goto-char (point-min))))
 
 ;;; Saving
@@ -2385,12 +2608,16 @@ and must not be recorded as one."
   (jsonyter--nb-refresh-output cell))
 
 (defun jsonyter--nb-append-output (cell output)
-  "Append one kernel OUTPUT to CELL, honoring clear_output."
+  "Append one kernel OUTPUT to CELL, honoring clear_output.
+A script cell's output ends up in an overlay string, so it is rendered
+for one; a notebook cell's becomes buffer text and is rendered with the
+slicing that needs — see `jsonyter--nb-refresh-output'."
   (if (equal (plist-get output :type) "clear_output")
       (jsonyter--nb-set-output cell "" nil t)
     (jsonyter--nb-set-output
      cell (concat (or (overlay-get cell 'jsonyter-output-string) "")
-                  (jsonyter--nb-render-string output))
+                  (jsonyter--nb-render-string
+                   output (overlay-get cell 'jsonyter-script-cell)))
      (append (overlay-get cell 'jsonyter-raw-outputs) (list output))
      t)))
 
@@ -2552,6 +2779,10 @@ code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
   "Create a new empty CELL-TYPE cell whose source begins at POS."
   (goto-char pos)
   (let* ((jsonyter--nb-cell-surgery t)
+         ;; POS may be the far side of a cell's read-only output, which
+         ;; is exactly where a cell inserted below one that has run
+         ;; belongs.
+         (inhibit-read-only t)
          (start (point))
          ;; A cell beginning exactly here would absorb the newline
          ;; inserted below: `make-overlay's FRONT-ADVANCE is nil, so text
@@ -2605,10 +2836,22 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (unless cell (user-error "No cell at point"))
     (when (or (string-blank-p (jsonyter--nb-cell-source cell))
               (yes-or-no-p "Delete this cell? "))
-      (let ((jsonyter--nb-cell-surgery t)
-            (start (overlay-start cell)) (end (overlay-end cell)))
+      (let* ((jsonyter--nb-cell-surgery t)
+             (inhibit-read-only t)
+             (start (overlay-start cell))
+             (end (overlay-end cell))
+             (source-end (overlay-get cell 'jsonyter-source-end))
+             (src-end (marker-position source-end)))
+        ;; The output leaves the way it arrived: as text that was never
+        ;; part of the document.  Deleting it along with the source would
+        ;; put it in the undo history, and undoing would then restore a
+        ;; read-only block with no cell left to own it — text the buffer
+        ;; would give no way to remove again.
+        (with-silent-modifications (delete-region src-end end))
+        (jsonyter--forget-undo-after src-end)
+        (set-marker source-end nil)
         (delete-overlay cell)
-        (delete-region start end)))))
+        (delete-region start src-end)))))
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
@@ -2636,11 +2879,28 @@ These are the things that must travel with the text when cells move —
 including this session's raw outputs and their touched flag, which
 `jsonyter-notebook-save-with-outputs' writes by cell: left behind on a
 move, they would be saved under whichever cell took over the old
-position.")
+position.
+
+`jsonyter-source-end' is not among them: it is a marker into the text
+being moved, so a swap has to re-derive it rather than hand it over —
+see `jsonyter--nb-swap-cells'.")
 
 (defun jsonyter--nb-swap-cells (a b)
-  "Exchange the text and identity of adjacent cells A and B (A before B)."
+  "Exchange the text and identity of adjacent cells A and B (A before B).
+A cell's output is buffer text within its own span, so it travels with
+the source rather than needing to be carried separately.  Returns the
+position the rearranged text starts at, for `jsonyter--forget-undo-after'."
   (let* ((jsonyter--nb-cell-surgery t)
+         ;; The text being moved includes each cell's read-only output.
+         (inhibit-read-only t)
+         ;; Undo could not put this move back in any case: the identities
+         ;; that belong with the text travel as overlay properties, which
+         ;; undo does not record, so replaying the text alone would leave
+         ;; each cell wearing its neighbour's results — and the output it
+         ;; restored, being read-only, could not then be cleared by hand.
+         ;; The move stays out of the history, and entries pointing into
+         ;; the rearranged text are dropped once it is bound back.
+         (buffer-undo-list t)
          (cells (jsonyter--nb-cells))
          ;; Every other cell's span is unchanged by a swap, since the two
          ;; texts merely trade places. Snapshot them anyway: the
@@ -2656,6 +2916,14 @@ position.")
                           jsonyter--nb-cell-props))
          (b-props (mapcar (lambda (p) (cons p (overlay-get b p)))
                           jsonyter--nb-cell-props))
+         ;; Where each cell's source ends, as a distance from its own
+         ;; start.  The markers themselves sit in the text about to be
+         ;; deleted, so they collapse onto START and cannot be read back
+         ;; afterwards; only the offsets survive the move.
+         (a-source-end (overlay-get a 'jsonyter-source-end))
+         (b-source-end (overlay-get b 'jsonyter-source-end))
+         (a-offset (- (marker-position a-source-end) (overlay-start a)))
+         (b-offset (- (marker-position b-source-end) (overlay-start b)))
          (start (overlay-start a))
          (end (overlay-end b))
          (boundary (+ start (length b-text))))
@@ -2668,12 +2936,18 @@ position.")
               ((eq ov b) (move-overlay ov boundary end))
               (t (move-overlay ov (nth 1 span) (nth 2 span))))))
     ;; The overlays keep their slots; the text moved, so the identities
-    ;; move with it.
+    ;; move with it — and each slot's source now ends where the text that
+    ;; landed in it says it does, not where its previous occupant's did.
     (dolist (p b-props) (overlay-put a (car p) (cdr p)))
     (dolist (p a-props) (overlay-put b (car p) (cdr p)))
+    (overlay-put a 'jsonyter-source-end (set-marker b-source-end
+                                                    (+ start b-offset)))
+    (overlay-put b 'jsonyter-source-end (set-marker a-source-end
+                                                    (+ boundary a-offset)))
     (jsonyter--nb-refresh-prompt a) (jsonyter--nb-refresh-output a)
     (jsonyter--nb-refresh-prompt b) (jsonyter--nb-refresh-output b)
-    (goto-char (overlay-start b))))
+    (goto-char (overlay-start b))
+    start))
 
 ;;;###autoload
 (defun jsonyter-move-cell-down ()
@@ -2685,7 +2959,7 @@ position.")
                                                   (overlay-start cell)))
                                    (jsonyter--nb-cells)))))
     (unless cell (user-error "No cell at point"))
-    (if next (jsonyter--nb-swap-cells cell next)
+    (if next (jsonyter--forget-undo-after (jsonyter--nb-swap-cells cell next))
       (message "jsonyter: already the last cell"))))
 
 ;;;###autoload
@@ -2699,7 +2973,7 @@ position.")
                                                     (overlay-start cell)))
                                      (jsonyter--nb-cells)))))))
     (unless cell (user-error "No cell at point"))
-    (if prev (jsonyter--nb-swap-cells prev cell)
+    (if prev (jsonyter--forget-undo-after (jsonyter--nb-swap-cells prev cell))
       (message "jsonyter: already the first cell"))))
 
 ;; Through 1.0.0 these commands were named `jsonyter-notebook-*'.  They
@@ -2781,9 +3055,10 @@ position.")
   "Minor mode for Jupyter notebooks rendered by jsonyter.
 
 Layered over the notebook language's own major mode, so syntax
-highlighting and indentation are the language's own.  Cell prompts and
-outputs are overlay strings, not buffer text, so undo and editing see
-only the cell source.
+highlighting and indentation are the language's own.  Cell prompts are
+overlay strings; a cell's output is read-only buffer text after its
+source, kept out of the undo history and out of the language's
+font-lock, so undo and editing still see only the cell source.
 
 \\{jsonyter-notebook-mode-map}"
   :lighter " Notebook"
@@ -2795,11 +3070,19 @@ only the cell source.
         (setq-local jsonyter--output-end (make-marker))
         (set-marker-insertion-type jsonyter--output-end t)
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
+        ;; Cell output is buffer text, and the language's own font-lock
+        ;; must not treat it as code; see `jsonyter--nb-fontify-region'.
+        (setq-local font-lock-fontify-region-function
+                    #'jsonyter--nb-fontify-region)
+        (setq-local font-lock-unfontify-region-function
+                    #'jsonyter--nb-unfontify-region)
         (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions
                   #'jsonyter--nb-stale-after-change nil t)
         (jsonyter-mode 1))
+    (kill-local-variable 'font-lock-fontify-region-function)
+    (kill-local-variable 'font-lock-unfontify-region-function)
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
