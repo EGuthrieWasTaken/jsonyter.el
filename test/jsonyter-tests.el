@@ -905,5 +905,352 @@ own visibility cycling hides committed-free session output for us."
       (org-cycle)                       ; fold the subtree
       (should (org-invisible-p anchor)))))
 
+;;;; org-babel backend (M5)
+
+(ert-deftest jsonyter-test-babel-jy-p-detects-prefix ()
+  "`jsonyter--org-babel-jy-p' matches only a `jy:'-prefixed `:session'."
+  (should (jsonyter--org-babel-jy-p '((:session . "jy:main"))))
+  (should-not (jsonyter--org-babel-jy-p '((:session . "main"))))
+  (should-not (jsonyter--org-babel-jy-p nil)))
+
+(ert-deftest jsonyter-test-babel-key-strips-jy-prefix ()
+  "`jsonyter--org-babel-key' turns `:session jy:NAME' into (LANG . NAME)."
+  (should (equal '("python" . "main")
+                 (jsonyter--org-babel-key "python" '((:session . "jy:main")))))
+  (should (equal '("R" . "") (jsonyter--org-babel-key "R" '((:session . "jy:"))))))
+
+(ert-deftest jsonyter-test-babel-dispatch-falls-through-without-jy ()
+  "A block with no `jy:' session calls ORIG-FUN, not jsonyter."
+  (let (called)
+    (should (equal "orig"
+                   (jsonyter--org-babel-dispatch
+                    "python"
+                    (lambda (body params) (setq called (list body params)) "orig")
+                    "print(1)" '((:session . "main")))))
+    (should (equal called '("print(1)" ((:session . "main")))))))
+
+(ert-deftest jsonyter-test-babel-dispatch-errors-without-orig-fun ()
+  "No ORIG-FUN and no `jy:' session — the same failure Org itself signals."
+  (should-error (jsonyter--org-babel-dispatch "SAS" nil "x" '((:session . "main")))))
+
+(ert-deftest jsonyter-test-babel-value-stream-for-output ()
+  "RESULT-TYPE `output' returns concatenated stream text."
+  (should (equal "a\nb\n"
+                 (jsonyter--org-babel-value
+                  (list (jsonyter-tests--stream "a\n") (jsonyter-tests--stream "b\n"))
+                  'output nil))))
+
+(ert-deftest jsonyter-test-babel-value-execute-result-for-value ()
+  "RESULT-TYPE `value' returns the last execute_result's text/plain."
+  (should (equal "42"
+                 (jsonyter--org-babel-value
+                  (list (list :type "execute_result" :data (list :text/plain "42")))
+                  'value nil))))
+
+(ert-deftest jsonyter-test-babel-value-falls-back-to-stream-for-value ()
+  "With no execute_result, RESULT-TYPE `value' falls back to stream text."
+  (should (equal "hi\n"
+                 (jsonyter--org-babel-value (list (jsonyter-tests--stream "hi\n")) 'value nil))))
+
+(ert-deftest jsonyter-test-babel-value-error-wins-over-everything ()
+  "An error's traceback is returned regardless of RESULT-TYPE/RESULT-PARAMS."
+  (should (equal "boom"
+                 (jsonyter--org-babel-value
+                  (list (list :type "error" :traceback '("boom"))) 'value '("html")))))
+
+(ert-deftest jsonyter-test-babel-value-html-when-requested ()
+  "`:results html' returns the text/html payload, not the plain-text one."
+  (should (equal "<b>hi</b>"
+                 (jsonyter--org-babel-value
+                  (list (list :type "execute_result"
+                              :data (list :text/plain "hi" :text/html "<b>hi</b>")))
+                  'value '("html")))))
+
+(ert-deftest jsonyter-test-babel-value-file-writes-image ()
+  "`:results file' writes the image and returns a bare path, not a link."
+  (jsonyter-tests--with-org-file "* h\n"
+    (let ((value (jsonyter--org-babel-value (list (jsonyter-tests--png "eA==")) 'value '("file"))))
+      (should (stringp value))
+      (should (file-exists-p (expand-file-name value (file-name-directory buffer-file-name)))))))
+
+(ert-deftest jsonyter-test-babel-execute-runs-synchronously ()
+  "`jsonyter--org-babel-execute' blocks for a reply and returns the value."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\n1 + 1\n#+end_src\n"
+    (cl-letf (((symbol-function 'jsonyter--org-connect)
+               (lambda (key &rest _) (jsonyter-tests--bind-session key "kid" t)))
+              ((symbol-function 'jsonyter--send)
+               (lambda (_method _params handlers)
+                 (funcall (plist-get handlers :result)
+                          (list :result
+                                (list :outputs
+                                      (list (list :type "execute_result"
+                                                  :data (list :text/plain "2")))))))))
+      (should (equal "2" (jsonyter--org-babel-execute
+                          "python" "1 + 1" '((:session . "jy:main"))))))))
+
+(ert-deftest jsonyter-test-babel-execute-refuses-when-session-busy ()
+  "A session already busy refuses a second execute rather than queuing it."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\n1\n#+end_src\n"
+    (cl-letf (((symbol-function 'jsonyter--org-connect)
+               (lambda (key &rest _)
+                 (let ((s (jsonyter-tests--bind-session key "kid" t)))
+                   (setf (jsonyter--session-busy s) t)
+                   s))))
+      (should-error (jsonyter--org-babel-execute "python" "1" '((:session . "jy:main")))))))
+
+(ert-deftest jsonyter-test-tangle-marks-jy-blocks-not-others ()
+  "`org-babel-tangle' prefixes a jy: block with `# %%'; a plain one is untouched."
+  (require 'ob-tangle)
+  (jsonyter-tests--with-org-file
+      (concat "* h\n"
+              "#+begin_src python :session jy:main :tangle yes\nprint(1)\n#+end_src\n"
+              "#+begin_src python :tangle yes\nprint(2)\n#+end_src\n")
+    (let ((target (org-babel-effective-tangled-filename buffer-file-name "python" "yes")))
+      (unwind-protect
+          (progn
+            (org-babel-tangle)
+            (should (file-exists-p target))
+            (with-temp-buffer
+              (insert-file-contents target)
+              (goto-char (point-min))
+              (should (search-forward "# %%" nil t))
+              (should (search-forward "print(1)" nil t))
+              (goto-char (point-min))
+              (search-forward "print(2)")
+              (goto-char (line-beginning-position 0))
+              (should-not (looking-at "# %%"))))
+        (when (file-exists-p target) (delete-file target))))))
+
+;;;; async babel path (M6)
+
+(ert-deftest jsonyter-test-babel-async-inserts-placeholder-then-replaces ()
+  "`:async yes' returns a placeholder immediately; the reply replaces it in place."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main :async yes\n1 + 1\n#+end_src\n"
+    (let (stashed-handlers)
+      (cl-letf (((symbol-function 'jsonyter--org-connect)
+                 (lambda (key &rest _) (jsonyter-tests--bind-session key "kid" t)))
+                ((symbol-function 'jsonyter--send)
+                 (lambda (_method _params handlers) (setq stashed-handlers handlers))))
+        (goto-char (point-min))
+        (search-forward "1 + 1")
+        (let* ((info (jsonyter--org-block-info))
+               (params (org-babel-process-params (nth 2 info)))
+               (placeholder (jsonyter--org-babel-execute "python" "1 + 1" params)))
+          (should (string-match "\\[\\[.+\\]\\]" placeholder))
+          (org-babel-insert-result placeholder (cdr (assq :result-params params)) info)
+          (goto-char (point-min))
+          (should (search-forward placeholder nil t))
+          (funcall (plist-get stashed-handlers :result)
+                   (list :result
+                         (list :outputs
+                               (list (list :type "execute_result" :data (list :text/plain "2"))))))
+          (goto-char (point-min))
+          (should-not (search-forward placeholder nil t))
+          (goto-char (point-min))
+          (should (search-forward "2" nil t)))))))
+
+(ert-deftest jsonyter-test-babel-async-drops-reply-with-no-placeholder ()
+  "A reply for a token no longer in the buffer is dropped, not an error."
+  (jsonyter-tests--with-org-file "* h\nno placeholder here\n"
+    (should (equal (concat "jsonyter: async result [gone-token] arrived for a block "
+                          "that no longer has its placeholder — dropped")
+                   (jsonyter--org-babel-async-reply "gone-token" (list :result nil))))))
+
+(ert-deftest jsonyter-test-babel-async-ignored-during-export ()
+  "Even with `:async yes', exporting forces the synchronous path."
+  (require 'ox)
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main :async yes\n1\n#+end_src\n"
+    (cl-letf (((symbol-function 'jsonyter--org-connect)
+               (lambda (key &rest _) (jsonyter-tests--bind-session key "kid" t)))
+              ((symbol-function 'jsonyter--send)
+               (lambda (_method _params handlers)
+                 (funcall (plist-get handlers :result)
+                          (list :result
+                                (list :outputs
+                                      (list (list :type "execute_result"
+                                                  :data (list :text/plain "1")))))))))
+      (let ((org-export-current-backend 'ascii))
+        (should (equal "1" (jsonyter--org-babel-execute
+                            "python" "1" '((:session . "jy:main") (:async . "yes")))))))))
+
+;;;; :var marshalling (M7)
+
+(ert-deftest jsonyter-test-var-python-scalar-and-string ()
+  "A Python scalar is a literal; a string is quoted and escaped."
+  (should (equal "n = 5" (jsonyter--org-var-value-python "n" 5 nil)))
+  (should (equal "s = \"hi\\nthere\"" (jsonyter--org-var-value-python "s" "hi\nthere" nil))))
+
+(ert-deftest jsonyter-test-var-python-table-list-of-lists ()
+  "A Python table with no colnames is a list of lists."
+  (should (equal "data = [[1, 2], [3, 4]]"
+                 (jsonyter--org-var-value-python "data" '((1 2) (3 4)) nil))))
+
+(ert-deftest jsonyter-test-var-python-table-with-colnames-is-dataframe ()
+  "`:colnames yes' makes a Python table a pandas DataFrame."
+  (should (equal (concat "import pandas as pd\n"
+                        "data = pd.DataFrame([[1, 2], [3, 4]], columns=[\"a\", \"b\"])")
+                 (jsonyter--org-var-value-python "data" '((1 2) (3 4)) '("a" "b")))))
+
+(ert-deftest jsonyter-test-var-r-table-is-matrix ()
+  "An R table with no colnames is a `matrix'."
+  (should (equal "data <- matrix(c(1, 2, 3, 4), nrow = 2, byrow = TRUE)"
+                 (jsonyter--org-var-value-r "data" '((1 2) (3 4)) nil))))
+
+(ert-deftest jsonyter-test-var-r-table-with-colnames-is-data-frame ()
+  "`:colnames yes' makes an R table a `data.frame' with those names."
+  (should (equal (concat "data <- as.data.frame(matrix(c(1, 2, 3, 4), nrow = 2, byrow = TRUE))\n"
+                        "colnames(data) <- c(\"a\", \"b\")")
+                 (jsonyter--org-var-value-r "data" '((1 2) (3 4)) '("a" "b")))))
+
+(ert-deftest jsonyter-test-var-julia-table-is-matrix-literal ()
+  "A Julia table is always a `Matrix' literal unless the DataFrame opt-in is on."
+  (should (equal "data = [1 2; 3 4]" (jsonyter--org-var-value-julia "data" '((1 2) (3 4)) nil))))
+
+(ert-deftest jsonyter-test-var-julia-dataframe-requires-opt-in ()
+  "Colnames alone do not make a Julia table a DataFrame without the option."
+  (let ((jsonyter-org-var-julia-dataframe nil))
+    (should (equal "data = [1 2; 3 4]"
+                   (jsonyter--org-var-value-julia "data" '((1 2) (3 4)) '("a" "b")))))
+  (let ((jsonyter-org-var-julia-dataframe t))
+    (should (equal "data = DataFrame([1 2; 3 4], [Symbol(\"a\"), Symbol(\"b\")])"
+                   (jsonyter--org-var-value-julia "data" '((1 2) (3 4)) '("a" "b"))))))
+
+(ert-deftest jsonyter-test-var-sas-scalar-is-let ()
+  "A SAS scalar is a `%let'."
+  (should (equal "%let n = 5;" (jsonyter--org-var-value-sas "n" 5))))
+
+(ert-deftest jsonyter-test-var-sas-numeric-table-is-datalines ()
+  "An all-numeric SAS table becomes a DATALINES step."
+  (should (equal "data t;\n  input col1 col2;\n  datalines;\n1 2\n3 4\n;\nrun;"
+                 (jsonyter--org-var-value-sas "t" '((1 2) (3 4))))))
+
+(ert-deftest jsonyter-test-var-sas-whitespace-character-table-errors ()
+  "A SAS table with a whitespace-containing character field refuses, not corrupts."
+  (should-error (jsonyter--org-var-value-sas "t" '(("hi there" 1)))))
+
+(ert-deftest jsonyter-test-var-code-prepends-prelude-for-every-var ()
+  "`jsonyter--org-var-code' prepends one prelude line per `:var' binding."
+  (should (equal "n = 5\nx = 1" (jsonyter--org-var-code "python" "x = 1" '((:var n . 5))))))
+
+(ert-deftest jsonyter-test-var-code-passes-body-through-with-no-vars ()
+  "With no `:var' bindings at all, the body is returned unchanged."
+  (should (equal "x = 1" (jsonyter--org-var-code "python" "x = 1" nil))))
+
+(ert-deftest jsonyter-test-var-size-limit-signals-clear-error ()
+  "Past `jsonyter-org-var-size-limit', jsonyter refuses rather than sends it anyway."
+  (let ((jsonyter-org-var-size-limit 5))
+    (should-error (jsonyter--org-var-check-size "n" "way too long a string"))))
+
+;;;; .ipynb <-> .org conversion (M8)
+
+(ert-deftest jsonyter-test-org-from-notebook-writes-property-and-drawers ()
+  "Converting a fixture notebook writes a session `#+PROPERTY:' and per-cell ids."
+  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+         (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
+         (org (make-temp-file "jsonyter-test-" nil ".org")))
+    (unwind-protect
+        (progn
+          (jsonyter-tests--write-notebook ipynb)
+          (delete-file org)
+          (jsonyter-org-from-notebook ipynb org "main")
+          (with-temp-buffer
+            (insert-file-contents org)
+            (goto-char (point-min))
+            (should (search-forward "#+PROPERTY: header-args:python :session jy:main" nil t))
+            (goto-char (point-min))
+            (should (search-forward ":JSONYTER_CELL_ID: aaa" nil t))
+            (goto-char (point-min))
+            (should (search-forward "#+begin_src python :session jy:main\nx = 1\n#+end_src" nil t))
+            (goto-char (point-min))
+            (should (search-forward ":JSONYTER_CELL_ID: ccc" nil t))
+            (goto-char (point-min))
+            (should (search-forward "# heading" nil t))))
+      (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
+      (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+(ert-deftest jsonyter-test-org-from-notebook-commits-stored-output ()
+  "A cell with stored output gets a committed `#+RESULTS:' drawer, not just source."
+  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+         (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
+         (org (make-temp-file "jsonyter-test-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-file ipynb (insert jsonyter-tests--notebook-with-outputs))
+          (delete-file org)
+          (jsonyter-org-from-notebook ipynb org "main")
+          (with-temp-buffer
+            (insert-file-contents org)
+            (goto-char (point-min))
+            (should (search-forward "#+RESULTS" nil t))
+            (goto-char (point-min))
+            (should (search-forward "stored one" nil t))))
+      (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
+      (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-cells-splits-on-id-drawers ()
+  "`jsonyter--org-to-notebook-cells' recovers each cell's id, type and source."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "#+PROPERTY: header-args:python :session jy:main\n\n"
+                ":PROPERTIES:\n:JSONYTER_CELL_ID: aaa\n:END:\n"
+                "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                ":PROPERTIES:\n:JSONYTER_CELL_ID: ccc\n:END:\n"
+                "# heading\n\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 2 (length cells)))
+        (should (equal "aaa" (plist-get (nth 0 cells) :id)))
+        (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+        (should (equal "ccc" (plist-get (nth 1 cells) :id)))
+        (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+        (should (equal "# heading" (plist-get (nth 1 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-cell-with-no-drawer-is-new ()
+  "A span with no `:JSONYTER_CELL_ID:' drawer becomes a cell with id `:null'."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 1 (length cells)))
+        (should (eq :null (plist-get (car cells) :id)))))))
+
+(ert-deftest jsonyter-test-org-parse-results-drawer-recovers-stream-text ()
+  "A committed text drawer reads back as one combined stream output."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n#+RESULTS:\n:results:\n: line one\n: line two\n:end:\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let* ((info (jsonyter--org-block-info))
+           (outputs (jsonyter--org-parse-results-drawer info default-directory)))
+      (should (= 1 (length outputs)))
+      (should (equal "stream" (plist-get (car outputs) :output_type)))
+      (should (equal "line one\nline two\n" (plist-get (car outputs) :text))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-round-trips-with-bridge ()
+  "An unedited round trip through `write_notebook' preserves every cell id."
+  (skip-unless (jsonyter-tests--bridge-available-p))
+  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+         (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
+         (org (make-temp-file "jsonyter-test-" nil ".org")))
+    (unwind-protect
+        (progn
+          (jsonyter-tests--write-notebook ipynb)
+          (delete-file org)
+          (jsonyter-org-from-notebook ipynb org "main")
+          (let ((org-buf (find-buffer-visiting org)))
+            (when org-buf
+              (with-current-buffer org-buf (set-buffer-modified-p nil))
+              (kill-buffer org-buf)))
+          (jsonyter-org-to-notebook org ipynb)
+          (let* ((json-object-type 'alist)
+                 (nb (json-read-file ipynb))
+                 (ids (mapcar (lambda (c) (alist-get 'id c)) (append (alist-get 'cells nb) nil))))
+            (should (equal '("aaa" "bbb" "ccc") ids))))
+      (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
+      (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

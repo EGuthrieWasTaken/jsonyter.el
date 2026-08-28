@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.0.0
+;; Version: 2.1.0
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -4289,6 +4289,790 @@ session are left entirely to Org.
 Suitable for `org-mode-hook'."
   (when (and (derived-mode-p 'org-mode) (jsonyter--org-buffer-has-jy-p))
     (jsonyter-org-mode 1)))
+
+
+;;;; The org-babel backend (M5/M6)
+
+;; `jsonyter-org-mode' is one front door: `C-RET' against an overlay,
+;; never touching buffer text until `C-c C-s' commits it.  This is the
+;; other: `org-babel-execute:python' (and `:R', `:julia', `:SAS') routed
+;; through jsonyter whenever a block's `:session' carries the `jy:'
+;; prefix, so `C-c C-c', export and `org-babel-tangle' all work on a
+;; `jy:' block too -- and, because session resolution is shared with the
+;; cell layer (`jsonyter--org-connect', keyed the same way), a variable a
+;; `C-RET' run defines is visible to a `C-c C-c' run in the same session
+;; and back again.  A block with no `jy:' session is untouched: dispatch
+;; falls through to whatever `org-babel-execute:LANG' Org (or a third
+;; party) already defines, exactly as if jsonyter did not exist.
+;;
+;; This backend works with `jsonyter-org-mode' off.  Export in particular
+;; may run without the cell layer ever having been turned on for the
+;; buffer, so `jsonyter--org-babel-ensure-plumbing' sets up just enough
+;; buffer-local state (a bridge, a callback table, a session table) for
+;; that to work on its own.
+;;
+;; Registration is lazy and global: `with-eval-after-load' on `ob-core'
+;; costs nothing in a REPL, notebook or script buffer that never loads
+;; Org at all, and fires the moment anything -- `jsonyter-org-mode', or
+;; the user's own unrelated Org-babel use -- actually loads it, which is
+;; what lets `C-c C-c' work in a buffer that only ever uses this back
+;; door.
+
+(declare-function org-babel-process-params "ob-core" (params))
+(declare-function org-babel-insert-result
+                   "ob-core" (result &optional result-params info hash lang exec-time))
+(declare-function org-babel-spec-to-string "ob-tangle" (spec))
+
+(defun jsonyter--org-babel-jy-p (params)
+  "Non-nil when PARAMS' `:session' header argument starts with `jy:'."
+  (let ((session (cdr (assq :session params))))
+    (and (stringp session) (string-prefix-p "jy:" session))))
+
+(defun jsonyter--org-babel-key (lang params)
+  "The (LANG . NAME) session key PARAMS opts into via `:session jy:...'."
+  (cons lang (substring (cdr (assq :session params)) 3)))
+
+(defun jsonyter--org-babel-ensure-plumbing ()
+  "Make sure this Org buffer can talk to a bridge, `jsonyter-org-mode' or not.
+The babel back door is independent of the cell layer (Part 5 of the
+feature request), so it cannot assume the minor mode's enable body ever
+ran to set up `jsonyter--callbacks', the session table pointer, and
+shutdown-on-kill.  Installs exactly that much and no more -- no keymap,
+no staleness hook -- since those are cell-layer UI this path does not
+need."
+  (unless (bound-and-true-p jsonyter-mode)
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (setq-local jsonyter--session-key nil)
+    (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+    (jsonyter-mode 1)))
+
+;;; Converting kernel outputs to an org-babel result value
+
+(defun jsonyter--org-babel-mime (outputs key)
+  "The last KEY mimetype string among OUTPUTS' `:data', or nil."
+  (let (found)
+    (dolist (o outputs found)
+      (let ((v (jsonyter--mime (plist-get o :data) key)))
+        (when v (setq found v))))))
+
+(defun jsonyter--org-babel-image (outputs)
+  "Write the first image among OUTPUTS to the managed directory; its path, or nil.
+Reuses `jsonyter--org-write-image' (M4), so this only ever runs with an
+Org buffer current."
+  (catch 'done
+    (dolist (o outputs)
+      (let* ((data (plist-get o :data))
+             (png (jsonyter--mime data :image/png))
+             (jpeg (jsonyter--mime data :image/jpeg))
+             (svg (jsonyter--mime data :image/svg+xml)))
+        (cond
+         (png (throw 'done (jsonyter--org-write-image png "png")))
+         (jpeg (throw 'done (jsonyter--org-write-image jpeg "jpg")))
+         (svg (throw 'done
+                (jsonyter--org-write-image
+                 (base64-encode-string (encode-coding-string svg 'utf-8)) "svg"))))))
+    nil))
+
+(defun jsonyter--org-babel-value (outputs result-type result-params)
+  "The Lisp result value `org-babel-insert-result' should insert for OUTPUTS.
+
+Follows the feature request's Part 5 mapping: an error's traceback (ANSI
+stripped) always wins, since there is nothing else to show; an image is
+written to `jsonyter-org-image-directory' and returned as a bare path
+when \"file\" is in RESULT-PARAMS -- exactly the existing Org convention
+for a `:results file' block, so `org-babel-insert-result' turns it into
+the `[[file:...]]' link itself; `text/html'/`text/latex' are returned
+plain when \"html\"/\"latex\" is requested, for the same reason.
+Otherwise: stream text verbatim for RESULT-TYPE `output', or the last
+`execute_result''s `text/plain' for `value' (Jupyter's own value/output
+distinction lines up with babel's), falling back to stream text if there
+was no execute_result to show."
+  (let* ((errors (seq-filter (lambda (o) (equal (plist-get o :type) "error")) outputs))
+         (streams (seq-filter (lambda (o) (equal (plist-get o :type) "stream")) outputs))
+         (rich (seq-filter (lambda (o) (member (plist-get o :type)
+                                               '("execute_result" "display_data"
+                                                 "update_display_data")))
+                           outputs))
+         (values (seq-filter (lambda (o) (equal (plist-get o :type) "execute_result")) rich)))
+    (cond
+     (errors
+      (mapconcat (lambda (o) (ansi-color-filter-apply
+                              (mapconcat #'identity (plist-get o :traceback) "\n")))
+                errors "\n"))
+     ((member "file" result-params) (or (jsonyter--org-babel-image rich) ""))
+     ((member "html" result-params) (or (jsonyter--org-babel-mime rich :text/html) ""))
+     ((member "latex" result-params) (or (jsonyter--org-babel-mime rich :text/latex) ""))
+     ((eq result-type 'output)
+      (mapconcat (lambda (o) (or (plist-get o :text) "")) streams ""))
+     (t (or (jsonyter--org-babel-mime values :text/plain)
+            (mapconcat (lambda (o) (or (plist-get o :text) "")) streams ""))))))
+
+;;; Running the code (synchronous and `:async yes')
+
+(defun jsonyter--org-babel-async-p (params)
+  "Non-nil when PARAMS' `:async' header argument is \"yes\"."
+  (let ((async (cdr (assq :async params))))
+    (and async (not (member async '("no" "nil"))))))
+
+(defun jsonyter--org-babel-token ()
+  "A short opaque token identifying one pending `:async yes' placeholder."
+  (substring (secure-hash 'sha1 (format "%s%s%s" (buffer-name) (float-time) (random)))
+             0 10))
+
+(defun jsonyter--org-babel-async-reply (token msg)
+  "Find the `:async yes' placeholder for TOKEN and replace it with MSG's result.
+Runs with the block's own buffer current.  Locates the placeholder by
+searching for TOKEN's literal text, then the nearest preceding
+`#+begin_src' line, so it works from nothing but what is already in the
+buffer -- no marker to go stale, no copy of the original params to fall
+out of sync with a header-arg edited in the meantime.  If the
+placeholder is gone -- the block was edited or deleted before the kernel
+replied -- the result is dropped, with a message saying so, exactly as
+the feature request's own answer to that edge case asks."
+  (save-excursion
+    (goto-char (point-min))
+    (if (not (search-forward (format "[[%s]]" token) nil t))
+        (message "jsonyter: async result [%s] arrived for a block that no longer has its placeholder — dropped" token)
+      (let ((src (save-excursion
+                   (goto-char (line-beginning-position))
+                   (and (re-search-backward "^[ \t]*#\\+begin_src" nil t) (point)))))
+        (if (not src)
+            (message "jsonyter: async result [%s]: no source block found — dropped" token)
+          (goto-char src)
+          (let ((info (jsonyter--org-block-info)))
+            (if (not info)
+                (message "jsonyter: async result [%s]: source block is gone — dropped" token)
+              (let* ((params (org-babel-process-params (nth 2 info)))
+                     (lang (nth 0 info))
+                     (err (plist-get msg :error))
+                     (value (if err
+                                (format "jsonyter: execute failed: %s" (jsonyter--error-message err))
+                              (jsonyter--org-babel-value
+                               (plist-get (plist-get msg :result) :outputs)
+                               (or (cdr (assq :result-type params)) 'value)
+                               (cdr (assq :result-params params))))))
+                (org-babel-insert-result value (cdr (assq :result-params params)) info nil lang)
+                (message "jsonyter: async result [%s] inserted" token)))))))))
+
+(defun jsonyter--org-babel-execute (lang body params)
+  "Run BODY (already noweb-expanded) for a `:session jy:...' block in LANG.
+
+Shared by every `org-babel-execute:LANG' wrapper.  Returns the Lisp value
+`org-babel-insert-result' should insert.  With `:async yes' and outside
+export, returns a placeholder immediately instead and lets
+`jsonyter--org-babel-async-reply' replace it once the kernel answers;
+export always forces the synchronous path, bounded by
+`jsonyter-exec-timeout', since `ox' collects the whole buffer in one pass
+and has nowhere for an async result to land.  A second execute on a
+session already busy is refused, matching the cell layer's own guard,
+rather than queued or made to interrupt the first."
+  (jsonyter--org-babel-ensure-plumbing)
+  (let* ((key (jsonyter--org-babel-key lang params))
+         (session (jsonyter--org-connect key (cdr (assq :kernel params)))))
+    (when (jsonyter--session-busy session)
+      (user-error "jsonyter: session %s is busy (C-c C-c in a jy: block interrupts it)"
+                  (jsonyter--session-name session)))
+    (let* ((code (jsonyter--org-var-code lang body params))
+           (result-type (or (cdr (assq :result-type params)) 'value))
+           (result-params (cdr (assq :result-params params)))
+           (async (and (jsonyter--org-babel-async-p params)
+                       (not (bound-and-true-p org-export-current-backend))))
+           (kernel-id (jsonyter--session-kernel-id session)))
+      (setf (jsonyter--session-busy session) t)
+      (force-mode-line-update)
+      (if async
+          (let ((token (jsonyter--org-babel-token))
+                (buf (current-buffer)))
+            (jsonyter--send
+             "execute" (list :kernel_id kernel-id :code code)
+             (list :result
+                   (lambda (msg)
+                     (setf (jsonyter--session-busy session) nil)
+                     (when (buffer-live-p buf)
+                       (with-current-buffer buf
+                         (force-mode-line-update)
+                         (jsonyter--org-babel-async-reply token msg))))))
+            (format "jsonyter: running… [[%s]]" token))
+        (let ((reply 'jsonyter--pending))
+          (jsonyter--send
+           "execute" (list :kernel_id kernel-id :code code)
+           (list :result (lambda (msg) (setq reply msg))))
+          (let ((deadline (+ (float-time) (min 3600 (or jsonyter-exec-timeout 3600)))))
+            (while (and (eq reply 'jsonyter--pending)
+                        (process-live-p jsonyter--process)
+                        (< (float-time) deadline))
+              (accept-process-output jsonyter--process 0.05)))
+          (setf (jsonyter--session-busy session) nil)
+          (force-mode-line-update)
+          (when (eq reply 'jsonyter--pending)
+            (error "jsonyter: %s timed out waiting for a reply"
+                   (jsonyter--session-name session)))
+          (let ((err (plist-get reply :error)))
+            (when err (error "jsonyter: %s" (jsonyter--error-message err))))
+          (jsonyter--org-babel-value
+           (plist-get (plist-get reply :result) :outputs) result-type result-params))))))
+
+;;; Registering the wrappers
+
+(defun jsonyter--org-babel-dispatch (lang orig-fun body params)
+  "Shared body for every `org-babel-execute:LANG' wrapper.
+Runs BODY through jsonyter when PARAMS opts into a `jy:' session;
+otherwise calls ORIG-FUN the way Org itself would have.  With no
+ORIG-FUN at all -- a language, such as SAS on a stock install, that Org
+ships no backend for -- signals the same \"no org-babel-execute
+function\" error Org's own dispatcher raises for any other unconfigured
+language."
+  (if (jsonyter--org-babel-jy-p params)
+      (jsonyter--org-babel-execute lang body params)
+    (if orig-fun
+        (funcall orig-fun body params)
+      (error "No org-babel-execute function for %s!" lang))))
+
+(defun jsonyter--org-babel-execute:python (orig-fun body params)
+  "Advice for `org-babel-execute:python'; see `jsonyter--org-babel-dispatch'."
+  (jsonyter--org-babel-dispatch "python" orig-fun body params))
+(defun jsonyter--org-babel-standalone:python (body params)
+  "Standalone `org-babel-execute:python' for when nothing else defines one."
+  (jsonyter--org-babel-dispatch "python" nil body params))
+
+(defun jsonyter--org-babel-execute:R (orig-fun body params)
+  "Advice for `org-babel-execute:R'; see `jsonyter--org-babel-dispatch'."
+  (jsonyter--org-babel-dispatch "R" orig-fun body params))
+(defun jsonyter--org-babel-standalone:R (body params)
+  "Standalone `org-babel-execute:R' for when nothing else defines one."
+  (jsonyter--org-babel-dispatch "R" nil body params))
+
+(defun jsonyter--org-babel-execute:julia (orig-fun body params)
+  "Advice for `org-babel-execute:julia'; see `jsonyter--org-babel-dispatch'."
+  (jsonyter--org-babel-dispatch "julia" orig-fun body params))
+(defun jsonyter--org-babel-standalone:julia (body params)
+  "Standalone `org-babel-execute:julia' for when nothing else defines one."
+  (jsonyter--org-babel-dispatch "julia" nil body params))
+
+(defun jsonyter--org-babel-execute:SAS (orig-fun body params)
+  "Advice for `org-babel-execute:SAS'; see `jsonyter--org-babel-dispatch'."
+  (jsonyter--org-babel-dispatch "SAS" orig-fun body params))
+(defun jsonyter--org-babel-standalone:SAS (body params)
+  "Standalone `org-babel-execute:SAS' -- Org itself ships no SAS backend at all."
+  (jsonyter--org-babel-dispatch "SAS" nil body params))
+
+(defun jsonyter--org-babel-wrap (lang advice-fn standalone-fn)
+  "Route `org-babel-execute:LANG' through ADVICE-FN, or install STANDALONE-FN.
+Wraps whatever already defines `org-babel-execute:LANG' -- Org's own, or
+a third party's -- with `:around' advice, so a non-`jy:' block keeps
+running exactly as it did before jsonyter was loaded.  Installs
+STANDALONE-FN outright when nothing does, so a language with no other
+backend at all -- SAS, on a stock Org install -- still gets one, live
+only inside a `:session jy:...' block."
+  (let ((cmd (intern (concat "org-babel-execute:" lang))))
+    (if (fboundp cmd)
+        (advice-add cmd :around advice-fn)
+      (defalias cmd standalone-fn))))
+
+(defvar jsonyter--org-babel-registered nil
+  "Non-nil once `jsonyter--org-babel-setup' has installed its wrappers.")
+
+(defun jsonyter--org-babel-setup ()
+  "Wrap `org-babel-execute:LANG' for python/R/julia/SAS with jsonyter dispatch.
+Idempotent.  Julia's Org backend is newer than the rest and SAS's does
+not exist in Org at all, so each `require' is best-effort; either one
+missing just means `jsonyter--org-babel-wrap' installs jsonyter's own
+standalone function instead of advice, which is exactly what a `jy:'
+block needs regardless."
+  (unless jsonyter--org-babel-registered
+    (setq jsonyter--org-babel-registered t)
+    (require 'ob-python nil t)
+    (require 'ob-R nil t)
+    (require 'ob-julia nil t)
+    (jsonyter--org-babel-wrap "python" #'jsonyter--org-babel-execute:python
+                              #'jsonyter--org-babel-standalone:python)
+    (jsonyter--org-babel-wrap "R" #'jsonyter--org-babel-execute:R
+                              #'jsonyter--org-babel-standalone:R)
+    (jsonyter--org-babel-wrap "julia" #'jsonyter--org-babel-execute:julia
+                              #'jsonyter--org-babel-standalone:julia)
+    (jsonyter--org-babel-wrap "SAS" #'jsonyter--org-babel-execute:SAS
+                              #'jsonyter--org-babel-standalone:SAS)))
+
+;;;###autoload
+(with-eval-after-load 'ob-core
+  (jsonyter--org-babel-setup))
+
+;;; Tangling to `# %%' scripts by default
+
+(defcustom jsonyter-org-tangle-cell-markers t
+  "If non-nil, prefix each tangled `jy:' block with a `# %%' cell marker.
+Matches `jsonyter-script-cell-regexp', so a file `org-babel-tangle'
+writes out of one or more `jy:' blocks opens ready for
+`jsonyter-script-mode'.  Blocks with no `jy:' session are never marked;
+this only changes what a `jy:' block tangles to."
+  :type 'boolean)
+
+(defun jsonyter--org-tangle-mark-cell (orig-fun spec)
+  "Around-advice on `org-babel-spec-to-string': prefix a `jy:' SPEC with `# %%'."
+  (when (and jsonyter-org-tangle-cell-markers (jsonyter--org-babel-jy-p (nth 4 spec)))
+    (insert "# %%\n"))
+  (funcall orig-fun spec))
+
+;;;###autoload
+(with-eval-after-load 'ob-tangle
+  (advice-add 'org-babel-spec-to-string :around #'jsonyter--org-tangle-mark-cell))
+
+
+;;;; `:var' marshalling (M7)
+
+;; Values arrive from Org already resolved to Lisp: a scalar as a string
+;; or number, a table as a list of row-lists.  Each language's own
+;; `jsonyter--org-var-value-LANG' turns one such binding into a prelude
+;; statement, prepended to the block's code ahead of execution -- there
+;; is no hook in `org-babel-execute:LANG' for this the way
+;; `org-babel-variable-assignments:LANG' gives other backends; jsonyter
+;; is on its own for it, per the feature request's Part 8.
+
+(defcustom jsonyter-org-var-size-limit 100000
+  "Largest size, in characters, of any single `:var' binding jsonyter will send.
+A large Org table becomes a large piece of code sent to the kernel;
+past this limit jsonyter signals a clear error instead of a slow or
+silently oversized execute payload.  Read the data from the kernel's own
+filesystem instead for anything bigger."
+  :type 'integer)
+
+(defcustom jsonyter-org-var-julia-dataframe nil
+  "If non-nil, marshal a `:var' table with `:colnames yes' as a DataFrame in Julia.
+Off by default: unlike Python's pandas, Julia's DataFrames.jl is not a
+near-universal dependency, and jsonyter will not silently `using' a
+package that may not be installed.  Turning this on is a promise that
+the session already has it loaded.  With this off, or without
+`:colnames', a Julia `:var' table is always a plain `Matrix'."
+  :type 'boolean)
+
+(defun jsonyter--org-var-shape (value)
+  "`table', `row', or `scalar' -- how a `:var' binding's Lisp shape reads."
+  (cond
+   ((not (listp value)) 'scalar)
+   ((and value (seq-every-p #'listp value)) 'table)
+   (t 'row)))
+
+(defun jsonyter--org-var-check-size (name value)
+  "Signal a clear error when NAME's VALUE is over `jsonyter-org-var-size-limit'."
+  (let ((size (length (format "%S" value))))
+    (when (> size jsonyter-org-var-size-limit)
+      (user-error
+       "jsonyter: `:var %s' is %d characters, over `jsonyter-org-var-size-limit' (%d) — read it from the kernel's filesystem instead"
+       name size jsonyter-org-var-size-limit))))
+
+(defun jsonyter--org-var-quote-c (s)
+  "Format string S as a double-quoted literal shared by Python, R and Julia.
+All three escape a double-quoted string the same C-like way, so one
+quoting function serves all three languages' scalar and table cells."
+  (concat "\""
+          (replace-regexp-in-string
+           "[\\\"\n\t\r]"
+           (lambda (m)
+             (pcase m
+               ("\\" "\\\\") ("\"" "\\\"")
+               ("\n" "\\n") ("\t" "\\t") ("\r" "\\r")))
+           s nil t)
+          "\""))
+
+(defun jsonyter--org-var-atom (value null true)
+  "Format scalar VALUE, using NULL and TRUE for Lisp nil and t respectively."
+  (cond ((stringp value) (jsonyter--org-var-quote-c value))
+        ((numberp value) (format "%s" value))
+        ((null value) null)
+        ((eq value t) true)
+        (t (jsonyter--org-var-quote-c (format "%s" value)))))
+
+(defun jsonyter--org-var-atom-python (value)
+  "Format scalar VALUE as a Python literal."
+  (jsonyter--org-var-atom value "None" "True"))
+(defun jsonyter--org-var-atom-r (value)
+  "Format scalar VALUE as an R literal."
+  (jsonyter--org-var-atom value "NA" "TRUE"))
+(defun jsonyter--org-var-atom-julia (value)
+  "Format scalar VALUE as a Julia literal."
+  (jsonyter--org-var-atom value "nothing" "true"))
+
+(defun jsonyter--org-var-value-python (name value colnames)
+  "One Python prelude statement binding NAME to VALUE.
+A table becomes a list of lists, or -- with COLNAMES, from `:colnames
+yes' -- a `pandas.DataFrame'; jsonyter imports pandas itself in that
+case, on the view that asking for column names is asking for a
+DataFrame, and the import is a cheap no-op if the kernel has it already."
+  (pcase (jsonyter--org-var-shape value)
+    ('table
+     (let ((rows (concat "[" (mapconcat
+                              (lambda (row)
+                                (concat "[" (mapconcat #'jsonyter--org-var-atom-python row ", ") "]"))
+                              value ", ")
+                         "]")))
+       (if colnames
+           (format "import pandas as pd\n%s = pd.DataFrame(%s, columns=[%s])"
+                   name rows (mapconcat #'jsonyter--org-var-quote-c colnames ", "))
+         (format "%s = %s" name rows))))
+    ('row (format "%s = [%s]" name (mapconcat #'jsonyter--org-var-atom-python value ", ")))
+    (_ (format "%s = %s" name (jsonyter--org-var-atom-python value)))))
+
+(defun jsonyter--org-var-value-r (name value colnames)
+  "One R prelude statement binding NAME to VALUE.
+A table becomes a `matrix', or with COLNAMES a `data.frame' built from
+one -- base R either way, so this never depends on an extra package."
+  (pcase (jsonyter--org-var-shape value)
+    ('table
+     (let* ((cells (apply #'append value))
+            (matrix (format "matrix(c(%s), nrow = %d, byrow = TRUE)"
+                            (mapconcat #'jsonyter--org-var-atom-r cells ", ")
+                            (length value))))
+       (if colnames
+           (format "%s <- as.data.frame(%s)\ncolnames(%s) <- c(%s)"
+                   name matrix name (mapconcat #'jsonyter--org-var-quote-c colnames ", "))
+         (format "%s <- %s" name matrix))))
+    ('row (format "%s <- c(%s)" name (mapconcat #'jsonyter--org-var-atom-r value ", ")))
+    (_ (format "%s <- %s" name (jsonyter--org-var-atom-r value)))))
+
+(defun jsonyter--org-var-value-julia (name value colnames)
+  "One Julia prelude statement binding NAME to VALUE.
+A table becomes a `Matrix' literal, or -- only with COLNAMES and
+`jsonyter-org-var-julia-dataframe' non-nil -- a `DataFrame' built from
+one; column names go through `Symbol(...)' rather than a bare `:name'
+token, so an arbitrary string always reads back as a valid symbol."
+  (pcase (jsonyter--org-var-shape value)
+    ('table
+     (let ((matrix (format "[%s]"
+                           (mapconcat (lambda (row)
+                                        (mapconcat #'jsonyter--org-var-atom-julia row " "))
+                                      value "; "))))
+       (if (and colnames jsonyter-org-var-julia-dataframe)
+           (format "%s = DataFrame(%s, [%s])"
+                   name matrix
+                   (mapconcat (lambda (c) (format "Symbol(%s)" (jsonyter--org-var-quote-c c)))
+                             colnames ", "))
+         (format "%s = %s" name matrix))))
+    ('row (format "%s = [%s]" name (mapconcat #'jsonyter--org-var-atom-julia value ", ")))
+    (_ (format "%s = %s" name (jsonyter--org-var-atom-julia value)))))
+
+(defun jsonyter--org-var-value-sas (name value)
+  "One SAS prelude statement binding NAME to VALUE.
+A scalar becomes a `%let'.  A table becomes a `DATALINES' step when every
+cell is safe to space-delimit -- an all-numeric table, in practice --
+and a clear `user-error' otherwise: SAS has no expression-level literal
+for a dataset, and guessing at a delimiter for a character field that
+might contain whitespace risks silently corrupting the very data the
+block asked for, which is worse than refusing outright."
+  (pcase (jsonyter--org-var-shape value)
+    ('table
+     (when (seq-some (lambda (row)
+                       (seq-some (lambda (cell) (and (stringp cell) (string-match-p "[ \t]" cell)))
+                                 row))
+                     value)
+       (user-error
+        "jsonyter: `:var %s' is a SAS table with a character field containing whitespace — unsupported, since DATALINES cannot delimit it safely; pass scalars instead, or read the data from the kernel's filesystem"
+        name))
+     (let* ((ncol (length (car value)))
+            (types (mapcar (lambda (i) (if (numberp (nth i (car value))) 'numeric 'character))
+                           (number-sequence 0 (1- ncol)))))
+       (format "data %s;\n  input %s;\n  datalines;\n%s\n;\nrun;"
+               name
+               (mapconcat (lambda (i) (format "col%d%s" (1+ i)
+                                              (if (eq (nth i types) 'character) " $" "")))
+                          (number-sequence 0 (1- ncol)) " ")
+               (mapconcat (lambda (row) (mapconcat (lambda (c) (format "%s" c)) row " "))
+                          value "\n"))))
+    ('row (format "%%let %s = %s;" name (mapconcat (lambda (c) (format "%s" c)) value " ")))
+    (_ (format "%%let %s = %s;" name value))))
+
+(defun jsonyter--org-var-code (lang body params)
+  "BODY prefixed with a marshalling prelude for every `:var' in PARAMS.
+One prelude statement per binding, in LANG, ahead of BODY; PARAMS with no
+`:var' at all returns BODY unchanged.  See the `jsonyter--org-var-value-*'
+family for the per-language rules, and `jsonyter-org-var-size-limit' for
+the guard against an oversized one."
+  (let ((colname-names (cdr (assq :colname-names params)))
+        lines)
+    (dolist (entry params)
+      (when (eq (car entry) :var)
+        (let* ((binding (cdr entry))
+               (name (symbol-name (car binding)))
+               (value (cdr binding))
+               (colnames (and colname-names (eq (car colname-names) (car binding))
+                              (cdr colname-names))))
+          (jsonyter--org-var-check-size name value)
+          (push (pcase lang
+                  ("python" (jsonyter--org-var-value-python name value colnames))
+                  ("R" (jsonyter--org-var-value-r name value colnames))
+                  ("julia" (jsonyter--org-var-value-julia name value colnames))
+                  ("SAS" (jsonyter--org-var-value-sas name value))
+                  (_ (user-error "jsonyter: no `:var' marshalling for language %s" lang)))
+                lines))))
+    (if lines (concat (mapconcat #'identity (nreverse lines) "\n") "\n" body) body)))
+
+;;;; `.ipynb' <-> `.org' conversion (M8)
+
+;; jsonyter already parses a notebook losslessly (`jsonyter--nb-parse') and
+;; writes one back merged by cell id (`write_notebook', via
+;; `jsonyter--nb-do-save'); that machinery is what makes round-tripping
+;; through Org viable at all, per the feature request's Part 9.
+;;
+;; A cell's nbformat id is preserved in a `:PROPERTIES:' drawer immediately
+;; ahead of its content -- code or prose alike.  It is deliberately *not*
+;; attached to a heading the way a `:PROPERTIES:' drawer usually is:
+;; nothing here reads it back with `org-entry-get' or relies on Org's own
+;; property inheritance, only a plain regexp scan for
+;; `:JSONYTER_CELL_ID:', so the drawer needs no heading to hang off and a
+;; notebook with no heading structure at all converts just as well as one
+;; with plenty.
+
+(defcustom jsonyter-org-default-session-name "main"
+  "Session name `jsonyter-org-from-notebook' opts every converted block into."
+  :type 'string)
+
+(defcustom jsonyter-org-markdown-converter nil
+  "Function converting between Markdown and Org, or nil for the built-in choice.
+Called as (FUNCTION TEXT DIRECTION), DIRECTION being `to-org' or
+`to-markdown'; must return the converted text.  When nil, jsonyter shells
+out to `pandoc' if it is on the variable `exec-path', and otherwise inserts TEXT
+unchanged with a note saying so -- accurate about there being no real
+conversion available, rather than silently claiming one where none
+happened.  Markdown <-> Org is the one lossy step in the whole round
+trip; this is the escape hatch for anyone who wants a better one."
+  :type '(choice (const nil) function))
+
+(defun jsonyter--org-markdown-convert (text direction)
+  "Convert TEXT between Markdown and Org, per DIRECTION (`to-org'/`to-markdown')."
+  (cond
+   (jsonyter-org-markdown-converter (funcall jsonyter-org-markdown-converter text direction))
+   ((executable-find "pandoc")
+    (let ((from (if (eq direction 'to-org) "markdown" "org"))
+          (to (if (eq direction 'to-org) "org" "markdown")))
+      (with-temp-buffer
+        (insert text)
+        (if (zerop (call-process-region (point-min) (point-max) "pandoc"
+                                        t t nil "-f" from "-t" to))
+            (string-trim (buffer-string))
+          (concat "[jsonyter: pandoc failed converting this cell -- inserted verbatim]\n\n"
+                  text)))))
+   (t (concat (format "[jsonyter: no Markdown%sOrg converter (install pandoc, or set \
+`jsonyter-org-markdown-converter') -- inserted verbatim]\n\n"
+                      (if (eq direction 'to-org) "->" "<-"))
+              text))))
+
+;;; notebook -> Org
+
+(defun jsonyter--org-cell-id-drawer (id)
+  "A `:PROPERTIES:' drawer string carrying nbformat cell ID, or \"\" without one."
+  (if (and id (not (eq id :null)))
+      (format ":PROPERTIES:\n:JSONYTER_CELL_ID: %s\n:END:\n" id)
+    ""))
+
+(defun jsonyter--org-from-notebook-code-cell (cell lang session)
+  "Org text for one nbformat code CELL, opted into SESSION in LANG."
+  (let* ((source (string-trim (jsonyter--nb-text (plist-get cell :source))))
+         (outputs (mapcar #'jsonyter--nb-adapt-output (append (plist-get cell :outputs) nil)))
+         (body (and outputs (jsonyter--org-result-body outputs))))
+    (concat
+     (jsonyter--org-cell-id-drawer (plist-get cell :id))
+     (format "#+begin_src %s :session jy:%s\n%s\n#+end_src\n" lang session source)
+     (if (and body (not (string-empty-p body)))
+         (concat (if jsonyter-org-stamp-results
+                     (format "#+RESULTS[%s]:\n" (substring (jsonyter--source-hash source) 0 7))
+                   "#+RESULTS:\n")
+                 ":results:\n" body "\n:end:\n")
+       ""))))
+
+(defun jsonyter--org-from-notebook-prose-cell (cell)
+  "Org text for one nbformat markdown or raw CELL."
+  (concat
+   (jsonyter--org-cell-id-drawer (plist-get cell :id))
+   (jsonyter--org-markdown-convert (jsonyter--nb-text (plist-get cell :source)) 'to-org)
+   "\n"))
+
+;;;###autoload
+(defun jsonyter-org-from-notebook (ipynb-file org-file &optional session)
+  "Write ORG-FILE as an Org rendering of IPYNB-FILE.
+
+Each cell keeps its nbformat id in a `:PROPERTIES:' drawer, so
+`jsonyter-org-to-notebook' can later merge an edited round trip back onto
+the original file by id rather than regenerating it wholesale.  A stored
+output is committed straight to a `#+RESULTS:' drawer, images included,
+exactly as `jsonyter-org-commit-block' would write one.  SESSION
+defaults to `jsonyter-org-default-session-name' and is the `jy:' session
+name every code block opts into; the notebook's kernelspec becomes a
+buffer-wide `#+PROPERTY:' line, so the file needs nothing further to run
+its own blocks.
+
+Interactively, prompts for both file names."
+  (interactive
+   (let* ((ipynb (read-file-name "Notebook to convert: " nil nil t nil
+                                 (lambda (f) (string-suffix-p ".ipynb" f))))
+          (default (concat (file-name-sans-extension ipynb) ".org")))
+     (list ipynb (read-file-name "Write Org file: " nil default nil
+                                 (file-name-nondirectory default)))))
+  (when (and (file-exists-p org-file) (not (called-interactively-p 'interactive)))
+    (user-error "jsonyter: %s already exists" org-file))
+  (when (and (file-exists-p org-file) (called-interactively-p 'interactive)
+             (not (yes-or-no-p (format "%s already exists; overwrite? " org-file))))
+    (user-error "jsonyter: aborted"))
+  (let* ((session (or session jsonyter-org-default-session-name))
+         (notebook (with-temp-buffer
+                     (insert-file-contents ipynb-file)
+                     (jsonyter--nb-parse)))
+         (lang (jsonyter--nb-language notebook))
+         (cells (append (plist-get notebook :cells) nil))
+         (buf (find-file-noselect org-file)))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert (format "#+PROPERTY: header-args:%s :session jy:%s\n\n" lang session))
+      (dolist (cell cells)
+        (insert (if (equal (plist-get cell :cell_type) "code")
+                    (jsonyter--org-from-notebook-code-cell cell lang session)
+                  (jsonyter--org-from-notebook-prose-cell cell))
+                "\n"))
+      (save-buffer))
+    (when (called-interactively-p 'interactive) (pop-to-buffer buf))
+    (message "jsonyter: wrote %s" org-file)))
+
+;;; Org -> notebook
+
+(defun jsonyter--org-parse-results-drawer (info base-dir)
+  "Kernel-shape outputs for INFO's block's current `#+RESULTS:' drawer, or nil.
+
+Necessarily lossy: a `[[file:...]]' link becomes a `display_data' image,
+read back from disk relative to BASE-DIR, but every text line becomes
+one combined `stream' output regardless of whether it first came from a
+stream or an `execute_result' -- once committed to fixed-width `: '
+lines the two cannot be told apart, and interleaving between text and
+images is not preserved either.  Good enough for what a committed drawer
+actually is: a record that something ran and produced this, not a
+faithful nbformat replica."
+  (let ((pos (save-excursion (org-babel-where-is-src-block-result nil info))))
+    (when pos
+      (save-excursion
+        (goto-char pos)
+        (when (looking-at jsonyter--org-results-re)
+          (let* ((el (org-element-at-point))
+                 (end (org-element-property :end el))
+                 lines outputs)
+            (forward-line 1)
+            (when (looking-at "^[ \t]*:results:[ \t]*$") (forward-line 1))
+            (while (and (< (point) end) (not (looking-at "^[ \t]*:end:[ \t]*$")))
+              (cond
+               ((looking-at "^[ \t]*\\[\\[file:\\([^]]+\\)\\]\\]")
+                (let* ((path (expand-file-name (match-string 1) base-dir))
+                       (ext (downcase (or (file-name-extension path) ""))))
+                  (when (file-exists-p path)
+                    (push (list :output_type "display_data"
+                                :data (list (intern (format ":image/%s"
+                                                            (if (equal ext "jpg") "jpeg" ext)))
+                                            (jsonyter--org-file-base64 path))
+                                :metadata nil)
+                          outputs)))
+                (forward-line 1))
+               ((looking-at "^[ \t]*:[ \t]?\\(.*\\)$")
+                (push (match-string 1) lines)
+                (forward-line 1))
+               (t (forward-line 1))))
+            (append (nreverse outputs)
+                    (and lines
+                         (list (list :output_type "stream" :name "stdout"
+                                    :text (concat (mapconcat #'identity (nreverse lines) "\n")
+                                                 "\n")))))))))))
+
+(defun jsonyter--org-file-base64 (path)
+  "Base64-encoded bytes of the file at PATH."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path)
+    (base64-encode-string (buffer-string))))
+
+(defconst jsonyter--org-cell-id-re
+  "^[ \t]*:PROPERTIES:[ \t]*\n[ \t]*:JSONYTER_CELL_ID:[ \t]*\\(\\S-+\\)[ \t]*\n[ \t]*:END:[ \t]*\n"
+  "Matches a `jsonyter-org-from-notebook' cell-id drawer; group 1 is the id.")
+
+(defun jsonyter--org-notebook-span-empty-p (text)
+  "Non-nil when TEXT has no cell content once `#+KEYWORD:' lines are stripped.
+`jsonyter-org-from-notebook' writes its `#+PROPERTY:' session line ahead
+of the first cell-id drawer; that span is structural, not a cell, so it
+is dropped along with genuinely blank ones."
+  (string-blank-p (replace-regexp-in-string "^[ \t]*#\\+[^:\n]+:.*$" "" text)))
+
+(defun jsonyter--org-notebook-cell-spans ()
+  "This buffer's ((ID-OR-NIL . TEXT) ...), split at cell-id drawers.
+TEXT runs from just after one drawer (or the start of the buffer, for
+content with no id) to just before the next -- see the Commentary above
+this section for why a drawer here carries no heading."
+  (let (spans (id nil) (start (point-min)))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward jsonyter--org-cell-id-re nil t)
+        (let ((text (buffer-substring-no-properties start (match-beginning 0))))
+          (unless (jsonyter--org-notebook-span-empty-p text) (push (cons id text) spans)))
+        (setq id (match-string 1) start (point)))
+      (let ((text (buffer-substring-no-properties start (point-max))))
+        (unless (jsonyter--org-notebook-span-empty-p text) (push (cons id text) spans))))
+    (nreverse spans)))
+
+(defun jsonyter--org-notebook-cell-from-span (id text base-dir)
+  "One `write_notebook' cell plist from one (ID . TEXT) span, read from BASE-DIR."
+  (let ((trimmed (string-trim text)))
+    (if (string-match-p "\\`#\\+begin_src" trimmed)
+        (with-temp-buffer
+          (delay-mode-hooks (org-mode))
+          (insert trimmed)
+          (goto-char (point-min))
+          (let* ((info (org-babel-get-src-block-info 'light))
+                 (source (string-trim (or (nth 1 info) "")))
+                 (outputs (and info (jsonyter--org-parse-results-drawer info base-dir))))
+            (append (list :id (or id :null) :cell_type "code" :source source)
+                    (and outputs
+                         (list :outputs (vconcat (mapcar #'jsonyter--nb-output-to-spec outputs))
+                               :execution_count :null)))))
+      (list :id (or id :null) :cell_type "markdown"
+            :source (jsonyter--org-markdown-convert trimmed 'to-markdown)))))
+
+(defun jsonyter--org-to-notebook-cells ()
+  "This buffer's cells, as a list of plists for `write_notebook'.
+See `jsonyter--org-notebook-cell-spans' for how the buffer is split, and
+`jsonyter--org-notebook-cell-from-span' for how one span becomes one
+cell."
+  (let ((base-dir (file-name-directory (or buffer-file-name default-directory))))
+    (mapcar (lambda (span) (jsonyter--org-notebook-cell-from-span (car span) (cdr span) base-dir))
+            (jsonyter--org-notebook-cell-spans))))
+
+;;;###autoload
+(defun jsonyter-org-to-notebook (org-file ipynb-file)
+  "Write IPYNB-FILE from ORG-FILE's cells: `jy:' blocks and the prose between them.
+
+The reverse of `jsonyter-org-from-notebook'.  A cell's `:JSONYTER_CELL_ID:'
+drawer, if one is there, tells `write_notebook' which existing nbformat
+cell to merge onto, so an unedited round trip reproduces the original
+file and a one-block edit becomes a one-cell diff -- the same guarantee
+`jsonyter-notebook-save-with-outputs' already gives a notebook buffer.  A
+span with no id drawer is treated as a new cell.  A block's committed
+`#+RESULTS:' is read back as that cell's output (see
+`jsonyter--org-parse-results-drawer' for what is necessarily lossy about
+that); a block with none keeps whatever nbformat already has on disk for
+its id.
+
+Interactively, prompts for both file names, defaulting IPYNB-FILE to
+ORG-FILE's own name with the extension swapped."
+  (interactive
+   (let* ((org (read-file-name "Org file to convert: " nil nil t nil
+                               (lambda (f) (string-suffix-p ".org" f))))
+          (default (concat (file-name-sans-extension org) ".ipynb")))
+     (list org (read-file-name "Write notebook: " nil default nil
+                               (file-name-nondirectory default)))))
+  (let* ((buf (find-file-noselect org-file))
+         (cells (with-current-buffer buf (jsonyter--org-to-notebook-cells)))
+         (hash (jsonyter--nb-hash-file ipynb-file)))
+    (with-current-buffer buf
+      (jsonyter--ensure-bridge)
+      (jsonyter--request-sync
+       "write_notebook"
+       (list :path (expand-file-name ipynb-file)
+             :cells (vconcat cells)
+             :expect_hash (or hash :null)
+             :include_outputs t)
+       jsonyter-startup-timeout))
+    (message "jsonyter: wrote %s" ipynb-file)))
 
 (provide 'jsonyter)
 ;;; jsonyter.el ends here
