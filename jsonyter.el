@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.1.0
+;; Version: 2.1.1
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -4528,74 +4528,80 @@ language."
         (funcall orig-fun body params)
       (error "No org-babel-execute function for %s!" lang))))
 
+;;;###autoload
 (defun jsonyter--org-babel-execute:python (orig-fun body params)
   "Advice for `org-babel-execute:python'; see `jsonyter--org-babel-dispatch'."
   (jsonyter--org-babel-dispatch "python" orig-fun body params))
+;;;###autoload
 (defun jsonyter--org-babel-standalone:python (body params)
   "Standalone `org-babel-execute:python' for when nothing else defines one."
   (jsonyter--org-babel-dispatch "python" nil body params))
 
+;;;###autoload
 (defun jsonyter--org-babel-execute:R (orig-fun body params)
   "Advice for `org-babel-execute:R'; see `jsonyter--org-babel-dispatch'."
   (jsonyter--org-babel-dispatch "R" orig-fun body params))
+;;;###autoload
 (defun jsonyter--org-babel-standalone:R (body params)
   "Standalone `org-babel-execute:R' for when nothing else defines one."
   (jsonyter--org-babel-dispatch "R" nil body params))
 
+;;;###autoload
 (defun jsonyter--org-babel-execute:julia (orig-fun body params)
   "Advice for `org-babel-execute:julia'; see `jsonyter--org-babel-dispatch'."
   (jsonyter--org-babel-dispatch "julia" orig-fun body params))
+;;;###autoload
 (defun jsonyter--org-babel-standalone:julia (body params)
   "Standalone `org-babel-execute:julia' for when nothing else defines one."
   (jsonyter--org-babel-dispatch "julia" nil body params))
 
+;;;###autoload
 (defun jsonyter--org-babel-execute:SAS (orig-fun body params)
   "Advice for `org-babel-execute:SAS'; see `jsonyter--org-babel-dispatch'."
   (jsonyter--org-babel-dispatch "SAS" orig-fun body params))
+;;;###autoload
 (defun jsonyter--org-babel-standalone:SAS (body params)
   "Standalone `org-babel-execute:SAS' -- Org itself ships no SAS backend at all."
   (jsonyter--org-babel-dispatch "SAS" nil body params))
 
-(defun jsonyter--org-babel-wrap (lang advice-fn standalone-fn)
-  "Route `org-babel-execute:LANG' through ADVICE-FN, or install STANDALONE-FN.
-Wraps whatever already defines `org-babel-execute:LANG' -- Org's own, or
-a third party's -- with `:around' advice, so a non-`jy:' block keeps
-running exactly as it did before jsonyter was loaded.  Installs
-STANDALONE-FN outright when nothing does, so a language with no other
-backend at all -- SAS, on a stock Org install -- still gets one, live
-only inside a `:session jy:...' block."
-  (let ((cmd (intern (concat "org-babel-execute:" lang))))
-    (if (fboundp cmd)
-        (advice-add cmd :around advice-fn)
-      (defalias cmd standalone-fn))))
-
+;;;###autoload
 (defvar jsonyter--org-babel-registered nil
-  "Non-nil once `jsonyter--org-babel-setup' has installed its wrappers.")
+  "Non-nil once the `org-babel-execute:LANG' wrappers have been installed.")
 
-(defun jsonyter--org-babel-setup ()
-  "Wrap `org-babel-execute:LANG' for python/R/julia/SAS with jsonyter dispatch.
-Idempotent.  Julia's Org backend is newer than the rest and SAS's does
-not exist in Org at all, so each `require' is best-effort; either one
-missing just means `jsonyter--org-babel-wrap' installs jsonyter's own
-standalone function instead of advice, which is exactly what a `jy:'
-block needs regardless."
+;;;###autoload
+(with-eval-after-load 'ob-core
+  ;; An autoload cookie on a form that is not a definition copies the form
+  ;; itself into `jsonyter-autoloads.el', which Emacs loads at startup with
+  ;; jsonyter.el still unloaded.  So this body may call nothing but subrs
+  ;; and the autoloaded `jsonyter--org-babel-execute:LANG' and
+  ;; `jsonyter--org-babel-standalone:LANG' wrappers above -- a helper of
+  ;; jsonyter's own would be a `void-function' the moment Org loaded, and a
+  ;; `require' of jsonyter here would pull the whole package into every
+  ;; Emacs that so much as opens an Org file.  Installing the wrappers is
+  ;; eager, since export and `C-c C-c' both have to find a `jy:' block
+  ;; already routed, but each one is only an autoload until a block runs
+  ;; it, so jsonyter itself loads no earlier than the first block that
+  ;; needs it.
+  ;;
+  ;; Julia's Org backend is newer than the rest and SAS's does not exist in
+  ;; Org at all, so each `require' is best-effort.  Advice wraps whatever
+  ;; already defines `org-babel-execute:LANG' -- Org's own, or a third
+  ;; party's -- so a non-`jy:' block keeps running exactly as it did before
+  ;; jsonyter was installed; jsonyter's own standalone function goes in
+  ;; outright when nothing defines one, so a language Org ships no backend
+  ;; for at all still gets one, live only inside a `:session jy:...' block.
   (unless jsonyter--org-babel-registered
     (setq jsonyter--org-babel-registered t)
     (require 'ob-python nil t)
     (require 'ob-R nil t)
     (require 'ob-julia nil t)
-    (jsonyter--org-babel-wrap "python" #'jsonyter--org-babel-execute:python
-                              #'jsonyter--org-babel-standalone:python)
-    (jsonyter--org-babel-wrap "R" #'jsonyter--org-babel-execute:R
-                              #'jsonyter--org-babel-standalone:R)
-    (jsonyter--org-babel-wrap "julia" #'jsonyter--org-babel-execute:julia
-                              #'jsonyter--org-babel-standalone:julia)
-    (jsonyter--org-babel-wrap "SAS" #'jsonyter--org-babel-execute:SAS
-                              #'jsonyter--org-babel-standalone:SAS)))
-
-;;;###autoload
-(with-eval-after-load 'ob-core
-  (jsonyter--org-babel-setup))
+    (dolist (lang '("python" "R" "julia" "SAS"))
+      (let ((cmd (intern (concat "org-babel-execute:" lang)))
+            (advice (intern (concat "jsonyter--org-babel-execute:" lang)))
+            (standalone (intern (concat "jsonyter--org-babel-standalone:" lang))))
+        (if (fboundp cmd)
+            (advice-add cmd :around advice)
+          (defalias cmd standalone))))))
 
 ;;; Tangling to `# %%' scripts by default
 
@@ -4607,6 +4613,7 @@ writes out of one or more `jy:' blocks opens ready for
 this only changes what a `jy:' block tangles to."
   :type 'boolean)
 
+;;;###autoload
 (defun jsonyter--org-tangle-mark-cell (orig-fun spec)
   "Around-advice on `org-babel-spec-to-string': prefix a `jy:' SPEC with `# %%'."
   (when (and jsonyter-org-tangle-cell-markers (jsonyter--org-babel-jy-p (nth 4 spec)))
