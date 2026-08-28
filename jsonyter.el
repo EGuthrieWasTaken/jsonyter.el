@@ -2,8 +2,9 @@
 
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
-;; Version: 1.3.0
-;; Package-Requires: ((emacs "27.1"))
+;; Assisted-by: Claude:claude-sonnet-5
+;; Version: 2.0.0
+;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
 
@@ -76,6 +77,15 @@
 ;; libxml is available; ANSI escape codes are colorized.  Kernel state
 ;; (busy/idle/dead) is reported in the mode line from the bridge's async
 ;; event subscription.
+;;
+;; The same machinery drives four surfaces, all sharing one bridge and
+;; one kernel model: the REPL, a rendered `.ipynb' (`jsonyter-notebook-open'),
+;; `# %%' cells in a script (`jsonyter-script-mode'), and -- new in 2.0 --
+;; `#+begin_src' blocks in an Org file whose `:session' starts with `jy:'
+;; (`jsonyter-org-mode'; add `jsonyter-org-mode-maybe' to `org-mode-hook').
+;; A jsonyter buffer holds a table of sessions keyed (language, name), so
+;; one Org file can drive Python, R and SAS kernels at once; the public
+;; accessors are `jsonyter-current-session' and `jsonyter-current-kernel-id'.
 ;;
 ;; Requires jsonyter >= 0.2 (concurrent bridge, "stream", "subscribe",
 ;; JUPYTER_TOKEN).  Against an older bridge the REPL still works, minus
@@ -274,41 +284,163 @@ session typed at a REPL prompt."
 ;;;; Buffer-local state
 
 (defvar-local jsonyter--process nil
-  "The jsonyter bridge process for this REPL buffer.
-The bridge handles requests concurrently, so control messages such as
-`interrupt_kernel' are serviced on this same process while an execute
-is still running.")
+  "The jsonyter bridge process for this jsonyter buffer.
+One bridge per buffer, however many kernels the buffer drives: the
+bridge handles requests concurrently and gives each kernel its own
+worker, so control messages such as `interrupt_kernel' are serviced on
+this same process while an execute is still running, and a Python and an
+R kernel in one Org buffer run without blocking each other.")
 (defvar-local jsonyter--command nil
   "The exact bridge command this buffer was started with.")
-(defvar-local jsonyter--url nil)
-(defvar-local jsonyter--language nil)
-(defvar-local jsonyter--kernel-id nil)
-(defvar-local jsonyter--kernel-name nil)
-(defvar-local jsonyter--kernel-state nil
-  "Last kernel execution state reported by a subscription event.")
-(defvar-local jsonyter--own-kernel-id nil
-  "Id of the kernel this buffer started, if it started one.
-
-Only this kernel is shut down when the buffer is killed (see
-`jsonyter-shutdown-on-kill'): one the buffer merely attached to with
-`jsonyter-kernel-connect' belongs to whoever started it, and killing a
-buffer that borrowed a kernel must not take it down with them.
-
-An id rather than a flag because the two come apart: a buffer that
-starts a kernel, attaches to someone else\\='s for a while and comes back
-never stopped being responsible for its own, and one killed while still
-attached elsewhere would otherwise leave the kernel it started running
-with nobody left to end it.")
-(defvar-local jsonyter--last-kernel nil
-  "Plist (:id ID :name NAME) of the kernel this buffer last used.
-Outlives `jsonyter--kernel-id' being cleared, which is what lets
-`jsonyter-kernel-reconnect' work after the connection is gone.")
+(defvar-local jsonyter--url nil
+  "Server URL this buffer's bridge is talking to.
+Buffer-wide: every session in the buffer shares the one server.")
 (defvar-local jsonyter--callbacks nil
-  "Hash table mapping request id to a handler plist (:result F :output F).")
+  "Hash table mapping request id to a handler plist (:result F :output F).
+Buffer-wide and keyed by the bridge's own request ids, which are unique
+across every kernel the one bridge serves.")
 (defvar-local jsonyter--next-id 0)
-(defvar-local jsonyter--busy nil
-  "Non-nil while an execute request of ours is in flight.")
-(defvar-local jsonyter--execution-count 0)
+(defvar-local jsonyter--execution-count 0
+  "REPL execution counter.
+A REPL is one kernel by definition, so unlike the per-session kernel
+state this stays a plain buffer-local.")
+
+;;;; The session table
+
+;; A jsonyter buffer no longer has \"a kernel\"; it has a table of
+;; sessions, each with its own kernel and its own state.  A REPL,
+;; notebook or script buffer holds exactly one entry -- they are one
+;; kernel by nature -- and `jsonyter--session-key' points at it, so the
+;; single-kernel surfaces read as \"the current session\" and never name a
+;; key.  An Org buffer holds one entry per `jy:' session in the file and
+;; leaves `jsonyter--session-key' nil, addressing a session per block.
+;;
+;; The key is (LANGUAGE . NAME), matching org-babel's own (language,
+;; name) session identity: `*Python:main*' and `*R:main*' have always
+;; been distinct.  Events, the busy guard, the shutdown-on-kill rule and
+;; the mode line are all per-session; only the bridge process, the
+;; callback table and the server URL stay buffer-wide.
+
+(cl-defstruct (jsonyter--session
+               (:copier nil)
+               (:constructor jsonyter--session-create))
+  "Everything this buffer knows about one kernel."
+  key                 ; (LANGUAGE . NAME), the hash key
+  language            ; kernel language, e.g. "python" -- the live truth,
+                      ; which an adopted cross-language kernel can move
+                      ; away from the key's own car
+  name                ; session name: "" (default), "main", "@KID" (adopt)
+  kernel-id           ; id of the kernel this session is bound to, or nil
+  kernel-name         ; its kernelspec name
+  state               ; last execution_state from a subscription event
+  busy                ; non-nil while an execute of ours is in flight
+  own                 ; kernel-id iff this buffer started it (shutdown rule)
+  last-kernel)        ; plist (:id :name); outlives KERNEL-ID being cleared
+
+(defvar-local jsonyter--sessions nil
+  "Hash table mapping a session key (LANGUAGE . NAME) to a `jsonyter--session'.
+Created on first use.  See \"The session table\" commentary above.")
+(defvar-local jsonyter--session-key nil
+  "Key into `jsonyter--sessions' for this buffer's sole or default session.
+Set in REPL, notebook and script buffers, which drive one kernel; left
+nil in Org buffers, which resolve a session per source block.")
+
+(defun jsonyter--sessions ()
+  "This buffer's session table, created empty on first use."
+  (or jsonyter--sessions
+      (setq jsonyter--sessions (make-hash-table :test #'equal))))
+
+(defun jsonyter--session (&optional key)
+  "The `jsonyter--session' for KEY, or this buffer's current session.
+Returns nil when there is none."
+  (and jsonyter--sessions
+       (gethash (or key jsonyter--session-key) jsonyter--sessions)))
+
+(defun jsonyter--session-put (key)
+  "Return the session for KEY, creating an empty one if absent.
+KEY is (LANGUAGE . NAME); the new session's language starts at KEY's car."
+  (or (gethash key (jsonyter--sessions))
+      (puthash key (jsonyter--session-create :key key :language (car key)
+                                             :name (cdr key))
+               jsonyter--sessions)))
+
+(defun jsonyter--session-list ()
+  "Every session in this buffer, in no particular order."
+  (and jsonyter--sessions (hash-table-values jsonyter--sessions)))
+
+(defun jsonyter--session-for-kernel (kernel-id)
+  "The session in this buffer currently bound to KERNEL-ID, or nil."
+  (and kernel-id jsonyter--sessions
+       (catch 'hit
+         (maphash (lambda (_key session)
+                    (when (equal (jsonyter--session-kernel-id session) kernel-id)
+                      (throw 'hit session)))
+                  jsonyter--sessions)
+         nil)))
+
+(defun jsonyter--session-drop (key)
+  "Forget the session for KEY."
+  (when jsonyter--sessions (remhash key jsonyter--sessions)))
+
+(defun jsonyter--session-clear (session)
+  "Drop SESSION's kernel binding, keeping the session and its `last-kernel'."
+  (setf (jsonyter--session-kernel-id session) nil
+        (jsonyter--session-busy session) nil
+        (jsonyter--session-state session) nil))
+
+(defun jsonyter--busy-p (&optional session)
+  "Non-nil if SESSION (default the current one) has an execute of ours in flight.
+Safe when there is no session at all."
+  (let ((session (or session (jsonyter--session))))
+    (and session (jsonyter--session-busy session))))
+
+;;;; Public accessors
+
+;; `jsonyter--session' and friends are private.  These give a user's
+;; config a stable handle on the buffer's current kernel without reaching
+;; into the struct -- the supported replacement for the pre-2.0 scalars
+;; `jsonyter--kernel-id' and `jsonyter--busy', which are gone.
+
+(defun jsonyter-current-session ()
+  "This buffer's current jsonyter session object, or nil.
+In a REPL, notebook or script buffer that is the buffer's one kernel.
+In an Org buffer it is the session of the `jy:' block at point, or nil
+when point is not in one."
+  (or (jsonyter--session)
+      (and (derived-mode-p 'org-mode)
+           (fboundp 'jsonyter--org-session-at-point)
+           (jsonyter--org-session-at-point 'noerror))))
+
+(defun jsonyter-current-kernel-id ()
+  "Kernel id of `jsonyter-current-session', or nil."
+  (let ((session (jsonyter-current-session)))
+    (and session (jsonyter--session-kernel-id session))))
+
+(defun jsonyter-current-session-name ()
+  "Name of `jsonyter-current-session', or nil."
+  (let ((session (jsonyter-current-session)))
+    (and session (jsonyter--session-name session))))
+
+(defun jsonyter-current-kernel-busy-p ()
+  "Non-nil if an execute of ours is in flight on the current session."
+  (let ((session (jsonyter-current-session)))
+    (and session (jsonyter--session-busy session))))
+
+(defvar jsonyter--kernel-id nil)
+(defvar jsonyter--busy nil)
+(defvar jsonyter--kernel-name nil)
+(defvar jsonyter--kernel-state nil)
+(defvar jsonyter--language nil)
+(defvar jsonyter--own-kernel-id nil)
+(defvar jsonyter--last-kernel nil)
+(dolist (pair '((jsonyter--kernel-id . jsonyter-current-kernel-id)
+                (jsonyter--busy . jsonyter-current-kernel-busy-p)
+                (jsonyter--kernel-name . jsonyter-current-session)
+                (jsonyter--kernel-state . jsonyter-current-session)
+                (jsonyter--language . jsonyter-current-session)
+                (jsonyter--own-kernel-id . jsonyter-current-session)
+                (jsonyter--last-kernel . jsonyter-current-session)))
+  (make-obsolete-variable (car pair) (cdr pair) "2.0.0"))
 (defvar-local jsonyter--prompt-start nil "Marker at the start of the current prompt.")
 (defvar-local jsonyter--input-start nil "Marker just after the current prompt.")
 (defvar-local jsonyter--output-start nil "Marker at the start of the running cell's output.")
@@ -480,43 +612,57 @@ and `event' are out-of-band and leave the request pending."
      proc (concat (json-serialize (list :id id :input answer)) "\n"))))
 
 (defun jsonyter--handle-event (msg)
-  "Handle an async kernel event line MSG from the bridge."
-  (let* ((event (plist-get msg :event))
+  "Handle an async kernel event line MSG from the bridge.
+
+The bridge tags every event with the `kernel_id' it belongs to, so the
+event is routed to the session that owns that kernel and touches nothing
+else.  With two kernels in one buffer this is what keeps a `dead' event
+from the R kernel from blanking the Python kernel's state or clearing a
+busy flag that belongs to a cell still running.  An event for a kernel
+this buffer no longer tracks -- a race with disconnect or shutdown -- has
+nowhere to land and is dropped."
+  (let* ((session (jsonyter--session-for-kernel (plist-get msg :kernel_id)))
+         (event (plist-get msg :event))
          (type (plist-get event :type)))
-    (pcase type
-      ("status"
-       ;; A kernel shutting down reports `idle' on its way out, after the
-       ;; shutdown_reply that told us it is gone — so once dead, stay dead
-       ;; until a restart resubscribes.  A dropped socket is different: it
-       ;; can come back on its own, and a status event is the proof.
-       ;; Current bridges suppress that trailing status themselves, which
-       ;; makes this a no-op there; it stays for older ones.
-       (unless (equal jsonyter--kernel-state "dead")
-         (setq jsonyter--kernel-state (plist-get event :execution_state))))
-      ("dead"
-       (cond
-        ((eq (plist-get event :restart) t)
-         (setq jsonyter--kernel-state "restarting")
-         (jsonyter--announce "[kernel is restarting]"))
-        (t
-         (setq jsonyter--kernel-state "dead")
-         (setq jsonyter--busy nil)
-         (jsonyter--announce "[kernel died — C-c C-r to restart]"))))
-      ("disconnected"
-       (setq jsonyter--kernel-state "disconnected")
-       (jsonyter--announce (format "[kernel connection lost: %s]"
-                               (or (plist-get event :message) "unknown"))))
-      (_ nil))
-    (force-mode-line-update)))
+    (when session
+      (pcase type
+        ("status"
+         ;; A kernel shutting down reports `idle' on its way out, after the
+         ;; shutdown_reply that told us it is gone — so once dead, stay dead
+         ;; until a restart resubscribes.  A dropped socket is different: it
+         ;; can come back on its own, and a status event is the proof.
+         ;; Current bridges suppress that trailing status themselves, which
+         ;; makes this a no-op there; it stays for older ones.
+         (unless (equal (jsonyter--session-state session) "dead")
+           (setf (jsonyter--session-state session)
+                 (plist-get event :execution_state))))
+        ("dead"
+         (cond
+          ((eq (plist-get event :restart) t)
+           (setf (jsonyter--session-state session) "restarting")
+           (jsonyter--announce "[kernel is restarting]" session))
+          (t
+           (setf (jsonyter--session-state session) "dead"
+                 (jsonyter--session-busy session) nil)
+           (jsonyter--announce "[kernel died — C-c C-r to restart]" session))))
+        ("disconnected"
+         (setf (jsonyter--session-state session) "disconnected")
+         (jsonyter--announce (format "[kernel connection lost: %s]"
+                                     (or (plist-get event :message) "unknown"))
+                             session))
+        (_ nil))
+      (force-mode-line-update))))
 
 (defun jsonyter--sentinel (proc event)
-  "Note bridge PROC state changes (EVENT) in its REPL buffer."
+  "Note bridge PROC exiting (EVENT) in its buffer.
+The one bridge serves every session, so its death takes them all down."
   (let ((buf (process-get proc 'jsonyter-repl-buffer)))
     (when (and (buffer-live-p buf) (not (process-live-p proc)))
       (with-current-buffer buf
         (when (eq proc jsonyter--process)
-          (setq jsonyter--busy nil
-                jsonyter--kernel-state "dead")
+          (dolist (session (jsonyter--session-list))
+            (setf (jsonyter--session-busy session) nil
+                  (jsonyter--session-state session) "dead"))
           (jsonyter--announce (format "\n[jsonyter bridge exited: %s]"
                                   (string-trim event)))
           (force-mode-line-update))))))
@@ -632,9 +778,12 @@ that is still live on the other side."
    (append params (list :timeout jsonyter-request-timeout))
    (+ jsonyter-request-timeout 5)))
 
-(defun jsonyter--live-p ()
-  "Non-nil if this buffer has a kernel and a running bridge process."
-  (and jsonyter--kernel-id (process-live-p jsonyter--process)))
+(defun jsonyter--live-p (&optional session)
+  "Non-nil if SESSION (default the current one) has a kernel and a live bridge."
+  (let ((session (or session (jsonyter--session))))
+    (and session
+         (jsonyter--session-kernel-id session)
+         (process-live-p jsonyter--process))))
 
 ;;;; Kernel spec resolution
 
@@ -734,18 +883,41 @@ the right thing in a jsonyter notebook; see `jsonyter-mode'."
     map)
   "Keymap for `jsonyter-repl-mode'.")
 
+(defun jsonyter--session-status-tag (session)
+  "The mode-line tag for one SESSION: our request state, else the kernel's."
+  (let ((state (jsonyter--session-state session)))
+    (cond
+     ((jsonyter--session-busy session) ":run")
+     ((equal state "dead") ":dead")
+     ((equal state "restarting") ":restarting")
+     ((equal state "disconnected") ":offline")
+     ;; Busy without a request of ours in flight: another client is using
+     ;; this kernel.
+     ((equal state "busy") ":run[ext]")
+     ((equal state "starting") ":starting")
+     ((null (jsonyter--session-kernel-id session)) ":no-kernel")
+     (t ":idle"))))
+
 (defun jsonyter--mode-line-string ()
-  "Mode-line indicator: our request state, else the kernel's own state."
-  (cond
-   (jsonyter--busy ":run")
-   ((equal jsonyter--kernel-state "dead") ":dead")
-   ((equal jsonyter--kernel-state "restarting") ":restarting")
-   ((equal jsonyter--kernel-state "disconnected") ":offline")
-   ;; Busy without a request of ours in flight: another client is using
-   ;; this kernel.
-   ((equal jsonyter--kernel-state "busy") ":run[ext]")
-   ((equal jsonyter--kernel-state "starting") ":starting")
-   (t ":idle")))
+  "Mode-line indicator for the session in play.
+
+A REPL, notebook or script buffer has one session and reports it.  An
+Org buffer reports the session of the block at point; with point outside
+every `jy:' block it summarizes -- the lone session's state if there is
+just one, otherwise a count like `:2 kernels' with a `!' if any is busy."
+  (let ((current (or (jsonyter--session)
+                     (and (derived-mode-p 'org-mode)
+                          (fboundp 'jsonyter--org-session-at-point)
+                          (jsonyter--org-session-at-point 'noerror)))))
+    (cond
+     (current (jsonyter--session-status-tag current))
+     ((null (jsonyter--session-list)) "")
+     ((cdr (jsonyter--session-list))
+      (let ((sessions (jsonyter--session-list)))
+        (format ":%d kernel%s%s" (length sessions)
+                (if (cdr sessions) "s" "")
+                (if (seq-some #'jsonyter--session-busy sessions) "!" ""))))
+     (t (jsonyter--session-status-tag (car (jsonyter--session-list)))))))
 
 (define-derived-mode jsonyter-repl-mode fundamental-mode "Jsonyter"
   "Major mode for interactive Jupyter REPL buffers via jsonyter.
@@ -787,14 +959,20 @@ reading further up."
      (unless (bolp) (insert "\n"))
      (insert (propertize text 'face 'jsonyter-note-face) "\n"))))
 
-(defun jsonyter--announce (text)
+(defun jsonyter--announce (text &optional session)
   "Report TEXT wherever this buffer's kind of transcript lives.
 A REPL's transcript *is* its buffer text, so notes belong inline.  A
-notebook buffer's text is the notebook's own source — writing a note
-into it would corrupt the document — so those go to the echo area."
+notebook or Org buffer's text is the document — writing a note into it
+would corrupt it — so those go to the echo area.
+
+SESSION, when given and named, is folded into the echo-area message so a
+buffer driving several kernels says which one an event concerns."
   (if (derived-mode-p 'jsonyter-repl-mode)
       (jsonyter--note text)
-    (message "jsonyter: %s" (string-trim (string-trim text) "\\[" "\\]"))))
+    (let ((name (and session (jsonyter--session-name session))))
+      (message "jsonyter%s: %s"
+               (if (and name (not (string-empty-p name))) (format " [%s]" name) "")
+               (string-trim (string-trim text) "\\[" "\\]")))))
 
 (defun jsonyter--insert-prompt ()
   "Freeze everything so far and insert a fresh input prompt at the end."
@@ -1032,7 +1210,7 @@ Point is expected to be at `jsonyter--output-end'."
   (cond
    ((not (jsonyter--live-p))
     (user-error "No live kernel in this buffer"))
-   (jsonyter--busy
+   ((jsonyter--busy-p)
     (message "jsonyter: kernel is busy (C-c C-c to interrupt)"))
    ((< (point) jsonyter--input-start)
     (goto-char (point-max)))
@@ -1073,7 +1251,7 @@ of round trips rather than one per RET.  Any success resets the count."
                 ;; ("if True:") still reports incomplete on every kernel,
                 ;; so nothing is sent early. The bridge deliberately does
                 ;; not append this for us — it is the front end's call.
-                (list :kernel_id jsonyter--kernel-id
+                (list :kernel_id (jsonyter-current-kernel-id)
                       :code (concat code "\n")))
           (setq jsonyter--is-complete-failures 0))
       (error
@@ -1090,7 +1268,8 @@ of round trips rather than one per RET.  Any success resets the count."
   (interactive)
   (cond
    ((not (jsonyter--live-p)) (user-error "No live kernel in this buffer"))
-   (jsonyter--busy (message "jsonyter: kernel is busy"))
+   ((jsonyter--busy-p)
+    (message "jsonyter: kernel is busy"))
    (t (let ((code (jsonyter--current-input)))
         (if (string-blank-p code)
             (message "jsonyter: nothing to send")
@@ -1105,55 +1284,57 @@ of round trips rather than one per RET.  Any success resets the count."
 (defun jsonyter--execute (code)
   "Send CODE to the kernel and render its outputs as they arrive."
   (jsonyter--history-add code)
-  (setq jsonyter--history-index -1
-        jsonyter--history-stash nil
-        jsonyter--busy t
-        jsonyter--clear-pending nil)
-  (force-mode-line-update)
-  (let ((inhibit-read-only t))
-    (goto-char (point-max))
-    (insert "\n")
-    ;; Freeze the sent input.
-    (add-text-properties jsonyter--input-start (point) '(read-only t)))
-  (set-marker jsonyter--output-start (point-max))
-  (set-marker jsonyter--output-end (point-max))
-  ;; Count what streaming already drew: the final result repeats every
-  ;; output, and an older bridge that ignores "stream" sends none at all,
-  ;; so rendering the tail past this count is right either way.
-  (let ((streamed 0)
-        (params (append (list :kernel_id jsonyter--kernel-id :code code)
-                        (and jsonyter-stream-output '(:stream t)))))
-    (jsonyter--send
-     "execute" params
-     (list
-      :output (lambda (output)
-                (cl-incf streamed)
-                (jsonyter--stream-output output))
-      :result
-      (lambda (msg)
-        (setq jsonyter--busy nil)
-        (force-mode-line-update)
-        (let ((err (plist-get msg :error))
-              (result (plist-get msg :result)))
-          (cond
-           (err
-            (jsonyter--note (format "[execute failed: %s]"
-                                    (jsonyter--error-message err))))
-           (result
-            (let ((n (plist-get result :execution_count)))
-              (when n (setq jsonyter--execution-count n)))
-            (let ((remaining (nthcdr streamed (plist-get result :outputs))))
-              (when remaining
-                (jsonyter--insert-at
-                 (marker-position jsonyter--output-end)
-                 (lambda ()
-                   (dolist (output remaining)
-                     (jsonyter--render-output output))))))
-            (when (equal (plist-get result :status) "aborted")
-              (jsonyter--note "[execution aborted]")))))
-        (let ((inhibit-read-only t))
-          (goto-char (point-max)))
-        (jsonyter--insert-prompt))))))
+  (let ((session (jsonyter--session)))
+    (setq jsonyter--history-index -1
+          jsonyter--history-stash nil
+          jsonyter--clear-pending nil)
+    (setf (jsonyter--session-busy session) t)
+    (force-mode-line-update)
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert "\n")
+      ;; Freeze the sent input.
+      (add-text-properties jsonyter--input-start (point) '(read-only t)))
+    (set-marker jsonyter--output-start (point-max))
+    (set-marker jsonyter--output-end (point-max))
+    ;; Count what streaming already drew: the final result repeats every
+    ;; output, and an older bridge that ignores "stream" sends none at all,
+    ;; so rendering the tail past this count is right either way.
+    (let ((streamed 0)
+          (params (append (list :kernel_id (jsonyter--session-kernel-id session)
+                                :code code)
+                          (and jsonyter-stream-output '(:stream t)))))
+      (jsonyter--send
+       "execute" params
+       (list
+        :output (lambda (output)
+                  (cl-incf streamed)
+                  (jsonyter--stream-output output))
+        :result
+        (lambda (msg)
+          (setf (jsonyter--session-busy session) nil)
+          (force-mode-line-update)
+          (let ((err (plist-get msg :error))
+                (result (plist-get msg :result)))
+            (cond
+             (err
+              (jsonyter--note (format "[execute failed: %s]"
+                                      (jsonyter--error-message err))))
+             (result
+              (let ((n (plist-get result :execution_count)))
+                (when n (setq jsonyter--execution-count n)))
+              (let ((remaining (nthcdr streamed (plist-get result :outputs))))
+                (when remaining
+                  (jsonyter--insert-at
+                   (marker-position jsonyter--output-end)
+                   (lambda ()
+                     (dolist (output remaining)
+                       (jsonyter--render-output output))))))
+              (when (equal (plist-get result :status) "aborted")
+                (jsonyter--note "[execution aborted]")))))
+          (let ((inhibit-read-only t))
+            (goto-char (point-max)))
+          (jsonyter--insert-prompt)))))))
 
 ;;;; History
 
@@ -1193,7 +1374,7 @@ of round trips rather than one per RET.  Any success resets the count."
 (defun jsonyter-completion-at-point ()
   "Kernel-backed `completion-at-point' function for the REPL."
   (when (and (jsonyter--live-p)
-             (not jsonyter--busy)
+             (not (jsonyter--busy-p))
              (marker-position jsonyter--input-start)
              (>= (point) jsonyter--input-start))
     (let* ((code (jsonyter--current-input))
@@ -1201,7 +1382,7 @@ of round trips rather than one per RET.  Any success resets the count."
            (reply (ignore-errors
                     (jsonyter--kernel-request
                      "complete"
-                     (list :kernel_id jsonyter--kernel-id
+                     (list :kernel_id (jsonyter-current-kernel-id)
                            :code code :cursor_pos pos)))))
       (when (and reply (equal (plist-get reply :status) "ok"))
         (let ((matches (plist-get reply :matches)))
@@ -1216,12 +1397,12 @@ of round trips rather than one per RET.  Any success resets the count."
   "Show kernel documentation for the object at point."
   (interactive)
   (unless (jsonyter--live-p) (user-error "No live kernel in this buffer"))
-  (when jsonyter--busy (user-error "Kernel is busy"))
+  (when (jsonyter--busy-p) (user-error "Kernel is busy"))
   (let* ((code (jsonyter--current-input))
          (pos (max 0 (min (length code) (- (point) jsonyter--input-start))))
          (reply (jsonyter--kernel-request
                  "inspect"
-                 (list :kernel_id jsonyter--kernel-id
+                 (list :kernel_id (jsonyter-current-kernel-id)
                        :code code :cursor_pos pos)))
          (text (and (eq (plist-get reply :found) t)
                     (jsonyter--mime (plist-get reply :data) :text/plain))))
@@ -1233,89 +1414,109 @@ of round trips rather than one per RET.  Any success resets the count."
 
 ;;;; Kernel control
 
-(defun jsonyter--subscribe ()
-  "Subscribe to async kernel state events, if the bridge supports it."
+(defun jsonyter--subscribe (session)
+  "Subscribe to SESSION's async kernel state events, if the bridge supports it."
   (when jsonyter-subscribe-events
     (condition-case err
         (let ((reply (jsonyter--request-sync
-                      "subscribe" (list :kernel_id jsonyter--kernel-id))))
-          (setq jsonyter--kernel-state (plist-get reply :execution_state))
+                      "subscribe"
+                      (list :kernel_id (jsonyter--session-kernel-id session)))))
+          (setf (jsonyter--session-state session)
+                (plist-get reply :execution_state))
           t)
       (error
        ;; An older bridge has no `subscribe'; the REPL works fine without
        ;; it, only the mode line goes quiet.
-       (setq jsonyter--kernel-state nil)
+       (setf (jsonyter--session-state session) nil)
        (message "jsonyter: kernel events unavailable (%s)"
                 (error-message-string err))
        nil))))
 
-(defun jsonyter-interrupt ()
-  "Interrupt the kernel.
+(defun jsonyter--command-session ()
+  "The session an interactive kernel command should act on.
+The buffer's sole session where there is one; in an Org buffer, the
+session of the `jy:' block at point.  Signals when neither applies."
+  (or (jsonyter--session)
+      (and (derived-mode-p 'org-mode)
+           (fboundp 'jsonyter--org-session-at-point)
+           (jsonyter--org-session-at-point))
+      (user-error "jsonyter: no kernel session here")))
+
+(defun jsonyter-interrupt (&optional session)
+  "Interrupt SESSION's kernel (default the session in play).
 The bridge handles requests concurrently, so this is acted on
 immediately even while an execute is still running."
   (interactive)
-  (unless jsonyter--kernel-id (user-error "No kernel in this buffer"))
-  (jsonyter--request-sync "interrupt_kernel"
-                          (list :kernel_id jsonyter--kernel-id))
-  (message "jsonyter: interrupt sent"))
+  (let* ((session (or session (jsonyter--command-session)))
+         (id (jsonyter--session-kernel-id session)))
+    (unless id (user-error "No kernel in this session"))
+    (jsonyter--request-sync "interrupt_kernel" (list :kernel_id id))
+    (message "jsonyter: interrupt sent")))
 
-(defun jsonyter-restart ()
-  "Restart the kernel, keeping the same kernel id."
+(defun jsonyter-restart (&optional session)
+  "Restart SESSION's kernel (default the session in play), keeping its id."
   (interactive)
-  (unless jsonyter--kernel-id (user-error "No kernel in this buffer"))
-  (when (yes-or-no-p "Restart the kernel (all state will be lost)? ")
-    (jsonyter--request-sync "restart_kernel"
-                            (list :kernel_id jsonyter--kernel-id)
-                            jsonyter-startup-timeout)
-    ;; Drop the now-stale websocket so the next execute reconnects
-    ;; cleanly.  This also drops the event subscription, so renew it.
-    (ignore-errors
-      (jsonyter--request-sync "disconnect"
-                              (list :kernel_id jsonyter--kernel-id)))
-    (setq jsonyter--busy nil
-          jsonyter--execution-count 0
-          jsonyter--clear-pending nil)
-    (jsonyter--subscribe)
-    (jsonyter--after-kernel-reset "[kernel restarted]")))
+  (let* ((session (or session (jsonyter--command-session)))
+         (id (jsonyter--session-kernel-id session)))
+    (unless id (user-error "No kernel in this session"))
+    (when (yes-or-no-p "Restart the kernel (all state will be lost)? ")
+      (jsonyter--request-sync "restart_kernel"
+                              (list :kernel_id id)
+                              jsonyter-startup-timeout)
+      ;; Drop the now-stale websocket so the next execute reconnects
+      ;; cleanly.  This also drops the event subscription, so renew it.
+      (ignore-errors
+        (jsonyter--request-sync "disconnect" (list :kernel_id id)))
+      (setf (jsonyter--session-busy session) nil)
+      (setq jsonyter--execution-count 0
+            jsonyter--clear-pending nil)
+      (jsonyter--subscribe session)
+      (jsonyter--after-kernel-reset "[kernel restarted]" session))))
 
-(defun jsonyter-shutdown ()
-  "Shut the kernel down and stop the bridge process."
+(defun jsonyter-shutdown (&optional session)
+  "Shut SESSION's kernel down (default the session in play).
+In a REPL, notebook or script buffer this also stops the bridge process,
+since that buffer has only the one kernel; in an Org buffer the bridge
+stays up for the buffer's other sessions."
   (interactive)
-  (unless jsonyter--kernel-id (user-error "No kernel in this buffer"))
-  (when (yes-or-no-p "Shut the kernel down? ")
-    (let ((id jsonyter--kernel-id))
+  (let* ((session (or session (jsonyter--command-session)))
+         (id (jsonyter--session-kernel-id session)))
+    (unless id (user-error "No kernel in this session"))
+    (when (yes-or-no-p "Shut the kernel down? ")
       (ignore-errors
         (jsonyter--request-sync "shutdown_kernel" (list :kernel_id id)))
-      ;; Shutting our own down explicitly leaves nothing for
-      ;; `jsonyter--cleanup' to account for later.
-      (when (equal id jsonyter--own-kernel-id)
-        (setq jsonyter--own-kernel-id nil)))
-    (setq jsonyter--kernel-id nil
-          jsonyter--last-kernel nil
-          jsonyter--busy nil
-          jsonyter--kernel-state "dead")
-    (jsonyter--kill-process)
-    (jsonyter--announce "\n[kernel shut down]")))
+      (setf (jsonyter--session-own session) nil
+            (jsonyter--session-last-kernel session) nil)
+      (jsonyter--session-clear session)
+      (setf (jsonyter--session-state session) "dead")
+      (if jsonyter--session-key
+          (progn (jsonyter--kill-process)
+                 (jsonyter--announce "\n[kernel shut down]"))
+        (jsonyter--session-drop (jsonyter--session-key session))
+        (jsonyter--announce "[kernel shut down]" session))
+      (force-mode-line-update))))
 
-(defun jsonyter-reset ()
+(defun jsonyter-reset (&optional session)
   "Recover a REPL stuck at a \"kernel is busy\" prompt.
-Abandons any in-flight requests, clears the busy flag and draws a fresh
-prompt.  The kernel is left running: if it is genuinely still working,
-interrupt it with \\[jsonyter-interrupt] first, or this prompt will sit
-alongside output that is still on its way."
+Abandons any in-flight requests, clears SESSION's busy flag and draws a
+fresh prompt.  The kernel is left running: if it is genuinely still
+working, interrupt it with \\[jsonyter-interrupt] first, or this prompt
+will sit alongside output that is still on its way."
   (interactive)
-  (when jsonyter--callbacks (clrhash jsonyter--callbacks))
-  (setq jsonyter--busy nil
-        jsonyter--clear-pending nil)
-  (force-mode-line-update)
-  (jsonyter--after-kernel-reset "[reset — kernel left running]"))
+  (let ((session (or session (jsonyter--command-session))))
+    (when jsonyter--callbacks (clrhash jsonyter--callbacks))
+    (setf (jsonyter--session-busy session) nil)
+    (setq jsonyter--clear-pending nil)
+    (force-mode-line-update)
+    (jsonyter--after-kernel-reset "[reset — kernel left running]" session)))
 
-(defun jsonyter--after-kernel-reset (text)
+(defun jsonyter--after-kernel-reset (text &optional session)
   "Put this buffer back in a usable state after a restart or reset.
 A REPL gets TEXT in its transcript and a fresh prompt.  A notebook gets
 neither — writing into its text would corrupt the document — but its
 cells' execution counts are blanked, since the kernel's counter has gone
-back to zero and the old numbers no longer mean anything."
+back to zero and the old numbers no longer mean anything.  SESSION names
+the affected session for the echo-area note in a multi-kernel buffer."
   (if (derived-mode-p 'jsonyter-repl-mode)
       (progn (jsonyter--note (concat "\n" text))
              (jsonyter--insert-prompt))
@@ -1324,7 +1525,7 @@ back to zero and the old numbers no longer mean anything."
         (overlay-put cell 'jsonyter-exec-count nil)
         (overlay-put cell 'jsonyter-running nil)
         (jsonyter--nb-refresh-prompt cell)))
-    (jsonyter--announce text)))
+    (jsonyter--announce text session)))
 
 (defun jsonyter-repl-clear ()
   "Delete all output above the current prompt."
@@ -1353,21 +1554,23 @@ back to zero and the old numbers no longer mean anything."
         (kill-buffer stderr-buffer)))))
 
 (defun jsonyter--cleanup ()
-  "Kill-buffer hook: shut down the kernel and the bridge process.
+  "Kill-buffer hook: shut down every kernel this buffer started, then the bridge.
 
-What is shut down is the kernel this buffer started — not whichever one
+What is shut down is each kernel this buffer started — not whichever ones
 it happens to be attached to now, which may be someone else\\='s.  A
 borrowed kernel was theirs before this buffer existed and stays theirs
 afterwards, and a buffer that wandered off to one still has its own to
-account for."
-  (when (and jsonyter-shutdown-on-kill
-             jsonyter--own-kernel-id
-             (process-live-p jsonyter--process))
-    ;; Safe even mid-execute: shutdown_kernel is a REST call and runs on
-    ;; the bridge's pool, not behind the kernel's queue.
-    (ignore-errors
-      (jsonyter--request-sync "shutdown_kernel"
-                              (list :kernel_id jsonyter--own-kernel-id) 5)))
+account for.  An Org buffer can have started several; each is ended on
+its own terms."
+  (when (and jsonyter-shutdown-on-kill (process-live-p jsonyter--process))
+    (dolist (session (jsonyter--session-list))
+      (when (jsonyter--session-own session)
+        ;; Safe even mid-execute: shutdown_kernel is a REST call and runs
+        ;; on the bridge's pool, not behind the kernel's queue.
+        (ignore-errors
+          (jsonyter--request-sync
+           "shutdown_kernel"
+           (list :kernel_id (jsonyter--session-own session)) 5)))))
   (jsonyter--kill-process))
 
 ;;;; Attaching to a kernel that is already running
@@ -1413,8 +1616,11 @@ handlers that will never be called."
   (unless (process-live-p jsonyter--process)
     (jsonyter--kill-process)
     (clrhash jsonyter--callbacks)
-    (setq jsonyter--busy nil
-          jsonyter--process (jsonyter--start-bridge)))
+    ;; A replacement bridge has none of the old one's kernel sockets, so
+    ;; no execute of ours is in flight on any session any more.
+    (dolist (session (jsonyter--session-list))
+      (setf (jsonyter--session-busy session) nil))
+    (setq jsonyter--process (jsonyter--start-bridge)))
   jsonyter--process)
 
 (defun jsonyter--running-kernels ()
@@ -1446,15 +1652,18 @@ Each is a plist with at least :id, :name, :execution_state and
           (or (plist-get kernel :execution_state) "?")
           (jsonyter--kernel-activity kernel)))
 
-(defun jsonyter--read-kernel (prompt)
+(defun jsonyter--read-kernel (prompt &optional current)
   "Read the id of a kernel running on the server, prompting with PROMPT.
-The buffer's own kernel, if it has one, is marked with a `*' and offered
-as the default, so reattaching after a dropped connection is one RET."
+CURRENT, an id, is marked with a `*' and offered as the default; it
+defaults to the current session's kernel (or the one it last used), so
+reattaching after a dropped connection is one RET."
   (let ((kernels (jsonyter--running-kernels)))
     (unless kernels
       (user-error "jsonyter: no kernels are running on %s" jsonyter-server-url))
-    (let* ((current (or jsonyter--kernel-id
-                        (plist-get jsonyter--last-kernel :id)))
+    (let* ((current (or current
+                        (jsonyter-current-kernel-id)
+                        (let ((s (jsonyter--session)))
+                          (and s (plist-get (jsonyter--session-last-kernel s) :id)))))
            (table (mapcar (lambda (kernel)
                             (cons (jsonyter--kernel-label kernel current)
                                   (plist-get kernel :id)))
@@ -1478,28 +1687,40 @@ reason to refuse a connection to a kernel it is plainly running."
                when (equal (plist-get spec :name) name)
                return (plist-get (plist-get spec :spec) :language)))))
 
-(defun jsonyter--adopt-kernel-language (name)
-  "Adopt kernel spec NAME's language as this buffer's, reporting a change.
-Returns a clause to append to the connection message when the buffer was
+(defun jsonyter--adopt-kernel-language (session name)
+  "Adopt kernel spec NAME's language into SESSION, reporting a change.
+Returns a clause to append to the connection message when the session was
 set up for a different language — attaching a Python script buffer to an
 R kernel is a mistake worth seeing rather than a silent one — else nil."
   (let ((language (jsonyter--kernelspec-language name))
-        (previous jsonyter--language))
+        (previous (jsonyter--session-language session)))
     (when language
-      (setq jsonyter--language language))
+      (setf (jsonyter--session-language session) language))
     (and language previous
          (not (string-equal (downcase previous) (downcase language)))
          (format " (note: this buffer was set up for %s, not %s)"
                  previous language))))
 
-(defun jsonyter-kernel-connect (kernel-id)
-  "Attach this buffer to KERNEL-ID, a kernel already running on the server.
+(defun jsonyter--attach-target ()
+  "The session `jsonyter-kernel-connect' (re)binds here, made if it must."
+  (or (jsonyter--session)
+      (and jsonyter--session-key (jsonyter--session-put jsonyter--session-key))
+      (and (derived-mode-p 'org-mode)
+           (fboundp 'jsonyter--org-session-at-point)
+           (or (jsonyter--org-session-at-point 'noerror)
+               (and (fboundp 'jsonyter--org-ensure-session-at-point)
+                    (jsonyter--org-ensure-session-at-point 'no-kernel))))
+      (user-error "jsonyter: nowhere to attach a kernel here")))
 
-Works in any jsonyter buffer — a REPL, a rendered .ipynb, or a script
-with `jsonyter-script-mode' on — and replaces whatever kernel that
-buffer was talking to.  Called interactively, offers the kernels
-`jsonyter-server-url' currently reports, most recently active first,
-with this buffer's own kernel marked `*' and offered as the default.
+(defun jsonyter-kernel-connect (kernel-id &optional session)
+  "Attach SESSION (default the one in play) to KERNEL-ID, running on the server.
+
+Works in any jsonyter buffer — a REPL, a rendered .ipynb, a script with
+`jsonyter-script-mode' on, or an Org buffer — and replaces whatever
+kernel that session was talking to.  Called interactively, offers the
+kernels `jsonyter-server-url' currently reports, most recently active
+first, with this session's own kernel marked `*' and offered as the
+default.
 
 Two quite different jobs, both of which come down to the same steps:
 
@@ -1529,10 +1750,11 @@ Returns KERNEL-ID."
    (list (progn (jsonyter--ensure-live-bridge)
                 (jsonyter--read-kernel "Connect to kernel: "))))
   (jsonyter--ensure-live-bridge)
-  (let* ((same (equal kernel-id jsonyter--kernel-id))
+  (let* ((session (or session (jsonyter--attach-target)))
+         (same (equal kernel-id (jsonyter--session-kernel-id session)))
          ;; Ask about the kernel before disturbing anything: if it is
          ;; gone from the server there is nothing to attach to, and the
-         ;; buffer should be left exactly as it was.
+         ;; session should be left exactly as it was.
          (kernel (condition-case err
                      (jsonyter--request-sync "get_kernel"
                                              (list :kernel_id kernel-id))
@@ -1544,8 +1766,8 @@ Returns KERNEL-ID."
          (name (plist-get kernel :name)))
     ;; Nothing pending can be answered across a new socket.
     (clrhash jsonyter--callbacks)
-    (setq jsonyter--busy nil
-          jsonyter--clear-pending nil
+    (setf (jsonyter--session-busy session) nil)
+    (setq jsonyter--clear-pending nil
           jsonyter--is-complete-failures 0)
     ;; The whole point (see the commentary above): close the old socket
     ;; before opening a new one, because a half-open one will happily
@@ -1553,21 +1775,22 @@ Returns KERNEL-ID."
     ;; is nothing to close, which is the case on a fresh bridge.
     (ignore-errors
       (jsonyter--request-sync "disconnect" (list :kernel_id kernel-id)))
-    (setq jsonyter--url jsonyter-server-url
-          jsonyter--kernel-id kernel-id
-          jsonyter--kernel-name name
-          jsonyter--kernel-state (plist-get kernel :execution_state)
-          ;; `jsonyter--own-kernel-id' is deliberately untouched:
-          ;; attaching to a kernel never makes it ours, and wandering off
-          ;; to one never stops the kernel we started from being.
-          jsonyter--last-kernel (list :id kernel-id :name name))
-    (jsonyter--subscribe)
+    (setq jsonyter--url jsonyter-server-url)
+    (setf (jsonyter--session-kernel-id session) kernel-id
+          (jsonyter--session-kernel-name session) name
+          (jsonyter--session-state session) (plist-get kernel :execution_state)
+          ;; `own' is deliberately untouched: attaching to a kernel never
+          ;; makes it ours, and wandering off to one never stops the
+          ;; kernel we started from being.
+          (jsonyter--session-last-kernel session) (list :id kernel-id :name name))
+    (jsonyter--subscribe session)
     ;; A socket opened moments ago has not seen a status message yet, so
     ;; `subscribe' can legitimately report no state at all; the REST
     ;; call above knows what the server thinks.
-    (unless jsonyter--kernel-state
-      (setq jsonyter--kernel-state (plist-get kernel :execution_state)))
-    (let ((mismatch (jsonyter--adopt-kernel-language name))
+    (unless (jsonyter--session-state session)
+      (setf (jsonyter--session-state session)
+            (plist-get kernel :execution_state)))
+    (let ((mismatch (jsonyter--adopt-kernel-language session name))
           (verb (if same "reconnected to" "connected to")))
       (force-mode-line-update)
       (when (derived-mode-p 'jsonyter-repl-mode)
@@ -1590,11 +1813,12 @@ state, and only the connection to it needs rebuilding.  Equivalent to
 the details are; use that one to pick a different kernel."
   (interactive)
   (jsonyter--check-jsonyter-buffer)
-  (let ((kernel-id (or jsonyter--kernel-id
-                       (plist-get jsonyter--last-kernel :id))))
+  (let* ((session (jsonyter--command-session))
+         (kernel-id (or (jsonyter--session-kernel-id session)
+                        (plist-get (jsonyter--session-last-kernel session) :id))))
     (unless kernel-id
-      (user-error "jsonyter: this buffer has no kernel to reconnect to (M-x jsonyter-kernel-connect to pick one)"))
-    (jsonyter-kernel-connect kernel-id)))
+      (user-error "jsonyter: this session has no kernel to reconnect to (M-x jsonyter-kernel-connect to pick one)"))
+    (jsonyter-kernel-connect kernel-id session)))
 
 (defun jsonyter--history-input (entry)
   "Input text of one `history' reply ENTRY, or nil if it carries none.
@@ -1676,7 +1900,7 @@ this can time out where a REPL against the same kernel works fine."
           ;; Whether we know of a kernel, not whether the bridge is up:
           ;; a buffer reaching for its history after the pipe broke wants
           ;; its own kernel, not a prompt.
-          (choose (or (consp arg) (null jsonyter--kernel-id)))
+          (choose (or (consp arg) (null (jsonyter-current-kernel-id))))
           (n (cond ((consp arg)
                     (read-number "Number of commands: "
                                  jsonyter-kernel-history-count))
@@ -1685,15 +1909,15 @@ this can time out where a REPL against the same kernel works fine."
      (jsonyter--ensure-live-bridge)
      (list n (if choose
                  (jsonyter--read-kernel "History of kernel: ")
-               jsonyter--kernel-id))))
+               (jsonyter-current-kernel-id)))))
   (jsonyter--ensure-live-bridge)
   (let ((n (or n jsonyter-kernel-history-count))
-        (kernel-id (or kernel-id jsonyter--kernel-id)))
+        (kernel-id (or kernel-id (jsonyter-current-kernel-id))))
     (unless kernel-id
       (user-error "jsonyter: no kernel to show the history of"))
     (unless (and (integerp n) (> n 0))
       (user-error "jsonyter: number of commands must be a positive integer, not %S" n))
-    (let* ((ours (equal kernel-id jsonyter--kernel-id))
+    (let* ((ours (equal kernel-id (jsonyter-current-kernel-id)))
            ;; Names the kernel for the header, and — the reason it comes
            ;; first — says plainly that a kernel is gone, rather than
            ;; leaving that to a socket that fails for its own reasons.
@@ -1746,39 +1970,54 @@ this can time out where a REPL against the same kernel works fine."
 
 ;;;; Starting REPLs
 
-(defun jsonyter--connect-kernel (language)
-  "Give the current buffer its own bridge process and LANGUAGE kernel.
-Sets up all of the connection-related buffer-local state, subscribes to
-kernel events, and leaves the buffer ready to send requests.  Shared by
-REPL buffers and notebook buffers, which differ only in how they render
-what comes back.
+(defun jsonyter--connect-kernel (key &optional kernel-name)
+  "Ensure session KEY in this buffer has a running kernel; return the session.
 
-Every step is awaited in turn: the bridge opens one websocket per
-kernel, and issuing two connection-opening requests concurrently is a
-race that older bridges lose."
-  (setq jsonyter--language language
-        jsonyter--url jsonyter-server-url)
-  (setq jsonyter--process (jsonyter--start-bridge))
-  (let* ((name (jsonyter--resolve-kernel-name language))
-         (kernel (jsonyter--request-sync "start_kernel" (list :name name)
-                                         jsonyter-startup-timeout)))
-    (setq jsonyter--kernel-id (plist-get kernel :id)
-          jsonyter--kernel-name (plist-get kernel :name)
-          jsonyter--kernel-state (plist-get kernel :execution_state)
-          ;; We started it, so it is ours to shut down again; see
-          ;; `jsonyter--cleanup'.
-          jsonyter--own-kernel-id (plist-get kernel :id)
-          jsonyter--last-kernel (list :id (plist-get kernel :id)
-                                      :name (plist-get kernel :name))))
-  (jsonyter--subscribe)
-  jsonyter--kernel-id)
+KEY is (LANGUAGE . NAME).  Idempotent: a session that already has a live
+kernel is returned untouched, so this doubles as \"get or start\".
+KERNEL-NAME pins the kernelspec, overriding language-based resolution and
+any name the session was last bound to.
+
+The buffer's one bridge process is started on first use and reused for
+every later kernel.  Every step is awaited in turn: the bridge opens one
+websocket per kernel, and issuing two connection-opening requests
+concurrently is a race that older bridges lose.
+
+REPL, notebook and script buffers also point `jsonyter--session-key' at
+KEY, so their single-kernel commands find it as \"the current session\";
+an Org buffer leaves that pointer alone."
+  (setq jsonyter--url jsonyter-server-url)
+  (jsonyter--ensure-live-bridge)
+  (let ((session (jsonyter--session-put key)))
+    (unless (derived-mode-p 'org-mode)
+      (setq jsonyter--session-key key))
+    (when kernel-name
+      (setf (jsonyter--session-kernel-name session) kernel-name))
+    (unless (jsonyter--live-p session)
+      (let* ((name (or kernel-name
+                       (jsonyter--session-kernel-name session)
+                       (jsonyter--resolve-kernel-name
+                        (jsonyter--session-language session))))
+             (kernel (jsonyter--request-sync "start_kernel" (list :name name)
+                                             jsonyter-startup-timeout))
+             (id (plist-get kernel :id)))
+        (setf (jsonyter--session-kernel-id session) id
+              (jsonyter--session-kernel-name session) (plist-get kernel :name)
+              (jsonyter--session-state session) (plist-get kernel :execution_state)
+              ;; We started it, so it is ours to shut down again; see
+              ;; `jsonyter--cleanup'.
+              (jsonyter--session-own session) id
+              (jsonyter--session-last-kernel session)
+              (list :id id :name (plist-get kernel :name)))
+        (jsonyter--subscribe session)))
+    session))
 
 (defun jsonyter--start-repl (language)
   "Start (or pop to) a Jupyter REPL for LANGUAGE."
   (let* ((bufname (format "*jsonyter[%s]*" language))
          (existing (get-buffer bufname)))
     (if (and existing
-             (buffer-local-value 'jsonyter--kernel-id existing)
+             (buffer-local-value 'jsonyter--session-key existing)
              (process-live-p (buffer-local-value 'jsonyter--process existing)))
         (pop-to-buffer existing)
       (when existing (kill-buffer existing))
@@ -1786,15 +2025,15 @@ race that older bridges lose."
         (condition-case err
             (with-current-buffer buffer
               (jsonyter-repl-mode)
-              (jsonyter--connect-kernel language)
-              (jsonyter--note
-               (format (concat "Jupyter REPL — kernel %s (%s) on %s\n"
-                               "RET send · TAB complete · C-c C-c interrupt · "
-                               "C-c C-r restart · C-c C-l reconnect · "
-                               "C-c C-d doc · M-p/M-n history")
-                       jsonyter--kernel-name
-                       (substring jsonyter--kernel-id 0 8)
-                       jsonyter--url))
+              (let ((session (jsonyter--connect-kernel (cons language ""))))
+                (jsonyter--note
+                 (format (concat "Jupyter REPL — kernel %s (%s) on %s\n"
+                                 "RET send · TAB complete · C-c C-c interrupt · "
+                                 "C-c C-r restart · C-c C-l reconnect · "
+                                 "C-c C-d doc · M-p/M-n history")
+                         (jsonyter--session-kernel-name session)
+                         (jsonyter--short-id (jsonyter--session-kernel-id session))
+                         jsonyter--url)))
               (jsonyter--insert-prompt)
               (pop-to-buffer buffer))
           (error
@@ -1916,6 +2155,11 @@ Flags output that may no longer match the cell's current source; the
 frame reverts to `jsonyter-output-border-face' when the cell is re-run
 \(or the edit is undone).")
 
+(defvar-local jsonyter--nb-lang nil
+  "The notebook's declared kernel language, from its metadata.
+Set at open time, before any kernel exists, so a cell's prompt can name
+the language from the start; the session's own `language' slot is the
+live truth once a kernel is running.")
 (defvar-local jsonyter--nb-metadata nil
   "The notebook's top-level metadata plist, as read from the file.")
 (defvar-local jsonyter--nb-format nil
@@ -2108,8 +2352,8 @@ cells of different kinds are tellable apart at a glance."
                   (_ (concat (if running "In [*]:"
                                (format "In [%s]:" (or exec-count " ")))
                              " code"
-                             (and jsonyter--language
-                                  (format " (%s)" jsonyter--language))))))
+                             (and jsonyter--nb-lang
+                                  (format " (%s)" jsonyter--nb-lang))))))
          (rule (make-string (max 4 (- jsonyter-notebook-separator-width
                                       (length label)))
                             ?─)))
@@ -2126,17 +2370,22 @@ cells of different kinds are tellable apart at a glance."
                                     (overlay-get cell 'jsonyter-exec-count)
                                     (overlay-get cell 'jsonyter-running))))
 
+(defun jsonyter--overlay-string-cell-p (cell)
+  "Non-nil if CELL shows its output in an overlay string, not buffer text.
+True for a `# %%' script cell and for an Org src block: in both the
+buffer's text is a file the user saves, so nothing may be written into
+it.  A rendered notebook buffer is a view, so its cell output is real
+buffer text instead — which is what lets a tall sliced image be scrolled
+through a line at a time."
+  (or (overlay-get cell 'jsonyter-script-cell)
+      (overlay-get cell 'jsonyter-org-cell)))
+
 (defun jsonyter--nb-refresh-output (cell)
   "Update CELL's shown output from its stored rendered text.
 
-Where the output goes depends on what the buffer's text is.  A notebook
-buffer is a rendered view, so a cell's output is written into it as
-buffer text: point can then move through it, which is what lets a tall
-image sliced one line per row be scrolled through a line at a time.  A
-script buffer's text is exactly the file being saved, so nothing may be
-written into it and its output stays an overlay string — where slices
-would not be lines at all, and images are shown whole instead."
-  (if (overlay-get cell 'jsonyter-script-cell)
+Where the output goes depends on what the buffer's text is; see
+`jsonyter--overlay-string-cell-p'."
+  (if (jsonyter--overlay-string-cell-p cell)
       (jsonyter--nb-show-output-as-string cell)
     (jsonyter--nb-show-output-as-text cell)))
 
@@ -2576,11 +2825,13 @@ wanted."
   "Start this notebook's kernel, using the language in its metadata."
   (interactive)
   (if (jsonyter--live-p)
-      (message "jsonyter: kernel already running (%s)" jsonyter--kernel-name)
-    (let ((language (or jsonyter--language "python")))
+      (message "jsonyter: kernel already running (%s)"
+               (jsonyter--session-kernel-name (jsonyter--session)))
+    (let ((language (or jsonyter--nb-lang "python")))
       (message "jsonyter: starting %s kernel..." language)
-      (jsonyter--connect-kernel language)
-      (message "jsonyter: kernel %s ready" jsonyter--kernel-name))))
+      (jsonyter--connect-kernel (cons language ""))
+      (message "jsonyter: kernel %s ready"
+               (jsonyter--session-kernel-name (jsonyter--session))))))
 
 (defun jsonyter--nb-ensure-kernel ()
   "Make sure a kernel is running, starting one if that is allowed."
@@ -2603,7 +2854,7 @@ and must not be recorded as one."
   (when touched
     (overlay-put cell 'jsonyter-raw-outputs raw)
     (overlay-put cell 'jsonyter-outputs-touched t))
-  (unless (overlay-get cell 'jsonyter-script-cell)
+  (unless (jsonyter--overlay-string-cell-p cell)
     (setq jsonyter--nb-outputs-dirty t))
   (jsonyter--nb-refresh-output cell))
 
@@ -2617,7 +2868,7 @@ slicing that needs — see `jsonyter--nb-refresh-output'."
     (jsonyter--nb-set-output
      cell (concat (or (overlay-get cell 'jsonyter-output-string) "")
                   (jsonyter--nb-render-string
-                   output (overlay-get cell 'jsonyter-script-cell)))
+                   output (jsonyter--overlay-string-cell-p cell)))
      (append (overlay-get cell 'jsonyter-raw-outputs) (list output))
      t)))
 
@@ -2665,11 +2916,12 @@ output."
      ((member (overlay-get cell 'jsonyter-cell-type) '("markdown" "raw"))
       (message "jsonyter: %s cell — nothing to execute"
                (overlay-get cell 'jsonyter-cell-type)))
-     (jsonyter--busy
+     ((jsonyter--busy-p)
       (message "jsonyter: kernel is busy (C-c C-c to interrupt)"))
      (t
       (jsonyter--nb-ensure-kernel)
-      (let ((code (jsonyter--nb-cell-source cell)))
+      (let ((code (jsonyter--nb-cell-source cell))
+            (session (jsonyter--session)))
         (if (string-blank-p code)
             (message "jsonyter: empty cell")
           ;; The output about to arrive belongs to the source being sent;
@@ -2685,19 +2937,20 @@ output."
           (jsonyter--nb-set-output cell "" nil t)
           (overlay-put cell 'jsonyter-running t)
           (jsonyter--nb-refresh-prompt cell)
-          (setq jsonyter--busy t
-                jsonyter--nb-running-cell cell)
+          (setf (jsonyter--session-busy session) t)
+          (setq jsonyter--nb-running-cell cell)
           (force-mode-line-update)
           (jsonyter--send
            "execute"
-           (append (list :kernel_id jsonyter--kernel-id :code code)
+           (append (list :kernel_id (jsonyter--session-kernel-id session)
+                         :code code)
                    (and jsonyter-stream-output '(:stream t)))
            (list
             :output (lambda (output) (jsonyter--nb-append-output cell output))
             :result
             (lambda (msg)
-              (setq jsonyter--busy nil
-                    jsonyter--nb-running-cell nil)
+              (setf (jsonyter--session-busy session) nil)
+              (setq jsonyter--nb-running-cell nil)
               (overlay-put cell 'jsonyter-running nil)
               (let ((err (plist-get msg :error))
                     (result (plist-get msg :result)))
@@ -2735,7 +2988,7 @@ output."
       (goto-char (overlay-start cell))
       (jsonyter-notebook-run-cell)
       (let ((deadline (+ (float-time) 3600)))
-        (while (and jsonyter--busy (< (float-time) deadline))
+        (while (and (jsonyter--busy-p) (< (float-time) deadline))
           (accept-process-output jsonyter--process 0.05))))))
 
 (defun jsonyter-notebook-clear-cell-output ()
@@ -3109,7 +3362,8 @@ Intended for `auto-mode-alist':
     (jsonyter-notebook-mode 1)
     (setq jsonyter--nb-metadata metadata
           jsonyter--nb-format format
-          jsonyter--language language
+          jsonyter--nb-lang language
+          jsonyter--session-key (cons language "")
           jsonyter--nb-file-hash (jsonyter--nb-hash-file buffer-file-name))
     (jsonyter--nb-render notebook)
     (set-buffer-modified-p nil)
@@ -3219,13 +3473,14 @@ nothing but surrounding blank lines is not called a change."
   "Execute the script cell at point, showing its output inline.
 With ADVANCE, move to the next cell afterwards."
   (interactive)
-  (when jsonyter--busy
+  (when (jsonyter--busy-p)
     (user-error "jsonyter: kernel is busy (C-c C-c to interrupt)"))
   (unless (jsonyter--live-p)
-    (jsonyter--connect-kernel (jsonyter--script-language)))
-  (pcase-let* ((`(,start . ,end) (jsonyter--script-cell-bounds))
-               (code (string-trim (buffer-substring-no-properties start end)))
-               (ov (jsonyter--script-output-overlay start end)))
+    (jsonyter--connect-kernel (cons (jsonyter--script-language) "")))
+  (let ((session (jsonyter--session)))
+   (pcase-let* ((`(,start . ,end) (jsonyter--script-cell-bounds))
+                (code (string-trim (buffer-substring-no-properties start end)))
+                (ov (jsonyter--script-output-overlay start end)))
     (if (string-blank-p code)
         (message "jsonyter: empty cell")
       ;; Pair the output about to arrive with the source being sent, so
@@ -3234,16 +3489,16 @@ With ADVANCE, move to the next cell afterwards."
       (overlay-put ov 'jsonyter-output-stale nil)
       (overlay-put ov 'jsonyter-output-string "")
       (jsonyter--nb-refresh-output ov)
-      (setq jsonyter--busy t)
+      (setf (jsonyter--session-busy session) t)
       (force-mode-line-update)
       (jsonyter--send
        "execute"
-       (append (list :kernel_id jsonyter--kernel-id :code code)
+       (append (list :kernel_id (jsonyter--session-kernel-id session) :code code)
                (and jsonyter-stream-output '(:stream t)))
        (list
         :output (lambda (output) (jsonyter--nb-append-output ov output))
         :result (lambda (msg)
-                  (setq jsonyter--busy nil)
+                  (setf (jsonyter--session-busy session) nil)
                   (force-mode-line-update)
                   (let ((err (plist-get msg :error))
                         (result (plist-get msg :result)))
@@ -3256,7 +3511,7 @@ With ADVANCE, move to the next cell afterwards."
                         (when (and (or (null drawn) (string-empty-p drawn))
                                    (plist-get result :outputs))
                           (dolist (o (plist-get result :outputs))
-                            (jsonyter--nb-append-output ov o))))))))))))
+                            (jsonyter--nb-append-output ov o)))))))))))))
   (when advance (jsonyter-script-next-cell)))
 
 (defun jsonyter-script-run-cell-and-advance ()
@@ -3336,6 +3591,704 @@ Suitable for a language mode hook."
                (goto-char (point-min))
                (re-search-forward jsonyter-script-cell-regexp nil t)))
     (jsonyter-script-mode 1)))
+
+
+;;;; Org-mode source blocks (jy: sessions)
+
+;; A `#+begin_src' block whose `:session' header argument starts with
+;; `jy:' becomes an executable jsonyter cell: `C-RET' runs it against a
+;; kernel, output streams into an overlay beneath the block, and `C-c
+;; C-s' commits that output to a `#+RESULTS:' drawer when you want it in
+;; the file.  Anything without a `jy:' session behaves exactly as it does
+;; today, so enabling this mode changes no existing Org file.
+;;
+;; Sessions are keyed (LANGUAGE . NAME) in the one buffer-wide session
+;; table built for the REPL/notebook/script surfaces, so a variable a
+;; `C-RET' run defines is visible to every later run in the same session,
+;; and Python, R and SAS blocks in one file are simply three entries.
+;; The buffer's `jsonyter--session-key' stays nil -- an Org buffer has no
+;; single "current" session; each command resolves the session of the
+;; block at point.
+;;
+;; Output lives in an overlay `after-string', exactly as a `# %%' script
+;; cell's does: buffer text is untouched, so an exploratory run leaves
+;; the file clean and out of `git diff'.  Org's own visibility cycling
+;; hides a folded block's output for free (the overlay is anchored inside
+;; the folded region); `org-indent-mode' does not prefix overlay strings,
+;; so under a deeply nested heading the output frame sits a couple of
+;; columns left of the code -- cosmetic, and only there.
+;;
+;; NOTE: `C-c C-c' here interrupts the session at point, matching the
+;; REPL/notebook/script maps and the feature request's key table.  The
+;; org-babel execution path (`C-c C-c' routed through
+;; `org-babel-execute:LANG', export, tangle) is a later milestone; until
+;; it lands, run blocks with `C-RET'/`S-RET', never `C-c C-c'.
+;;
+;; `org' is loaded lazily, when `jsonyter-org-mode' is first turned on,
+;; so a REPL/notebook/script user never pays for it.
+
+(defcustom jsonyter-org-image-directory "./.jsonyter/"
+  "Directory, relative to the Org file, that committed figures are written to.
+`jsonyter-org-commit-block' writes each image output to a
+content-addressed file here and links it with `[[file:...]]'.  Set to
+e.g. \"./images/\" to keep figures version-controlled beside the
+document; with the default, add \".jsonyter/\" to `.gitignore'."
+  :type 'directory)
+
+(defcustom jsonyter-org-stamp-results t
+  "If non-nil, stamp a committed `#+RESULTS:' with its block's source hash.
+Written as org's own `#+RESULTS[<hash>]:' slot, so a result reopened cold
+knows which source produced it and jsonyter can flag it stale before any
+kernel starts.  This is the same slot babel's `:cache yes' uses; the two
+are mutually exclusive per block, so turn this off where you rely on
+`:cache'."
+  :type 'boolean)
+
+(defcustom jsonyter-org-mode-lighter " Jy"
+  "Mode-line lighter for `jsonyter-org-mode'."
+  :type 'string)
+
+(declare-function org-element-at-point "org-element" (&optional pom cached-only))
+(declare-function org-element-type "org-element-ast" (node &optional anonymous))
+(declare-function org-element-property "org-element-ast" (property node))
+(declare-function org-babel-get-src-block-info "ob-core" (&optional light datum))
+(declare-function org-babel-where-is-src-block-result "ob-core" (&optional insert info hash))
+(declare-function org-babel-remove-result "ob-core" (&optional info keep-keyword))
+(declare-function org-babel-next-src-block "ob-core" (&optional arg))
+(declare-function org-babel-previous-src-block "ob-core" (&optional arg))
+
+(defvar jsonyter-org-mode)              ; the minor-mode flag, defined below
+
+(defvar-local jsonyter--org-cells nil
+  "Output overlays for Org src blocks in this buffer, newest first.")
+(defvar-local jsonyter--org-committed nil
+  "Overlays framing committed `#+RESULTS:' drawers found stale on reload.")
+
+(defconst jsonyter--org-results-re
+  "^[ \t]*#\\+RESULTS\\(?:\\[\\([0-9a-f]+\\)\\]\\)?:[ \t]*$"
+  "Matches a `#+RESULTS:' line, capturing its `[hash]' stamp if present.")
+
+;;; Opting in and resolving the session
+
+(defun jsonyter--org-block-info ()
+  "`org-babel-get-src-block-info' for the block at point, or nil.
+LIGHT, so noweb is not expanded and no kernel-language code runs."
+  (ignore-errors (org-babel-get-src-block-info 'light)))
+
+(defun jsonyter--org-session-key (info)
+  "The (LANGUAGE . NAME) session key INFO opts into, or nil.
+
+A block opts in when its `:session' header argument starts with `jy:'.
+`jy:NAME' is a named session; bare `jy:' is the language's default
+session for the buffer; `jy:@KERNEL-ID' attaches to a kernel already
+running on the server.  Keyed by (language, name) to match org-babel's
+own session identity, so `jy:main' in Python and in R are two kernels."
+  (let ((session (and info (cdr (assq :session (nth 2 info))))))
+    (when (and (stringp session) (string-prefix-p "jy:" session))
+      (cons (nth 0 info) (substring session 3)))))
+
+(defun jsonyter--org-key-at-point ()
+  "The session key for the jy: block at point, or nil."
+  (jsonyter--org-session-key (jsonyter--org-block-info)))
+
+(defun jsonyter--org-in-jy-block-p ()
+  "Non-nil when point is inside a src block that opts into jsonyter."
+  (and (jsonyter--org-key-at-point) t))
+
+(defun jsonyter--org-session-at-point (&optional noerror)
+  "The `jsonyter--session' for the jy: block at point.
+Returns nil, or signals unless NOERROR, when point is not in a jy: block
+or that block has no session entry yet."
+  (let ((key (jsonyter--org-key-at-point)))
+    (cond
+     ((and key (jsonyter--session key)))
+     (noerror nil)
+     ((null key)
+      (user-error "jsonyter: point is not in a `:session jy:...' source block"))
+     (t (user-error
+         "jsonyter: no kernel session for this block yet (C-RET starts one)")))))
+
+(defun jsonyter--org-connect (key &optional kernel-name)
+  "Connect session KEY, honouring a `@KERNEL-ID' name as attach-not-start.
+KERNEL-NAME pins the kernelspec for a started kernel.  Returns the session."
+  (jsonyter--ensure-live-bridge)
+  (let ((name (cdr key)))
+    (if (string-prefix-p "@" name)
+        (let ((session (jsonyter--session-put key)))
+          (unless (jsonyter--live-p session)
+            (jsonyter-kernel-connect (substring name 1) session))
+          session)
+      (jsonyter--connect-kernel key kernel-name))))
+
+(defun jsonyter--org-ensure-session-at-point (&optional no-kernel)
+  "Resolve and return the session for the jy: block at point.
+With NO-KERNEL, register the session but do not start or attach a kernel."
+  (let* ((info (or (jsonyter--org-block-info)
+                   (user-error "jsonyter: no source block at point")))
+         (key (or (jsonyter--org-session-key info)
+                  (user-error "jsonyter: this block has no `:session jy:...'")))
+         (kernel-name (cdr (assq :kernel (nth 2 info)))))
+    (if no-kernel
+        (jsonyter--session-put key)
+      (jsonyter--org-connect key kernel-name))))
+
+(defun jsonyter--org-buffer-has-jy-p ()
+  "Non-nil if this buffer has any `:session jy:' -- inline or via a property."
+  (save-excursion
+    (goto-char (point-min))
+    (re-search-forward ":session[ \t]+jy:" nil t)))
+
+;;; Block geometry and the output overlay
+
+(defun jsonyter--org-block-region ()
+  "Return (BODY . ANCHOR) for the src block at point.
+BODY is the block's source, trimmed.  ANCHOR is the position just after
+the `#+end_src' line, where the output overlay hangs its `after-string'."
+  (let* ((el (org-element-at-point))
+         (begin (org-element-property :begin el))
+         (body (string-trim (or (org-element-property :value el) "")))
+         (anchor (save-excursion
+                   (goto-char begin)
+                   (if (re-search-forward "^[ \t]*#\\+end_src.*\n"
+                                          (org-element-property :end el) t)
+                       (point)
+                     (org-element-property :end el)))))
+    (cons body anchor)))
+
+(defun jsonyter--org-cell-overlay (anchor &optional create)
+  "The output overlay ending at ANCHOR, made when CREATE and absent."
+  (or (seq-find (lambda (o) (overlay-get o 'jsonyter-org-cell))
+                (overlays-in (max (point-min) (1- anchor)) anchor))
+      (and create
+           (let ((ov (make-overlay (max (point-min) (1- anchor)) anchor nil nil t)))
+             (overlay-put ov 'jsonyter-org-cell t)
+             (overlay-put ov 'evaporate nil)
+             (push ov jsonyter--org-cells)
+             ov))))
+
+(defun jsonyter--org-cell-at (&optional pos)
+  "The output overlay of the src block containing POS (default point), or nil."
+  (save-excursion
+    (when pos (goto-char pos))
+    (when (jsonyter--org-block-info)
+      (jsonyter--org-cell-overlay (cdr (jsonyter--org-block-region))))))
+
+;;; Staleness of shown output
+
+(defun jsonyter--org-stale-after-change (beg end _len)
+  "Re-judge the output of any src block touched by an edit from BEG to END.
+On `after-change-functions'; a no-op until some block has run."
+  (when (or jsonyter--org-cells jsonyter--org-committed)
+    (save-excursion
+      (let (seen)
+        (dolist (pos (list beg end))
+          (goto-char pos)
+          (let ((info (jsonyter--org-block-info)))
+            (when info
+              (pcase-let* ((`(,body . ,anchor) (jsonyter--org-block-region))
+                           (ov (jsonyter--org-cell-overlay anchor)))
+                (when (and ov (not (memq ov seen)))
+                  (push ov seen)
+                  (jsonyter--output-update-stale ov body))
+                (jsonyter--org-refresh-committed-frame info body)))))))))
+
+;;; Running a block
+
+(defun jsonyter-org-run-block (&optional advance)
+  "Run the jy: src block at point against its kernel, output inline.
+With ADVANCE (\\[jsonyter-org-run-block-and-advance]) move to the next
+jy: block afterwards.  Starts the block's session on first use."
+  (interactive)
+  (let* ((info (or (jsonyter--org-block-info)
+                   (user-error "jsonyter: no source block at point")))
+         (key (or (jsonyter--org-session-key info)
+                  (user-error
+                   "jsonyter: this block has no `:session jy:...' -- nothing to run")))
+         (session (jsonyter--org-connect key (cdr (assq :kernel (nth 2 info))))))
+    (when (jsonyter--session-busy session)
+      (user-error "jsonyter: session %s is busy (C-c C-c to interrupt)"
+                  (jsonyter--session-name session)))
+    (pcase-let* ((`(,code . ,anchor) (jsonyter--org-block-region))
+                 (ov (jsonyter--org-cell-overlay anchor t)))
+      (if (string-blank-p code)
+          (message "jsonyter: empty block")
+        (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash code))
+        (overlay-put ov 'jsonyter-output-stale nil)
+        (overlay-put ov 'jsonyter-output-string "")
+        (overlay-put ov 'jsonyter-raw-outputs nil)
+        (jsonyter--nb-refresh-output ov)
+        (setf (jsonyter--session-busy session) t)
+        (force-mode-line-update)
+        (jsonyter--send
+         "execute"
+         (append (list :kernel_id (jsonyter--session-kernel-id session) :code code)
+                 (and jsonyter-stream-output '(:stream t)))
+         (list
+          :output (lambda (output) (jsonyter--nb-append-output ov output))
+          :result
+          (lambda (msg)
+            (setf (jsonyter--session-busy session) nil)
+            (force-mode-line-update)
+            (let ((err (plist-get msg :error))
+                  (result (plist-get msg :result)))
+              (cond
+               (err (jsonyter--nb-set-output
+                     ov (format "[execute failed: %s]\n"
+                                (jsonyter--error-message err))))
+               (result
+                (let ((drawn (overlay-get ov 'jsonyter-output-string)))
+                  (when (and (or (null drawn) (string-empty-p drawn))
+                             (plist-get result :outputs))
+                    (dolist (o (plist-get result :outputs))
+                      (jsonyter--nb-append-output ov o))))
+                (when (equal (plist-get result :status) "aborted")
+                  (jsonyter--nb-append-output
+                   ov (list :type "stream" :name "stderr"
+                            :text "[execution aborted]\n")))))))))))
+    (when advance (jsonyter-org-next-block))))
+
+(defun jsonyter-org-run-block-and-advance ()
+  "Run the jy: block at point, then move to the next one."
+  (interactive)
+  (jsonyter-org-run-block t))
+
+(defun jsonyter-org-run-buffer ()
+  "Run every jy: src block in the buffer, in order, waiting for each."
+  (interactive)
+  (save-excursion
+    (goto-char (point-min))
+    (let ((seen 0))
+      (while (jsonyter--org-goto-next-jy-block)
+        (cl-incf seen)
+        (jsonyter-org-run-block)
+        (let* ((session (jsonyter--org-session-at-point 'noerror))
+               (deadline (+ (float-time) 3600)))
+          (while (and session (jsonyter--session-busy session)
+                      (< (float-time) deadline))
+            (accept-process-output jsonyter--process 0.05))))
+      (message "jsonyter: ran %d jy: block%s" seen (if (= seen 1) "" "s")))))
+
+;;; Navigation
+
+(defun jsonyter--org-goto-next-jy-block ()
+  "Move to the head of the next jy: block after point; return point or nil."
+  (let ((found nil))
+    (while (and (not found) (ignore-errors (org-babel-next-src-block) t))
+      (when (jsonyter--org-in-jy-block-p) (setq found (point))))
+    found))
+
+(defun jsonyter-org-next-block ()
+  "Move to the next jy: src block."
+  (interactive)
+  (or (jsonyter--org-goto-next-jy-block)
+      (message "jsonyter: no further jy: block")))
+
+(defun jsonyter-org-previous-block ()
+  "Move to the previous jy: src block."
+  (interactive)
+  (let ((start (point)) (found nil))
+    (while (and (not found) (ignore-errors (org-babel-previous-src-block) t))
+      (when (jsonyter--org-in-jy-block-p) (setq found (point))))
+    (unless found
+      (goto-char start)
+      (message "jsonyter: no earlier jy: block"))))
+
+;;; Kernel control for the session at point
+
+(defun jsonyter-org-interrupt ()
+  "Interrupt the kernel of the jy: session at point."
+  (interactive)
+  (jsonyter-interrupt (jsonyter--org-session-at-point)))
+
+(defun jsonyter-org-restart ()
+  "Restart the kernel of the jy: session at point."
+  (interactive)
+  (jsonyter-restart (jsonyter--org-session-at-point)))
+
+(defun jsonyter-org-reconnect ()
+  "Reconnect the jy: session at point to the kernel it was last using."
+  (interactive)
+  (let* ((session (jsonyter--org-ensure-session-at-point 'no-kernel))
+         (id (or (jsonyter--session-kernel-id session)
+                 (plist-get (jsonyter--session-last-kernel session) :id))))
+    (unless id
+      (user-error "jsonyter: this session has no kernel to reconnect to"))
+    (jsonyter-kernel-connect id session)))
+
+(defun jsonyter-org-connect-kernel (kernel-id)
+  "Attach the jy: session at point to KERNEL-ID, a kernel on the server."
+  (interactive
+   (list (progn (jsonyter--ensure-live-bridge)
+                (jsonyter--read-kernel "Attach this block's session to kernel: "))))
+  (jsonyter-kernel-connect kernel-id (jsonyter--org-ensure-session-at-point 'no-kernel)))
+
+(defun jsonyter-org-kernel-history (&optional n)
+  "Show the kernel history of the jy: session at point (N commands)."
+  (interactive "P")
+  (let ((session (jsonyter--org-session-at-point)))
+    (jsonyter-kernel-history (and n (prefix-numeric-value n))
+                             (jsonyter--session-kernel-id session))))
+
+(defun jsonyter-org-inspect ()
+  "Show kernel documentation for the thing at point in a jy: block."
+  (interactive)
+  (let ((session (jsonyter--org-session-at-point)))
+    (unless (jsonyter--live-p session)
+      (user-error "jsonyter: this block's kernel is not running"))
+    (let* ((el (org-element-at-point))
+           (body-beg (save-excursion
+                       (goto-char (org-element-property :begin el))
+                       (forward-line 1) (point)))
+           (code (or (org-element-property :value el) ""))
+           (pos (max 0 (min (length code) (- (point) body-beg))))
+           (reply (jsonyter--kernel-request
+                   "inspect"
+                   (list :kernel_id (jsonyter--session-kernel-id session)
+                         :code code :cursor_pos pos)))
+           (text (and (eq (plist-get reply :found) t)
+                      (jsonyter--mime (plist-get reply :data) :text/plain))))
+      (if (not text)
+          (message "jsonyter: no documentation found")
+        (with-help-window "*jsonyter-doc*"
+          (with-current-buffer standard-output
+            (insert (ansi-color-apply text))))))))
+
+;;; Clearing shown output
+
+(defun jsonyter-org-clear-block-output ()
+  "Discard the overlay output shown beneath the src block at point."
+  (interactive)
+  (let ((ov (jsonyter--org-cell-at)))
+    (unless ov (user-error "jsonyter: no output at this block"))
+    (setq jsonyter--org-cells (delq ov jsonyter--org-cells))
+    (delete-overlay ov)
+    (message "jsonyter: output cleared")))
+
+(defun jsonyter-org-clear-all-output ()
+  "Discard every overlay output in this buffer.
+Committed `#+RESULTS:' drawers are buffer text and are left untouched."
+  (interactive)
+  (dolist (ov jsonyter--org-cells)
+    (when (overlay-buffer ov) (delete-overlay ov)))
+  (setq jsonyter--org-cells nil)
+  (message "jsonyter: cleared all overlay output"))
+
+;;; Committing output to a #+RESULTS: drawer  (M4)
+
+(defun jsonyter--org-image-dir ()
+  "Absolute path of the managed image directory for this buffer's file."
+  (expand-file-name jsonyter-org-image-directory
+                    (file-name-directory (or buffer-file-name
+                                             default-directory))))
+
+(defun jsonyter--org-managed-file-p (path)
+  "Non-nil if PATH is inside this buffer's managed image directory."
+  (let ((dir (file-name-as-directory (jsonyter--org-image-dir))))
+    (string-prefix-p dir (expand-file-name path))))
+
+(defun jsonyter--org-write-image (base64 ext)
+  "Decode BASE64 and write the bytes to a content-addressed .EXT file.
+Returns the file's path, relative to the Org file when it can be so the
+`[[file:...]]' link stays portable."
+  (let* ((bytes (base64-decode-string
+                 (replace-regexp-in-string "[ \t\r\n]" "" base64)))
+         (name (format "plot-%s.%s" (substring (secure-hash 'sha1 bytes) 0 12) ext))
+         (dir (jsonyter--org-image-dir))
+         (abs (expand-file-name name dir)))
+    (make-directory dir t)
+    (unless (file-exists-p abs)          ; content-addressed: identical => no write
+      (let ((coding-system-for-write 'binary))
+        (write-region bytes nil abs nil 'quiet)))
+    (if buffer-file-name
+        (file-relative-name abs (file-name-directory buffer-file-name))
+      abs)))
+
+(defun jsonyter--org-result-body (raw-outputs)
+  "Render RAW-OUTPUTS (kernel-shape plists) as `#+RESULTS:' drawer lines.
+Returns a string: fixed-width `: ' lines for text, `[[file:...]]' links
+for images, each image also written to disk as a side effect."
+  (let (lines)
+    (dolist (o raw-outputs)
+      (pcase (plist-get o :type)
+        ("stream"
+         (dolist (l (split-string (or (plist-get o :text) "") "\n"))
+           (push (if (string-empty-p l) ":" (concat ": " l)) lines)))
+        ((or "execute_result" "display_data" "update_display_data")
+         (let* ((data (plist-get o :data))
+                (png (jsonyter--mime data :image/png))
+                (jpeg (jsonyter--mime data :image/jpeg))
+                (svg (jsonyter--mime data :image/svg+xml))
+                (txt (jsonyter--mime data :text/plain)))
+           (cond
+            (png  (push (format "[[file:%s]]" (jsonyter--org-write-image png "png")) lines))
+            (jpeg (push (format "[[file:%s]]" (jsonyter--org-write-image jpeg "jpg")) lines))
+            (svg  (push (format "[[file:%s]]"
+                                (jsonyter--org-write-image (base64-encode-string
+                                                            (encode-coding-string svg 'utf-8))
+                                                           "svg"))
+                        lines))
+            (txt (dolist (l (split-string (ansi-color-filter-apply txt) "\n"))
+                   (push (if (string-empty-p l) ":" (concat ": " l)) lines))))))
+        ("error"
+         (dolist (l (split-string
+                     (ansi-color-filter-apply
+                      (mapconcat #'identity (plist-get o :traceback) "\n"))
+                     "\n"))
+           (push (if (string-empty-p l) ":" (concat ": " l)) lines)))
+        (_ nil)))
+    (string-join (nreverse lines) "\n")))
+
+(defun jsonyter--org-result-images (info)
+  "Absolute paths of managed image files linked by INFO's current `#+RESULTS:'."
+  (let ((pos (save-excursion (org-babel-where-is-src-block-result nil info))))
+    (when pos
+      (save-excursion
+        (goto-char pos)
+        (let* ((el (org-element-at-point))
+               (end (org-element-property :end el))
+               files)
+          (while (re-search-forward "\\[\\[file:\\([^]]+\\)\\]\\]" end t)
+            (let ((f (expand-file-name (match-string 1))))
+              (when (jsonyter--org-managed-file-p f) (push f files))))
+          files)))))
+
+(defun jsonyter--org-commit-1 (info hash raw-outputs)
+  "Replace INFO's block's `#+RESULTS:' with RAW-OUTPUTS, stamped HASH.
+Deletes managed image files the previous result referenced but the new
+one does not.  Point must be in the block."
+  (let* ((old-images (jsonyter--org-result-images info))
+         (body (jsonyter--org-result-body raw-outputs)) ; writes the image files
+         (new-images (jsonyter--org-result-images info))
+         ;; The old result sits *below* `#+end_src', so removing it never
+         ;; shifts this anchor -- compute it once, up front.
+         (anchor (save-excursion
+                   (goto-char (org-element-property :end (org-element-at-point)))
+                   (skip-chars-backward "\n \t")
+                   (line-beginning-position 2))))
+    (org-babel-remove-result info)
+    (save-excursion
+      (goto-char (min anchor (point-max)))
+      (unless (bolp) (insert "\n"))
+      (insert (if (and jsonyter-org-stamp-results hash)
+                  (format "#+RESULTS[%s]:\n" (substring hash 0 7))
+                "#+RESULTS:\n")
+              ":results:\n"
+              (if (string-empty-p body) "" (concat body "\n"))
+              ":end:\n"))
+    (dolist (f old-images)
+      (unless (member f new-images)
+        (ignore-errors (delete-file f))))))
+
+(defun jsonyter-org-commit-block ()
+  "Commit the shown output of the src block at point to a `#+RESULTS:' drawer.
+Overlay output is session-only until this is run; afterwards it is in the
+file, exportable, and stamped with the source hash it came from."
+  (interactive)
+  (let* ((info (or (jsonyter--org-block-info)
+                   (user-error "jsonyter: no source block at point")))
+         (ov (jsonyter--org-cell-at))
+         (raw (and ov (overlay-get ov 'jsonyter-raw-outputs))))
+    (unless raw
+      (user-error "jsonyter: this block has no shown output to commit"))
+    (jsonyter--org-commit-1 info (overlay-get ov 'jsonyter-source-hash) raw)
+    ;; The committed text now IS the result; drop the overlay so the two
+    ;; are not shown twice.
+    (setq jsonyter--org-cells (delq ov jsonyter--org-cells))
+    (delete-overlay ov)
+    (message "jsonyter: committed output to #+RESULTS:")))
+
+(defun jsonyter-org-commit-buffer ()
+  "Commit every block's shown overlay output to its `#+RESULTS:' drawer.
+Blocks with no shown output this session are left exactly as they were."
+  (interactive)
+  (let ((n 0))
+    (dolist (ov (copy-sequence jsonyter--org-cells))
+      (when (and (overlay-buffer ov) (overlay-get ov 'jsonyter-raw-outputs))
+        (save-excursion
+          (goto-char (overlay-start ov))
+          (let ((info (jsonyter--org-block-info)))
+            (when info
+              (jsonyter--org-commit-1 info (overlay-get ov 'jsonyter-source-hash)
+                                      (overlay-get ov 'jsonyter-raw-outputs))
+              (cl-incf n)))
+          (setq jsonyter--org-cells (delq ov jsonyter--org-cells))
+          (delete-overlay ov))))
+    (message "jsonyter: committed %d block%s" n (if (= n 1) "" "s"))))
+
+(defun jsonyter-org-clean-images ()
+  "Delete managed image files no `#+RESULTS:' in this buffer still links."
+  (interactive)
+  (let ((dir (jsonyter--org-image-dir))
+        (linked (make-hash-table :test #'equal))
+        (removed 0))
+    (unless (file-directory-p dir)
+      (user-error "jsonyter: no managed image directory at %s" dir))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward "\\[\\[file:\\([^]]+\\)\\]\\]" nil t)
+        (puthash (expand-file-name (match-string 1)) t linked)))
+    (dolist (f (directory-files dir t "\\`plot-.*\\.\\(png\\|jpg\\|svg\\)\\'"))
+      (unless (gethash f linked)
+        (ignore-errors (delete-file f) (cl-incf removed))))
+    (message "jsonyter: removed %d unreferenced image%s"
+             removed (if (= removed 1) "" "s"))))
+
+;;; Staleness of a committed result, known before any kernel starts  (M4)
+
+(defun jsonyter--org-refresh-committed-frame (info body)
+  "Frame INFO's committed `#+RESULTS:' as stale when its stamp != BODY's hash."
+  (when jsonyter-org-stamp-results
+    (let ((pos (save-excursion (org-babel-where-is-src-block-result nil info))))
+      (when pos
+        (save-excursion
+          (goto-char pos)
+          (when (looking-at jsonyter--org-results-re)
+            (let* ((stamp (match-string 1))
+                   (el (org-element-at-point))
+                   (beg (line-beginning-position))
+                   (end (org-element-property :end el))
+                   (stale (and stamp
+                               (not (equal stamp
+                                           (substring (jsonyter--source-hash body)
+                                                      0 (length stamp))))))
+                   (ov (seq-find (lambda (o) (overlay-get o 'jsonyter-org-committed))
+                                 (overlays-in beg (1+ beg)))))
+              (cond
+               ((and stale (not ov))
+                (setq ov (make-overlay beg end))
+                (overlay-put ov 'jsonyter-org-committed t)
+                (overlay-put ov 'evaporate t)
+                (overlay-put ov 'face 'jsonyter-output-border-stale-face)
+                (overlay-put ov 'help-echo
+                             "Source edited since this result was committed — re-run and re-commit")
+                (push ov jsonyter--org-committed))
+               ((and ov (not stale))
+                (setq jsonyter--org-committed (delq ov jsonyter--org-committed))
+                (delete-overlay ov))
+               ((and ov stale)
+                (move-overlay ov beg end))))))))))
+
+(defun jsonyter--org-scan-committed ()
+  "On mode start, frame every committed `#+RESULTS:' whose jy: block has changed.
+Walks the jy: blocks forward -- from a block one can always find its own
+result, where the reverse is not reliable."
+  (save-excursion
+    (goto-char (point-min))
+    (while (jsonyter--org-goto-next-jy-block)
+      (let ((info (jsonyter--org-block-info)))
+        (when info
+          (jsonyter--org-refresh-committed-frame
+           info (string-trim (or (org-element-property
+                                  :value (org-element-at-point))
+                                 ""))))))))
+
+;;; The minor mode
+
+(defun jsonyter--org-fallthrough ()
+  "Run the command this key would run with `jsonyter-org-mode' off."
+  (let* ((jsonyter-org-mode nil)
+         (cmd (key-binding (this-command-keys-vector) t)))
+    (if (commandp cmd)
+        (progn (setq this-command cmd) (call-interactively cmd))
+      (ding))))
+
+(defmacro jsonyter--org-defkey (name jy-command doc)
+  "Define command NAME with docstring DOC.
+In a jy: src block it runs JY-COMMAND; anywhere else it falls through to
+whatever the invoking key does with `jsonyter-org-mode' off."
+  `(defun ,name ()
+     ,doc
+     (interactive)
+     (if (jsonyter--org-in-jy-block-p)
+         (call-interactively #',jy-command)
+       (jsonyter--org-fallthrough))))
+
+(jsonyter--org-defkey jsonyter-org-C-RET jsonyter-org-run-block
+  "Run the jy: block at point, else `org-insert-heading-respect-content'.")
+(jsonyter--org-defkey jsonyter-org-S-RET jsonyter-org-run-block-and-advance
+  "Run the jy: block at point and advance, else org's own `S-RET'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-c jsonyter-org-interrupt
+  "Interrupt the jy: session at point, else `org-ctrl-c-ctrl-c'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-r jsonyter-org-restart
+  "Restart the jy: session at point, else `org-ctrl-c-ctrl-r'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-l jsonyter-org-reconnect
+  "Reconnect the jy: session at point, else `org-insert-link'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-j jsonyter-org-connect-kernel
+  "Attach the jy: session at point to a kernel, else `org-goto'.")
+(jsonyter--org-defkey jsonyter-org-C-c-M-h jsonyter-org-kernel-history
+  "Kernel history for the jy: session at point, else org's `C-c M-h'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-d jsonyter-org-inspect
+  "Documentation for the thing at point in a jy: block, else `org-deadline'.")
+(jsonyter--org-defkey jsonyter-org-C-c-M-o jsonyter-org-clear-block-output
+  "Clear this jy: block's shown output, else org's `C-c M-o'.")
+(jsonyter--org-defkey jsonyter-org-C-c-C-s jsonyter-org-commit-block
+  "Commit this jy: block's output to `#+RESULTS:', else `org-schedule'.")
+
+(defvar jsonyter-org-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "<C-return>") #'jsonyter-org-C-RET)
+    (define-key map (kbd "<S-return>") #'jsonyter-org-S-RET)
+    (define-key map (kbd "C-c C-v C-b") #'jsonyter-org-run-buffer)
+    (define-key map (kbd "C-c C-n") #'jsonyter-org-next-block)
+    (define-key map (kbd "C-c C-p") #'jsonyter-org-previous-block)
+    (define-key map (kbd "C-c C-c") #'jsonyter-org-C-c-C-c)
+    (define-key map (kbd "C-c C-r") #'jsonyter-org-C-c-C-r)
+    (define-key map (kbd "C-c C-l") #'jsonyter-org-C-c-C-l)
+    (define-key map (kbd "C-c C-j") #'jsonyter-org-C-c-C-j)
+    (define-key map (kbd "C-c M-h") #'jsonyter-org-C-c-M-h)
+    (define-key map (kbd "C-c C-d") #'jsonyter-org-C-c-C-d)
+    (define-key map (kbd "C-c M-o") #'jsonyter-org-C-c-M-o)
+    (define-key map (kbd "C-c M-O") #'jsonyter-org-clear-all-output)
+    (define-key map (kbd "C-c C-s") #'jsonyter-org-C-c-C-s)
+    (define-key map (kbd "C-c C-M-s") #'jsonyter-org-commit-buffer)
+    map)
+  "Keymap for `jsonyter-org-mode'.
+Every binding that shadows an Org command is conditional: inside a jy:
+src block it runs the jsonyter action, everywhere else it falls through
+to what Org would otherwise do.  `C-c C-n' / `C-c C-p' are the exception
+-- they always jump to the next / previous jy: block, since that is
+useful from anywhere in the file.")
+
+;;;###autoload
+(define-minor-mode jsonyter-org-mode
+  "Run `#+begin_src' blocks with a `:session jy:...' against Jupyter kernels.
+
+`C-RET' runs the block at point; output streams into an overlay beneath
+it and never touches buffer text.  `C-c C-s' commits that output to a
+`#+RESULTS:' drawer when you want it saved.  Blocks without a `jy:'
+session are left entirely to Org.
+
+\\{jsonyter-org-mode-map}"
+  :lighter jsonyter-org-mode-lighter
+  :keymap jsonyter-org-mode-map
+  (if jsonyter-org-mode
+      (progn
+        (unless (derived-mode-p 'org-mode)
+          (setq jsonyter-org-mode nil)
+          (user-error "jsonyter-org-mode is only for Org buffers"))
+        (require 'org)
+        (require 'ob-core)
+        (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+        (setq-local jsonyter--session-key nil) ; per-block, never a "current" one
+        (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
+        (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
+        (add-hook 'after-change-functions #'jsonyter--org-stale-after-change nil t)
+        (jsonyter-mode 1)
+        (jsonyter--org-scan-committed))
+    (jsonyter-org-clear-all-output)
+    (dolist (ov jsonyter--org-committed)
+      (when (overlay-buffer ov) (delete-overlay ov)))
+    (setq jsonyter--org-committed nil)
+    (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
+    (remove-hook 'after-change-functions #'jsonyter--org-stale-after-change t)
+    (jsonyter-mode -1)))
+
+;;;###autoload
+(defun jsonyter-org-mode-maybe ()
+  "Enable `jsonyter-org-mode' when this Org buffer has a `jy:' session.
+Suitable for `org-mode-hook'."
+  (when (and (derived-mode-p 'org-mode) (jsonyter--org-buffer-has-jy-p))
+    (jsonyter-org-mode 1)))
 
 (provide 'jsonyter)
 ;;; jsonyter.el ends here

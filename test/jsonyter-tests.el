@@ -573,5 +573,337 @@ source, or the next cell is rendered inside the previous one's results."
       (should (equal "" (jsonyter-tests--output-text cell)))
       (should (= (overlay-end cell) (overlay-start (jsonyter-tests--cell 1)))))))
 
+;;;; The session table (M1)
+
+;; These never touch a bridge: a session's kernel binding is set on the
+;; struct directly, and events are fed to `jsonyter--handle-event' in the
+;; shape the bridge tags them with.
+
+(defmacro jsonyter-tests--with-sessions (&rest body)
+  "Run BODY in a fresh temp buffer with an empty session table."
+  (declare (indent 0) (debug t))
+  `(with-temp-buffer
+     (setq-local jsonyter--sessions (make-hash-table :test #'equal))
+     (setq-local jsonyter--process nil)
+     ,@body))
+
+(defun jsonyter-tests--bind-session (key id &optional own)
+  "Put a session for KEY bound to kernel ID, owned when OWN, and return it."
+  (let ((session (jsonyter--session-put key)))
+    (setf (jsonyter--session-kernel-id session) id
+          (jsonyter--session-state session) "idle"
+          (jsonyter--session-own session) (and own id))
+    session))
+
+(ert-deftest jsonyter-test-session-put-is-idempotent ()
+  "`jsonyter--session-put' creates once and returns the same object after."
+  (jsonyter-tests--with-sessions
+    (let ((a (jsonyter--session-put '("python" . "main")))
+          (b (jsonyter--session-put '("python" . "main"))))
+      (should (eq a b))
+      (should (equal (jsonyter--session-language a) "python"))
+      (should (= 1 (length (jsonyter--session-list)))))))
+
+(ert-deftest jsonyter-test-sessions-keyed-by-language-and-name ()
+  "jy:main in Python and in R are two different sessions."
+  (jsonyter-tests--with-sessions
+    (jsonyter--session-put '("python" . "main"))
+    (jsonyter--session-put '("R" . "main"))
+    (should (= 2 (length (jsonyter--session-list))))))
+
+(ert-deftest jsonyter-test-session-for-kernel-round-trips ()
+  "A kernel id resolves back to the session it is bound to, and unknown ids to nil."
+  (jsonyter-tests--with-sessions
+    (let ((py (jsonyter-tests--bind-session '("python" . "") "kid-py"))
+          (r  (jsonyter-tests--bind-session '("R" . "") "kid-r")))
+      (should (eq py (jsonyter--session-for-kernel "kid-py")))
+      (should (eq r (jsonyter--session-for-kernel "kid-r")))
+      (should (null (jsonyter--session-for-kernel "kid-nope")))
+      (should (null (jsonyter--session-for-kernel nil))))))
+
+(ert-deftest jsonyter-test-event-routes-to-owning-session-only ()
+  "A `dead' event blanks only its own session; the sibling is untouched."
+  (jsonyter-tests--with-sessions
+    (let ((py (jsonyter-tests--bind-session '("python" . "") "kid-py"))
+          (r  (jsonyter-tests--bind-session '("R" . "") "kid-r")))
+      (setf (jsonyter--session-busy py) t
+            (jsonyter--session-busy r) t)
+      (jsonyter--handle-event
+       '(:kernel_id "kid-r" :event (:type "dead")))
+      (should (equal (jsonyter--session-state r) "dead"))
+      (should (null (jsonyter--session-busy r)))
+      ;; Python is left exactly as it was.
+      (should (equal (jsonyter--session-state py) "idle"))
+      (should (jsonyter--session-busy py)))))
+
+(ert-deftest jsonyter-test-event-for-unknown-kernel-is-a-no-op ()
+  "An event whose kernel this buffer no longer tracks is dropped, not an error."
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid-py")
+    (should-not
+     (jsonyter--handle-event '(:kernel_id "gone" :event (:type "dead"))))))
+
+(ert-deftest jsonyter-test-status-event-updates-only-its-session ()
+  "A busy/idle status event moves one session's state and leaves others alone."
+  (jsonyter-tests--with-sessions
+    (let ((py (jsonyter-tests--bind-session '("python" . "") "kid-py"))
+          (r  (jsonyter-tests--bind-session '("R" . "") "kid-r")))
+      (jsonyter--handle-event
+       '(:kernel_id "kid-py" :event (:type "status" :execution_state "busy")))
+      (should (equal (jsonyter--session-state py) "busy"))
+      (should (equal (jsonyter--session-state r) "idle")))))
+
+(ert-deftest jsonyter-test-mode-line-single-session ()
+  "With one session the mode line reports that session's state."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setq-local jsonyter--session-key '("python" . ""))
+      (should (equal ":idle" (jsonyter--mode-line-string)))
+      (setf (jsonyter--session-busy s) t)
+      (should (equal ":run" (jsonyter--mode-line-string)))
+      (setf (jsonyter--session-busy s) nil
+            (jsonyter--session-state s) "dead")
+      (should (equal ":dead" (jsonyter--mode-line-string))))))
+
+(ert-deftest jsonyter-test-mode-line-summarizes-many-sessions ()
+  "An Org-style buffer with no current session summarizes the table."
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "main") "kid-py")
+    (jsonyter-tests--bind-session '("R" . "main") "kid-r")
+    (setq-local jsonyter--session-key nil)
+    (should (equal ":2 kernels" (jsonyter--mode-line-string)))
+    (setf (jsonyter--session-busy (jsonyter--session-for-kernel "kid-py")) t)
+    (should (equal ":2 kernels!" (jsonyter--mode-line-string)))))
+
+(ert-deftest jsonyter-test-cleanup-shuts-down-every-owned-kernel ()
+  "`jsonyter--cleanup' ends each kernel this buffer started, not adopted ones."
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "main") "own-py" t)
+    (jsonyter-tests--bind-session '("R" . "main") "own-r" t)
+    (jsonyter-tests--bind-session '("julia" . "main") "adopted" nil)
+    (let ((shutdowns '()))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--kill-process) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (method params &rest _)
+                   (when (equal method "shutdown_kernel")
+                     (push (plist-get params :kernel_id) shutdowns)))))
+        (jsonyter--cleanup))
+      (should (equal (sort shutdowns #'string<) '("own-py" "own-r"))))))
+
+(ert-deftest jsonyter-test-legacy-kernel-vars-are-obsolete ()
+  "The pre-2.0 scalars carry an obsolescence notice pointing at the accessors."
+  (should (get 'jsonyter--kernel-id 'byte-obsolete-variable))
+  (should (get 'jsonyter--busy 'byte-obsolete-variable)))
+
+(ert-deftest jsonyter-test-public-accessors-are-nil-safe ()
+  "The public accessors return nil in a buffer that has no session."
+  (with-temp-buffer
+    (should (null (jsonyter-current-session)))
+    (should (null (jsonyter-current-kernel-id)))
+    (should (null (jsonyter-current-kernel-busy-p)))))
+
+;;;; Org-mode cell layer (M3/M4)
+
+;; No kernel: outputs are fed to the overlay in kernel shape, and session
+;; resolution / commit / staleness are pure buffer operations.
+
+(require 'org)
+
+(defmacro jsonyter-tests--with-org-file (text &rest body)
+  "Run BODY in a buffer visiting a temp .org file containing TEXT."
+  (declare (indent 1) (debug t))
+  `(let ((path (make-temp-file "jsonyter-org-" nil ".org"))
+         (buffer nil))
+     (unwind-protect
+         (progn
+           (with-temp-file path (insert ,text))
+           (setq buffer (find-file-noselect path))
+           (with-current-buffer buffer
+             (jsonyter-org-mode 1)
+             ,@body))
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer (set-buffer-modified-p nil))
+         (kill-buffer buffer))
+       (when (file-exists-p path) (delete-file path))
+       (let ((d (expand-file-name ".jsonyter"
+                                  (file-name-directory path))))
+         (when (file-directory-p d) (delete-directory d t))))))
+
+(defun jsonyter-tests--info (lang &rest header-args)
+  "A fake `org-babel-get-src-block-info' list for LANG with HEADER-ARGS (plist)."
+  (list lang "body"
+        (let (alist)
+          (while header-args
+            (push (cons (pop header-args) (pop header-args)) alist))
+          (nreverse alist))
+        nil nil 1 nil))
+
+(ert-deftest jsonyter-test-org-session-key-opts-in-on-jy-prefix ()
+  "`:session jy:...' resolves to a (language . name) key; anything else is nil."
+  (should (equal '("python" . "main")
+                 (jsonyter--org-session-key
+                  (jsonyter-tests--info "python" :session "jy:main"))))
+  (should (equal '("python" . "")
+                 (jsonyter--org-session-key
+                  (jsonyter-tests--info "python" :session "jy:"))))
+  (should (equal '("R" . "@abc123")
+                 (jsonyter--org-session-key
+                  (jsonyter-tests--info "R" :session "jy:@abc123"))))
+  (should (null (jsonyter--org-session-key
+                 (jsonyter-tests--info "python" :session "none"))))
+  (should (null (jsonyter--org-session-key
+                 (jsonyter-tests--info "python" :session "main"))))
+  (should (null (jsonyter--org-session-key (jsonyter-tests--info "python")))))
+
+(ert-deftest jsonyter-test-org-buffer-detection ()
+  "`jsonyter--org-buffer-has-jy-p' sees inline and property-line opt-ins."
+  (with-temp-buffer
+    (insert "#+begin_src python :session jy:main\n1\n#+end_src\n")
+    (should (jsonyter--org-buffer-has-jy-p)))
+  (with-temp-buffer
+    (insert "#+PROPERTY: header-args:R :session jy:shared\n* h\n")
+    (should (jsonyter--org-buffer-has-jy-p)))
+  (with-temp-buffer
+    (insert "#+begin_src python :session main\n1\n#+end_src\n")
+    (should-not (jsonyter--org-buffer-has-jy-p))))
+
+(ert-deftest jsonyter-test-org-commit-writes-stamped-drawer ()
+  "Committing a block's shown output writes a hash-stamped `#+RESULTS:' drawer."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\nx = 1\nx + 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x + 1")
+    (pcase-let* ((`(,code . ,anchor) (jsonyter--org-block-region))
+                 (ov (jsonyter--org-cell-overlay anchor t)))
+      (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash code))
+      (overlay-put ov 'jsonyter-raw-outputs
+                   (list (jsonyter-tests--stream "first\n")
+                         (jsonyter-tests--stream "second\n")))
+      (overlay-put ov 'jsonyter-output-string "x")) ; non-empty => committable
+    (jsonyter-org-commit-block)
+    (let ((text (buffer-string)))
+      (should (string-match-p "#\\+RESULTS\\[[0-9a-f]\\{7\\}\\]:" text))
+      (should (string-match-p ":results:" text))
+      (should (string-match-p "^: first$" text))
+      (should (string-match-p "^: second$" text))
+      (should (string-match-p ":end:" text)))
+    ;; the overlay is gone -- the committed text is the result now
+    (should (null (jsonyter--org-cell-at)))))
+
+(ert-deftest jsonyter-test-org-commit-writes-image-file-and-link ()
+  "An image output is written to a content-addressed file and linked."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\nplot()\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "plot()")
+    (pcase-let* ((`(,code . ,anchor) (jsonyter--org-block-region))
+                 (ov (jsonyter--org-cell-overlay anchor t))
+                 ;; 1x1 transparent PNG
+                 (png (concat "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfF"
+                              "cSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")))
+      (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash code))
+      (overlay-put ov 'jsonyter-output-string "x")
+      (overlay-put ov 'jsonyter-raw-outputs
+                   (list (list :type "display_data"
+                               :data (list :image/png png) :metadata nil))))
+    (jsonyter-org-commit-block)
+    (should (string-match-p "\\[\\[file:[^]]*/?plot-[0-9a-f]+\\.png\\]\\]"
+                            (buffer-string)))
+    (let ((dir (expand-file-name ".jsonyter"
+                                 (file-name-directory buffer-file-name))))
+      (should (directory-files dir nil "\\`plot-.*\\.png\\'")))))
+
+(ert-deftest jsonyter-test-org-reload-flags-stale-committed-result ()
+  "A committed `#+RESULTS[hash]:' whose block changed is framed on mode start."
+  (jsonyter-tests--with-org-file
+      (concat "* h\n#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+RESULTS[deadbee]:\n:results:\n: 1\n:end:\n")
+    ;; jsonyter-org-mode already ran once via the macro; re-scan explicitly.
+    (jsonyter--org-scan-committed)
+    (should (seq-some (lambda (o) (overlay-get o 'jsonyter-org-committed))
+                      (overlays-in (point-min) (point-max))))))
+
+(ert-deftest jsonyter-test-org-reload-leaves-matching-result-alone ()
+  "A committed result whose stamp matches its block's hash is not framed."
+  (let* ((body "x = 1")
+         (stamp (substring (jsonyter--source-hash body) 0 7)))
+    (jsonyter-tests--with-org-file
+        (concat "* h\n#+begin_src python :session jy:main\n" body "\n#+end_src\n\n"
+                "#+RESULTS[" stamp "]:\n:results:\n: 1\n:end:\n")
+      (jsonyter--org-scan-committed)
+      (should-not (seq-some (lambda (o) (overlay-get o 'jsonyter-org-committed))
+                            (overlays-in (point-min) (point-max)))))))
+
+(ert-deftest jsonyter-test-org-edit-marks-overlay-output-stale ()
+  "Editing a block's body flips its shown output to the stale face."
+  (jsonyter-tests--with-org-file
+      "* h\n#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (pcase-let* ((`(,code . ,anchor) (jsonyter--org-block-region))
+                 (ov (jsonyter--org-cell-overlay anchor t)))
+      (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash code))
+      (overlay-put ov 'jsonyter-output-string "1\n")
+      (should-not (overlay-get ov 'jsonyter-output-stale))
+      (goto-char (line-end-position))
+      (insert " + 9")
+      (should (overlay-get ov 'jsonyter-output-stale)))))
+
+(ert-deftest jsonyter-test-org-clean-images-removes-unreferenced ()
+  "`jsonyter-org-clean-images' deletes managed pngs no link points at."
+  (jsonyter-tests--with-org-file
+      "* h\n[[file:.jsonyter/plot-keepme.png]]\n"
+    (let* ((dir (jsonyter--org-image-dir)))
+      (make-directory dir t)
+      (write-region "x" nil (expand-file-name "plot-keepme.png" dir) nil 'quiet)
+      (write-region "x" nil (expand-file-name "plot-orphan.png" dir) nil 'quiet)
+      (jsonyter-org-clean-images)
+      (should (file-exists-p (expand-file-name "plot-keepme.png" dir)))
+      (should-not (file-exists-p (expand-file-name "plot-orphan.png" dir))))))
+
+(ert-deftest jsonyter-test-org-dispatch-key-branches-on-block ()
+  "A shadowing key runs the jsonyter action in a jy: block, else falls through."
+  (jsonyter-tests--with-org-file
+      "* h\nprose\n#+begin_src python :session jy:main\n1\n#+end_src\n"
+    (let (acted fell)
+      (cl-letf (((symbol-function 'jsonyter-org-run-block)
+                 (lambda (&rest _) (interactive) (setq acted t)))
+                ((symbol-function 'jsonyter--org-fallthrough)
+                 (lambda (&rest _) (setq fell t))))
+        ;; inside the block -> jsonyter action
+        (goto-char (point-min)) (search-forward "1\n#+end")
+        (goto-char (match-beginning 0))
+        (call-interactively #'jsonyter-org-C-RET)
+        (should acted) (should-not fell)
+        ;; on the prose line -> Org's own command
+        (setq acted nil fell nil)
+        (goto-char (point-min)) (search-forward "prose")
+        (call-interactively #'jsonyter-org-C-RET)
+        (should fell) (should-not acted)))))
+
+(ert-deftest jsonyter-test-org-mode-refuses-non-org-buffer ()
+  "`jsonyter-org-mode' will not turn on outside an Org buffer."
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-error (jsonyter-org-mode 1))
+    (should-not (bound-and-true-p jsonyter-org-mode))))
+
+(ert-deftest jsonyter-test-org-folding-hides-overlay-output ()
+  "An output after-string anchored inside a folded subtree is not displayed.
+This is the M2 spike, codified: the overlay approach only works if Org's
+own visibility cycling hides committed-free session output for us."
+  (jsonyter-tests--with-org-file
+      "* h\nprose\n#+begin_src python :session jy:main\n1\n#+end_src\nafter\n"
+    (goto-char (point-min))
+    (search-forward "#+end_src")
+    (let* ((anchor (line-beginning-position 2))
+           (ov (make-overlay (1- anchor) anchor)))
+      (overlay-put ov 'after-string "\n[OUT]\n")
+      (should-not (org-invisible-p anchor))
+      (goto-char (point-min))
+      (org-cycle)                       ; fold the subtree
+      (should (org-invisible-p anchor)))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

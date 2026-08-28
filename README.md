@@ -1,13 +1,17 @@
 # jsonyter.el
 
-Jupyter, natively in Emacs — REPLs, rendered `.ipynb` notebooks, and `# %%`
-script cells, all against Python, Julia, R or SAS kernels on a local or
-remote server, backed by the
+Jupyter, natively in Emacs — REPLs, rendered `.ipynb` notebooks, `# %%`
+script cells, and `#+begin_src` blocks in Org files, all against Python,
+Julia, R or SAS kernels on a local or remote server, backed by the
 [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python package's
 JSON-over-stdio bridge. Streaming output, inline images, kernel-backed
 completion and documentation lookup, `input()` support, and — for
 notebooks — lossless byte-identical saves that never touch stored outputs
 unless you ask.
+
+Since 2.0, a single buffer can drive **several kernels at once** — a
+table of sessions keyed by `(language, name)` — which is what makes one
+Org file with Python, R and SAS blocks work.
 
 > **A note on how this was built.** The bulk of jsonyter.el was written by
 > Claude Fable 5, an Anthropic AI model, working iteratively with the
@@ -18,6 +22,7 @@ unless you ask.
 ## Requirements
 
 - Emacs 27.1+ (images need a graphical Emacs built with image support)
+- Org 9.4+ (bundled with Emacs 27.1+); only loaded when `jsonyter-org-mode` is used
 - The [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python
   package, 1.0.0 or newer:
   ```bash
@@ -257,8 +262,8 @@ that state.
 anywhere: it lists the kernels the server is running — most recently
 active first, with this buffer's own marked `*` — and attaches the buffer
 to the one you pick. Both work in any jsonyter buffer: a REPL, a rendered
-notebook, or a script with `jsonyter-script-mode` on. Two uses beyond
-recovery:
+notebook, a script with `jsonyter-script-mode` on, or the session at
+point in a `jsonyter-org-mode` buffer. Two uses beyond recovery:
 
 - Point a script's `# %%` cells at the kernel a notebook already has
   warm, so both see the same variables.
@@ -448,14 +453,137 @@ be scrolled into, so a tall image is shown whole here rather than sliced
 across lines. The kernel language comes from the buffer's major mode via
 `jsonyter-script-languages`.
 
+## Org-mode source blocks
+
+`jsonyter-org-mode` runs `#+begin_src` blocks against Jupyter kernels
+from inside an Org file, with output rendered beneath the block and,
+when you want it, committed to a `#+RESULTS:` drawer.
+
+```elisp
+(add-hook 'org-mode-hook #'jsonyter-org-mode-maybe)
+```
+
+`jsonyter-org-mode-maybe` turns the mode on only in files that opt in, so
+Org files that don't mention jsonyter are unaffected. `org` itself is
+loaded lazily the first time the mode is enabled.
+
+### Opting in: `:session jy:`
+
+A block routes to jsonyter when its `:session` header argument starts
+with `jy:`. Anything else — a bare `:session`, a plain name, or no
+`:session` — is left entirely to Org, so enabling the mode changes the
+behaviour of no existing file.
+
+```org
+#+begin_src python :session jy:main
+import numpy as np
+np.random.default_rng(0).normal(size=5).mean()
+#+end_src
+```
+
+| Form | Meaning |
+| --- | --- |
+| `:session jy:NAME` | Named session. Started on first use, reused after. |
+| `:session jy:` | The default session for this block's language in this buffer. |
+| `:session jy:@KERNEL-ID` | Attach to a kernel already running on the server, by id. Never shut down on your behalf. |
+
+Sessions are keyed **(language, name)**, so `jy:main` in a Python block
+and `jy:main` in an R block are two different kernels. A variable one
+block defines is visible to every later block in the same session.
+
+File-wide or subtree-wide opt-in uses Org's ordinary property mechanism:
+
+```org
+#+PROPERTY: header-args:python :session jy:main
+#+PROPERTY: header-args:R      :session jy:main
+```
+
+A `:kernel` header arg pins the kernelspec for one block, overriding
+`jsonyter-kernel-names`:
+
+```org
+#+begin_src R :session jy:main :kernel ir
+```
+
+### Keys
+
+Every binding that shadows an Org command is **conditional**: inside a
+`jy:` block it runs the jsonyter action; anywhere else it falls through
+to what Org would otherwise do. `org-edit-special` (`C-c '`) is
+unaffected.
+
+| Key | Action |
+| --- | --- |
+| `C-RET` | Run the block at point |
+| `S-RET` | Run the block and move to the next |
+| `C-c C-v C-b` | Run every `jy:` block in the buffer, in order |
+| `C-c C-n` / `C-c C-p` | Next / previous `jy:` block (from anywhere) |
+| `C-c C-c` | Interrupt the session at point |
+| `C-c C-r` | Restart the session at point |
+| `C-c C-l` / `C-c C-j` | Reconnect / attach this session to a kernel |
+| `C-c M-h` | Kernel history for the session at point |
+| `C-c C-d` | Documentation for the thing at point (`inspect`) |
+| `C-c M-o` / `C-c M-O` | Clear this block's output / all overlay output |
+| `C-c C-s` | Commit this block's output to `#+RESULTS:` |
+| `C-c C-M-s` | Commit every shown output in the buffer |
+
+### Results: overlay first, commit on demand
+
+Running a block touches no buffer text — output is an overlay, exactly
+as in a `# %%` script. Exploratory runs stay out of `git diff`.
+
+`C-c C-s` writes the shown output into a `#+RESULTS:` drawer beneath the
+block; `C-c C-M-s` does it for every block that has output, leaving
+untouched blocks exactly as they were. Multiple outputs (a stream, a
+figure, a value) go in a `:results:` … `:end:` drawer:
+
+```org
+#+RESULTS[8f3a1c2]:
+:results:
+: fitting…
+: R² = 0.87, n = 240
+[[file:.jsonyter/plot-8f3a1c2e0b4d.png]]
+:end:
+```
+
+The `[8f3a1c2]` is Org's own `#+RESULTS[<hash>]:` slot, stamped with the
+block's source hash. Reopen the file a month later and jsonyter frames
+every result whose block has since been edited in
+`jsonyter-output-border-stale-face` — **before any kernel starts**.
+This is the one slot Org's `:cache yes` also uses; the two are mutually
+exclusive per block. Set `jsonyter-org-stamp-results` to nil to turn the
+stamping off.
+
+### Images
+
+Committed figures are written to `jsonyter-org-image-directory` (default
+`./.jsonyter/`, relative to the Org file) as content-addressed
+`plot-<hash>.png` files and linked with `[[file:…]]`. Re-committing a
+block deletes the files its previous result referenced, but only inside
+that managed directory. `jsonyter-org-clean-images` removes files no
+result still links. With the default directory, add `.jsonyter/` to
+`.gitignore`; set it to `./images/` to version figures alongside the
+document.
+
+Image bytes arrive over the websocket, so figures work identically
+against a remote server.
+
+### Not yet
+
+`C-c C-c` routed through `org-babel-execute:LANG`, export
+(`C-c C-e`), tangle, `:var` marshalling and `.ipynb` ↔ `.org`
+conversion are later milestones. Until the babel path lands, run blocks
+with `C-RET` / `S-RET`, not `C-c C-c` — and do not point a `jy:` block's
+`C-c C-c` at `ob-python`, which would spawn a separate local interpreter.
+
 ## Extending jsonyter.el: `jsonyter-mode`
 
 `jsonyter-mode` is a marker minor mode, on in every jsonyter buffer —
-REPL, rendered notebook, or a script with `# %%` cells — regardless of
-which. It carries no keymap or behavior of its own; it exists so other
-code can ask "is this any kind of jsonyter buffer" with one check,
-`(bound-and-true-p jsonyter-mode)`, instead of testing all three
-specific modes itself.
+REPL, rendered notebook, a `# %%` script, or a `jsonyter-org-mode` Org
+file — regardless of which. It carries no keymap or behavior of its own;
+it exists so other code can ask "is this any kind of jsonyter buffer"
+with one check, `(bound-and-true-p jsonyter-mode)`, instead of testing
+each specific mode itself.
 
 `jsonyter-save-buffer` is built on this and is the pattern to copy:
 dispatch on a specific mode only where that mode's buffer actually needs
@@ -507,13 +635,24 @@ established" as soon as it arrives.
 
 ## Architecture notes
 
-Each REPL buffer owns a single `jsonyter` bridge process. The bridge is
-concurrent — REST calls run on a pool and each kernel gets its own worker —
-so `C-c C-c` is delivered and acted on over the same pipe while a cell is
-still running, with no separate control process. Replies are matched by
-request id, since they can arrive out of order. The bridge's stderr goes to
-a hidden buffer (` *jsonyter stderr*`) so Python warnings cannot corrupt
-the JSON protocol on stdout.
+Each jsonyter buffer owns a single `jsonyter` bridge process and a table
+of **sessions** keyed `(language, name)`. A REPL, notebook or script
+buffer holds one entry — one kernel by nature — and its commands read it
+as "the current session"; a `jsonyter-org-mode` buffer holds one entry
+per `jy:` session in the file. The bridge is concurrent — REST calls run
+on a pool and each kernel gets its own worker — so one bridge serves
+every session at once, `C-c C-c` is delivered over the same pipe while a
+cell is still running, and a `dead` event from one kernel is routed to
+its own session without disturbing the others. Replies are matched by
+request id, since they can arrive out of order. The bridge's stderr goes
+to a hidden buffer (` *jsonyter stderr*`) so Python warnings cannot
+corrupt the JSON protocol on stdout.
+
+The buffer-local scalars `jsonyter--kernel-id`, `jsonyter--busy` and the
+rest were replaced by that table in 2.0. Config that read them should
+use `jsonyter-current-kernel-id`, `jsonyter-current-session` and
+`jsonyter-current-kernel-busy-p` instead; the old names remain as
+obsolete aliases for one release.
 
 Streaming and the final reply are reconciled by count: the bridge repeats
 every streamed output in the final `outputs` list, so jsonyter.el renders
