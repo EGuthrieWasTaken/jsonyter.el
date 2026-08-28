@@ -116,8 +116,27 @@ sliced image is expected to occupy HEIGHT/LINE-HEIGHT of them."
              ((symbol-function 'display-images-p) (lambda (&rest _) t))
              ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
              ((symbol-function 'image-size) (lambda (&rest _) (cons 400.0 (float ,height))))
+             ;; Nothing here needs an image that decodes, only a
+             ;; well-formed spec for the slicing to measure and cut up
+             ;; — and `image-size' is faked just above.  Standing in
+             ;; for `create-image' keeps these tests about slicing, and
+             ;; keeps them runnable on an Emacs built without image
+             ;; support, where the real one signals and the renderer's
+             ;; "could not decode" fallback would quietly pass for a
+             ;; correctly unsliced image.
+             ((symbol-function 'create-image)
+              (lambda (data &optional type _data-p &rest props)
+                (append (list 'image :type (or type 'png) :data data) props)))
              ((symbol-function 'default-font-height) (lambda (&rest _) ,line-height)))
      ,@body))
+
+(defmacro jsonyter-tests--with-global-line-spacing (spacing &rest body)
+  "Run BODY with SPACING as every buffer's default `line-spacing'."
+  (declare (indent 1) (debug t))
+  `(let ((jsonyter-tests--spacing-was (default-value 'line-spacing)))
+     (unwind-protect
+         (progn (setq-default line-spacing ,spacing) ,@body)
+       (setq-default line-spacing jsonyter-tests--spacing-was))))
 
 (defun jsonyter-tests--bridge-available-p ()
   "Non-nil if the jsonyter Python package can be run as a bridge."
@@ -237,6 +256,97 @@ is really in the buffer."
         ;; ...and the overlay string holds one image, not twenty slices.
         (should (= 3 (length (split-string (overlay-get ov 'after-string)
                                            "\n" t))))))))
+
+;;;; `line-spacing' bands sliced images, so buffers showing them go without
+
+(ert-deftest jsonyter-test-line-spacing-resolves-like-emacs ()
+  "`jsonyter--line-spacing' reads leading from where Emacs itself reads it."
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+            ((symbol-function 'frame-char-height) (lambda (&rest _) 20)))
+    (jsonyter-tests--with-global-line-spacing nil
+      (with-temp-buffer
+        ;; Asked for nowhere.
+        (should (= 0 (jsonyter--line-spacing)))
+        ;; An integer is pixels...
+        (setq-local line-spacing 7)
+        (should (= 7 (jsonyter--line-spacing)))
+        ;; ...and a float a multiple of the frame's line height.
+        (setq-local line-spacing 0.25)
+        (should (= 5 (jsonyter--line-spacing)))
+        ;; The buffer's own value wins over the global one.
+        (setq-default line-spacing 9)
+        (should (= 5 (jsonyter--line-spacing)))
+        (kill-local-variable 'line-spacing)
+        (should (= 9 (jsonyter--line-spacing))))))
+  ;; A terminal draws no leading whatever anyone has asked for.
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) nil)))
+    (with-temp-buffer
+      (setq-local line-spacing 7)
+      (should (= 0 (jsonyter--line-spacing))))))
+
+(ert-deftest jsonyter-test-line-spacing-stands-slicing-down ()
+  "Slicing declines where each slice would sit on a bar of background."
+  (jsonyter-tests--with-fake-display 300 15
+    (with-temp-buffer
+      (should (= 20 (jsonyter--image-rows '(image :type png) 15)))
+      (setq-local line-spacing 4)
+      (should (null (jsonyter--image-rows '(image :type png) 15))))))
+
+(ert-deftest jsonyter-test-notebook-drops-line-spacing ()
+  "A notebook buffer goes without leading, and so its plots still tile.
+The image is 300px over 15px lines: 20 slices, not one banded glyph."
+  (jsonyter-tests--with-fake-display 300 15
+    (jsonyter-tests--with-global-line-spacing 5
+      (jsonyter-tests--with-notebook
+        (should (equal 0 line-spacing))
+        (let ((cell (jsonyter-tests--cell 0)))
+          (jsonyter--nb-append-output
+           cell (jsonyter-tests--png (base64-encode-string "not really a png")))
+          (should (= 22 (length (split-string (jsonyter-tests--output-text cell)
+                                              "\n" t)))))))))
+
+(ert-deftest jsonyter-test-repl-drops-line-spacing ()
+  "A REPL buffer does the same; its output is buffer text too."
+  (jsonyter-tests--with-fake-display 300 15
+    (jsonyter-tests--with-global-line-spacing 5
+      (with-temp-buffer
+        (jsonyter-repl-mode)
+        (should (equal 0 line-spacing))))))
+
+(ert-deftest jsonyter-test-line-spacing-kept-leaves-image-whole ()
+  "Declining the fix keeps the leading, and images stop being sliced.
+Banding a plot to preserve someone\='s leading would be the worse of the
+two, so the image goes in whole — as it does in a script cell."
+  (jsonyter-tests--with-fake-display 300 15
+    (jsonyter-tests--with-global-line-spacing 5
+      (let ((jsonyter-suppress-line-spacing nil))
+        (jsonyter-tests--with-notebook
+          (should (equal 5 line-spacing))
+          (should-not (local-variable-p 'line-spacing))
+          (let ((cell (jsonyter-tests--cell 0)))
+            (jsonyter--nb-append-output
+             cell (jsonyter-tests--png (base64-encode-string "not really a png")))
+            (should (= 3 (length (split-string (jsonyter-tests--output-text cell)
+                                               "\n" t))))))))))
+
+(ert-deftest jsonyter-test-notebook-puts-line-spacing-back ()
+  "Turning the mode off returns the buffer to the leading it had."
+  (jsonyter-tests--with-fake-display 300 15
+    (jsonyter-tests--with-global-line-spacing 5
+      (jsonyter-tests--with-notebook
+        (should (local-variable-p 'line-spacing))
+        (jsonyter-notebook-mode -1)
+        (should-not (local-variable-p 'line-spacing))
+        (should (equal 5 line-spacing))))))
+
+(ert-deftest jsonyter-test-line-spacing-untouched-without-any ()
+  "A buffer that asked for no leading is left exactly as it was.
+The fix is for buffers that would otherwise band a plot; everywhere else
+`line-spacing\=' stays unbound rather than being pinned to zero."
+  (jsonyter-tests--with-fake-display 300 15
+    (jsonyter-tests--with-global-line-spacing nil
+      (jsonyter-tests--with-notebook
+        (should-not (local-variable-p 'line-spacing))))))
 
 ;;;; Output is protected, but readable
 
