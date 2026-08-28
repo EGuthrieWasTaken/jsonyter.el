@@ -11,7 +11,9 @@ unless you ask.
 
 Since 2.0, a single buffer can drive **several kernels at once** — a
 table of sessions keyed by `(language, name)` — which is what makes one
-Org file with Python, R and SAS blocks work.
+Org file with Python, R and SAS blocks work. Since 2.1, a `jy:` block
+also runs through standard Org Babel: `C-c C-c`, export and
+`org-babel-tangle` all work on it, on the same kernel `C-RET` uses.
 
 > **A note on how this was built.** The bulk of jsonyter.el was written by
 > Claude Fable 5, an Anthropic AI model, working iteratively with the
@@ -22,7 +24,7 @@ Org file with Python, R and SAS blocks work.
 ## Requirements
 
 - Emacs 27.1+ (images need a graphical Emacs built with image support)
-- Org 9.4+ (bundled with Emacs 27.1+); only loaded when `jsonyter-org-mode` is used
+- Org 9.4+ (bundled with Emacs 27.1+); only loaded when `jsonyter-org-mode` is used, or Org Babel itself is
 - The [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python
   package, 1.0.0 or newer:
   ```bash
@@ -568,13 +570,82 @@ document.
 Image bytes arrive over the websocket, so figures work identically
 against a remote server.
 
-### Not yet
+### The org-babel backend: `C-c C-c`, export, tangle
 
-`C-c C-c` routed through `org-babel-execute:LANG`, export
-(`C-c C-e`), tangle, `:var` marshalling and `.ipynb` ↔ `.org`
-conversion are later milestones. Until the babel path lands, run blocks
-with `C-RET` / `S-RET`, not `C-c C-c` — and do not point a `jy:` block's
-`C-c C-c` at `ob-python`, which would spawn a separate local interpreter.
+`jsonyter-org-mode` is one way in — `C-RET` against an overlay. The
+other is standard Org Babel: `org-babel-execute:python` (and `:R`,
+`:julia`, `:SAS`) run a `jy:` block through the very same session, so
+`C-c C-c`, `C-c C-e` export and `org-babel-tangle` all work on it too. A
+variable a `C-RET` run defines is visible to a `C-c C-c` run in the same
+session and back again — the two are front doors onto one kernel, not
+two competing mechanisms. A block with no `jy:` session is untouched: it
+runs through whatever `org-babel-execute:LANG` Org itself defines
+(`ob-python`, `ob-R`, `ob-julia`), exactly as if jsonyter did not exist.
+This works whether or not `jsonyter-org-mode` is turned on — export in
+particular often runs without it ever having been enabled.
+
+SAS is the one language Org ships no backend for at all; a `jy:` SAS
+block gets kernel-backed Babel execution for the first time, and a
+non-`jy:` SAS block gets Org's own "no org-babel-execute function"
+error, same as before jsonyter existed.
+
+`:results` works as documented: `output` / `value` selects stream text
+or the kernel's own execute-result value; `html` / `latex` unwrap the
+matching mimetype into an export block; `file` writes an image to
+`jsonyter-org-image-directory` and links it, the same as a committed
+cell (see Images, above). An error's traceback, ANSI stripped, is
+returned as the result regardless of `:results`.
+
+By default, `org-babel-tangle` prefixes each `jy:` block's tangled text
+with a `# %%` marker (set `jsonyter-org-tangle-cell-markers` to nil to
+turn that off), so a file tangled out of one or more `jy:` blocks opens
+ready for `jsonyter-script-mode`.
+
+### Async: `:async yes`
+
+The cell layer (`C-RET`) is always async — this only affects the Babel
+path. Add `:async yes` and `C-c C-c` returns immediately with a
+placeholder result; when the kernel answers, jsonyter finds the
+placeholder by its opaque token and replaces it in place. A second
+`C-c C-c` on a session already busy is refused, not queued or made to
+interrupt the first. Exporting always runs synchronously regardless of
+`:async`, since `ox` collects the whole buffer in one pass and has
+nowhere for an async result to land; the wait is bounded by
+`jsonyter-exec-timeout`.
+
+### `:var`
+
+Org table and scalar `:var` bindings are marshalled into a short prelude
+prepended to the block, one statement per binding:
+
+| Language | Scalars | Table |
+| --- | --- | --- |
+| Python | literals | list of lists, or a `pandas.DataFrame` with `:colnames yes` |
+| R | literals | `matrix`, or `data.frame` with `:colnames yes` |
+| Julia | literals | `Matrix`; `DataFrame` only with `jsonyter-org-var-julia-dataframe` also set, since DataFrames.jl is not assumed to be loaded |
+| SAS | `%let` | `DATALINES`, for an all-numeric table only — a character field containing whitespace signals a clear error rather than risk silently corrupting it |
+
+A binding over `jsonyter-org-var-size-limit` characters (default
+100,000) signals a clear error instead of sending a huge execute
+payload; read the data from the kernel's filesystem instead.
+
+### `.ipynb` ↔ `.org` conversion
+
+`jsonyter-org-from-notebook` writes a `.ipynb` file out as `.org`: each
+code cell becomes a `jy:` block, each stored output a committed
+`#+RESULTS:` drawer (images included), and the kernelspec a buffer-wide
+`#+PROPERTY:` line, so the file runs as-is. `jsonyter-org-to-notebook` is
+the reverse; every cell keeps its nbformat id in a `:PROPERTIES:` drawer,
+so writing back merges onto the original file by id rather than
+regenerating it wholesale — an unedited round trip reproduces the
+original file, and a one-block edit becomes a one-cell diff, the same
+guarantee `jsonyter-notebook-save-with-outputs` already gives a notebook
+buffer.
+
+Markdown ↔ Org is the one lossy step: jsonyter shells out to `pandoc`
+when it is on `exec-path`, and otherwise inserts the text unchanged with
+a note saying so. Set `jsonyter-org-markdown-converter` to use something
+else.
 
 ## Extending jsonyter.el: `jsonyter-mode`
 
