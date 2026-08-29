@@ -129,6 +129,7 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-image-max-width` | `800` | Max pixel width for inline images. |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
 | `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
+| `jsonyter-suppress-line-spacing` | `t` | Drop `line-spacing` in REPL and notebook buffers, where its leading would band a sliced image. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
 | `jsonyter-insecure-tls` | `nil` | Skip TLS verification (self-signed remote servers). |
 | `jsonyter-shutdown-on-kill` | `t` | Shut the kernel down when the REPL buffer is killed. |
@@ -204,6 +205,19 @@ there is nothing there for scrolling to stop at. Script cells show tall
 images whole, and Emacs scrolls those by pixel. Set
 `jsonyter-slice-images` to nil to opt out everywhere, or
 `jsonyter-image-max-height` to shrink tall plots to fit instead.
+
+Slices tile only where each buffer line is exactly as tall as the slice
+on it, so a buffer showing them goes without `line-spacing`. Emacs draws
+that leading below a line holding an image slice just as readily as
+below a line of text, which turns a plot into strips of picture
+separated by bars of background — and nothing the text carries can
+prevent it, because the leading comes from the buffer rather than from
+the text. So `jsonyter-suppress-line-spacing` sets `line-spacing` to 0
+in REPL and notebook buffers, and only in those: the value is
+buffer-local, and every other buffer keeps the leading you configured.
+Set it to nil to keep yours here too, and images are inserted whole
+rather than banded, at the cost of scrolling through them a line at a
+time.
 
 ### Faces
 

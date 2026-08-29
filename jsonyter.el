@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.1.1
+;; Version: 2.1.2
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -96,6 +96,13 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'ansi-color)
+;; `create-image', `image-size', `insert-sliced-image' and the
+;; `image-property' place all live here.  A graphical Emacs has loaded
+;; it long before this file, but a batch or terminal one has not, and
+;; `(setf (image-property ...))' in particular needs it loaded before
+;; this file is read: without it `setf' finds no expander and compiles
+;; a call to a `(setf image-property)' function that does not exist.
+(require 'image)
 
 (declare-function shr-render-region "shr" (begin end &optional buffer))
 
@@ -229,12 +236,36 @@ brought fully into view.  Slicing it across as many lines as it is tall
 \(what `doc-view' does for page images) lets ordinary line scrolling walk
 through it like normal text.
 
+Slices tile only in a buffer that draws no leading between its lines,
+so a buffer showing them goes without `line-spacing'; see
+`jsonyter-suppress-line-spacing'.
+
 This applies wherever output is the buffer's own text: a REPL buffer,
 and a notebook cell, whose output is written into the buffer after its
 source.  A `# %%' script cell is the exception — its buffer's text is
 the file you save, so its output has to stay an overlay string, where
 slices would not be lines at all and images are inserted whole; see
 `jsonyter--string-output'."
+  :type 'boolean)
+
+(defcustom jsonyter-suppress-line-spacing t
+  "If non-nil, drop `line-spacing' in buffers that show sliced images.
+
+`line-spacing' adds leading below every display line, and Emacs adds it
+below a line showing an image slice too — so a sliced plot comes out
+banded, each strip of picture separated from the next by a bar of
+background as tall as the leading.  The `line-height' property
+`insert-sliced-image' puts on each row's newline does not prevent this:
+it cancels the leading for the newline, but the image glyph on the same
+row has already claimed it, and no text property can take it back.  The
+only thing that helps is for the buffer not to ask for leading at all.
+
+Only REPL and notebook buffers are touched, and only their own
+`line-spacing' is set — it is a buffer-local value, so every other
+buffer keeps whatever leading you have configured.  Set this to nil to
+keep yours here too: images are then inserted whole rather than banded,
+at the cost of the line-by-line scrolling `jsonyter-slice-images'
+describes."
   :type 'boolean)
 
 (defcustom jsonyter-render-html t
@@ -859,6 +890,68 @@ the right thing in a jsonyter notebook; see `jsonyter-mode'."
       (jsonyter-notebook-save-buffer)
     (save-buffer)))
 
+;;;; Line spacing
+
+;; A sliced image tiles only if each row of the buffer is exactly as
+;; tall as the slice it shows.  `line-spacing' breaks that: Emacs adds
+;; the leading below the image glyph as readily as below a character,
+;; so every slice ends up sitting on a bar of background and the plot
+;; is drawn through a set of blinds.  It cannot be fixed per line --
+;; the leading comes from the buffer (or the frame), not from anything
+;; the text carries — so a buffer that shows slices has to go without
+;; it.  See `jsonyter-suppress-line-spacing'.
+
+(defvar-local jsonyter--line-spacing-restore nil
+  "How to put `line-spacing' back when jsonyter stops managing it.
+Nil when jsonyter has not set it in this buffer; `kill' when the buffer
+had no `line-spacing' of its own before; otherwise a cons whose cdr is
+the value to put back.")
+
+(defun jsonyter--line-spacing ()
+  "Extra leading, in pixels, this buffer draws below every line.
+The buffer's own `line-spacing', else the global one, else the frame's
+parameter — the same order `default-line-height' consults, and the
+order Emacs itself resolves them in.  A float is a multiple of the
+frame's line height, as `line-spacing' documents.  Zero on a text
+terminal, which has no such thing."
+  (if (not (display-graphic-p))
+      0
+    (let ((spacing (or line-spacing
+                       (default-value 'line-spacing)
+                       (frame-parameter nil 'line-spacing)
+                       0)))
+      (max 0 (if (floatp spacing)
+                 (truncate (* (frame-char-height) spacing))
+               spacing)))))
+
+(defun jsonyter--suppress-line-spacing ()
+  "Take `line-spacing' out of this buffer so image slices tile.
+Does nothing unless there is leading to remove and something that would
+be spoiled by it; see `jsonyter-suppress-line-spacing'.
+
+The value set is 0 rather than nil deliberately: a buffer-local nil
+means \"no opinion\" and Emacs falls through to the frame's own
+`line-spacing' parameter, which would leave the bands in place on a
+frame that sets one."
+  (when (and jsonyter-suppress-line-spacing
+             jsonyter-slice-images
+             (not (zerop (jsonyter--line-spacing))))
+    (setq jsonyter--line-spacing-restore
+          (if (local-variable-p 'line-spacing)
+              (cons 'set line-spacing)
+            'kill))
+    (setq-local line-spacing 0)))
+
+(defun jsonyter--restore-line-spacing ()
+  "Undo `jsonyter--suppress-line-spacing' in this buffer.
+Leaves alone a `line-spacing' jsonyter never set, and puts back one the
+buffer had of its own rather than assuming it had none."
+  (pcase jsonyter--line-spacing-restore
+    ('nil nil)
+    ('kill (kill-local-variable 'line-spacing))
+    (`(set . ,value) (setq-local line-spacing value)))
+  (setq jsonyter--line-spacing-restore nil))
+
 ;;;; REPL buffer basics
 
 (defvar jsonyter-repl-mode-map
@@ -930,6 +1023,7 @@ just one, otherwise a count like `:2 kernels' with a `!' if any is busy."
   (setq-local jsonyter--output-end (make-marker))
   (set-marker-insertion-type jsonyter--output-end t)
   (setq-local scroll-conservatively 101)
+  (jsonyter--suppress-line-spacing)
   (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
   (add-hook 'completion-at-point-functions #'jsonyter-completion-at-point nil t)
   (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
@@ -1048,10 +1142,19 @@ LINE-HEIGHT is the pixel height of a line in the buffer that will show
 it.  Returns nil when slicing is off, when the output is bound for a
 script cell's overlay string rather than for buffer text, when there is
 no graphical display, or when the image's displayed size cannot be
-measured."
+measured.
+
+Also nil when the buffer still draws leading below each line: Emacs
+draws it below an image slice too, so slicing there would band the
+picture rather than tile it.  A REPL or notebook buffer has had that
+leading removed by `jsonyter--suppress-line-spacing' before any of this
+runs, so this only bites where the user has asked to keep it — and
+there a whole image, which has no seams to show, is the better of the
+two."
   (and jsonyter-slice-images
        (not jsonyter--string-output)
        (display-graphic-p)
+       (zerop (jsonyter--line-spacing))
        (ignore-errors
          (max 1 (round (/ (float (cdr (image-size image t))) line-height))))))
 
@@ -1062,6 +1165,9 @@ image's height is an exact multiple of LINE-HEIGHT every slice comes up
 short of the line it sits on, and the shortfall is drawn as a band of
 background — a stripe across the picture, once per slice.  Rounding the
 height to a whole number of lines removes the shortfall.
+
+That is one of the two ways slices come out banded; `line-spacing' is
+the other, and `jsonyter-suppress-line-spacing' deals with it.
 
 Both dimensions are pinned rather than just the height because
 `:max-width' and `:max-height' would otherwise still be free to shrink
@@ -2285,8 +2391,15 @@ With OVERLAY-STRING the renderer is told it is working for a string
 rather than for buffer text (see `jsonyter--string-output'), which is
 what keeps it from slicing images across lines that an overlay string
 does not have.  Only script cells pass it."
-  (let ((jsonyter--string-output overlay-string))
+  (let ((jsonyter--string-output overlay-string)
+        ;; Rendering happens over there but the text lands back here, so
+        ;; the scratch buffer is told what leading this one draws: a
+        ;; fresh buffer would report the global `line-spacing' and
+        ;; `jsonyter--image-rows' would judge slicing by a line grid
+        ;; that is not the one the slices end up on.
+        (spacing line-spacing))
     (with-temp-buffer
+      (setq-local line-spacing spacing)
       (setq-local jsonyter--clear-pending nil)
       (setq-local jsonyter--output-start (copy-marker (point-min)))
       (setq-local jsonyter--output-end (copy-marker (point-max) t))
@@ -3323,6 +3436,10 @@ font-lock, so undo and editing still see only the cell source.
         (setq-local jsonyter--output-end (make-marker))
         (set-marker-insertion-type jsonyter--output-end t)
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
+        ;; Cell output is buffer text, so a plot drawn into it is drawn
+        ;; on the buffer's own line grid; see
+        ;; `jsonyter--suppress-line-spacing'.
+        (jsonyter--suppress-line-spacing)
         ;; Cell output is buffer text, and the language's own font-lock
         ;; must not treat it as code; see `jsonyter--nb-fontify-region'.
         (setq-local font-lock-fontify-region-function
@@ -3334,6 +3451,7 @@ font-lock, so undo and editing still see only the cell source.
         (add-hook 'after-change-functions
                   #'jsonyter--nb-stale-after-change nil t)
         (jsonyter-mode 1))
+    (jsonyter--restore-line-spacing)
     (kill-local-variable 'font-lock-fontify-region-function)
     (kill-local-variable 'font-lock-unfontify-region-function)
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
