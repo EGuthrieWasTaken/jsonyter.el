@@ -31,15 +31,8 @@ env:
   # `:needs (:executable ...)' and `eh-scenario-setup-functions'.
   HARNESS_REF: 6e493035d198497f3afbc10265e5dc0f64c79e77
 
-  # emacs-harness is a *private* repository, and a workflow's default
-  # GITHUB_TOKEN is scoped to this repository alone -- same owner or not.
-  # So reading it needs a token of its own: a fine-grained PAT with
-  # Contents: read on EGuthrieWasTaken/emacs-harness, stored here as the
-  # repository secret HARNESS_TOKEN.
-  #
-  # If emacs-harness is ever made public, delete this and the preflight
-  # step in each job, and drop `token:` from the checkout -- the default
-  # token reads public repositories fine.
+  # The harness is a public repository, so the workflow's default
+  # GITHUB_TOKEN checks it out with nothing else to configure.
   HARNESS_REPO: EGuthrieWasTaken/emacs-harness
 
 jobs:
@@ -50,27 +43,12 @@ jobs:
       - name: Check out jsonyter.el
         uses: actions/checkout@v4
 
-      - name: Check for the harness token
-        # Fails here, with the reason, rather than fifty lines later as
-        # `could not read Username for https://github.com' -- which is
-        # what an unauthenticated clone of a private repository actually
-        # reports, and which names neither the repository nor the fix.
-        env:
-          HARNESS_TOKEN: ${{ secrets.HARNESS_TOKEN }}
-        run: |
-          if [ -z "$HARNESS_TOKEN" ]; then
-            echo "::error::${HARNESS_REPO} is private, and this workflow has no token that can read it."
-            echo "::error::Add a repository secret HARNESS_TOKEN (a fine-grained PAT with Contents: read on ${HARNESS_REPO}), or make that repository public and simplify this workflow per the comment in env:."
-            exit 1
-          fi
-
       - name: Check out emacs-harness
         uses: actions/checkout@v4
         with:
           repository: ${{ env.HARNESS_REPO }}
           ref: ${{ env.HARNESS_REF }}
           path: .harness
-          token: ${{ secrets.HARNESS_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -149,20 +127,6 @@ jobs:
           emacs -Q --batch -L . -l test/jsonyter-tests.el \
             -f ert-run-tests-batch-and-exit
 
-      - name: Check for the harness token
-        # Fails here, with the reason, rather than fifty lines later as
-        # `could not read Username for https://github.com' -- which is
-        # what an unauthenticated clone of a private repository actually
-        # reports, and which names neither the repository nor the fix.
-        env:
-          HARNESS_TOKEN: ${{ secrets.HARNESS_TOKEN }}
-        run: |
-          if [ -z "$HARNESS_TOKEN" ]; then
-            echo "::error::${HARNESS_REPO} is private, and this workflow has no token that can read it."
-            echo "::error::Add a repository secret HARNESS_TOKEN (a fine-grained PAT with Contents: read on ${HARNESS_REPO}), or make that repository public and simplify this workflow per the comment in env:."
-            exit 1
-          fi
-
       - name: Check out emacs-harness
         # Deliberately after the suite above: those 91 tests need none of
         # this, and a missing token should not hide their result.
@@ -171,7 +135,6 @@ jobs:
           repository: ${{ env.HARNESS_REPO }}
           ref: ${{ env.HARNESS_REF }}
           path: .harness
-          token: ${{ secrets.HARNESS_TOKEN }}
 
       - name: Harness scenarios, tier-1 assertions only
         # The same scenario files under plain batch ERT (emacs-harness

@@ -218,20 +218,11 @@ catches a broken scenario file in seconds rather than after an image
 build). `runs/` is uploaded on failure, so a red check comes with the
 screenshots and snapshots of the frame it failed in.
 
-The emacs-harness ref is pinned in the workflow's `HARNESS_REF`. Bump it
-on purpose, in its own commit — tracking `main` would let a change over
-there turn a pull request red here that touched none of it.
+emacs-harness is a public repository, so the workflow's default
+`GITHUB_TOKEN` checks it out with nothing else to configure — no secret,
+no setup step.
 
-**One-time setup: `HARNESS_TOKEN`.** emacs-harness is a private
-repository, and a workflow's default `GITHUB_TOKEN` is scoped to the
-repository it runs in — same owner or not. So CI needs a token of its
-own to check the harness out: a fine-grained PAT with `Contents: read`
-on `EGuthrieWasTaken/emacs-harness`, stored as the repository secret
-`HARNESS_TOKEN`. Without it both jobs fail a preflight step that says
-so, rather than dying later on `could not read Username for
-https://github.com`, which names neither the repository nor the fix.
-
-If emacs-harness is ever made public, this goes away: drop the
-preflight steps and the `token:` lines, and the default token reads it
-fine. Neither the container run nor `harness/run-batch.sh` needs any of
-this locally — you already have the checkout.
+Its ref is pinned to a commit in the workflow's `HARNESS_REF`, currently
+`6e49303`. Bump it on purpose, in its own commit: tracking `main` would
+let a change over there turn a pull request red here that touched none
+of it, and the person left debugging that is the one least equipped to.
