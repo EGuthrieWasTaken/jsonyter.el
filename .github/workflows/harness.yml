@@ -67,14 +67,23 @@ jobs:
         # Only the notebook-save scenarios need it: a save is written by
         # the bridge's own `write_notebook', so the file it produces
         # cannot come from a fixture. They skip without this layer.
-        uses: docker/build-push-action@v6
-        with:
-          context: harness
-          tags: jsonyter-harness:ci
-          load: true
-          build-args: BASE=emacs-harness:ci
-          cache-from: type=gha,scope=jsonyter-harness
-          cache-to: type=gha,scope=jsonyter-harness,mode=max
+        #
+        # Plain `docker build', not docker/build-push-action, and that is
+        # load-bearing. The action drives buildx with the docker-container
+        # driver, which keeps its own image store: `emacs-harness:ci' from
+        # the step above exists in the *daemon* (that is what `load: true'
+        # means) and is invisible to it, so `FROM emacs-harness:ci' gets
+        # resolved against Docker Hub and fails with "pull access denied,
+        # repository does not exist". The default builder reads the
+        # daemon's store, which is where the base image actually is.
+        #
+        # The GHA layer cache goes with it, and that is a fair trade: this
+        # layer is one apt-get and one pip install, while the image it
+        # builds on -- the expensive one -- keeps its cache above.
+        run: |
+          docker build -t jsonyter-harness:ci \
+            --build-arg BASE=emacs-harness:ci \
+            harness
 
       - name: eh doctor
         # Always first after a fresh image build: it reports what the
