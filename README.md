@@ -35,33 +35,89 @@ also runs through standard Org Babel: `C-c C-c`, export and
 
 ## Setup
 
-Pick whichever matches your package manager.
+### Install from a release (recommended)
 
-**[straight.el](https://github.com/radian-software/straight.el):**
+**Current stable release: `v1.3.0`.** The `v2.x` tags are published as
+GitHub *pre-releases* — the 2.x line isn't fully operational yet — so pin
+to `v1.3.0` unless you're specifically helping test 2.x.
+
+Each release is a Git tag `vX.Y.Z`. Pinning to one keeps an upstream
+change from breaking your setup between updates.
+
+**Manual:** grab the single file at the tag and put it on your
+`load-path`:
+
+```bash
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v1.3.0/jsonyter.el
+```
+
+```elisp
+(add-to-list 'load-path "/path/to/jsonyter")  ; the directory holding jsonyter.el
+(require 'jsonyter)  ; or autoload the jsonyter-start-* commands
+```
+
+Releases from `v2.x` onward also attach `jsonyter.el` directly on the
+[Releases page](https://github.com/EGuthrieWasTaken/jsonyter.el/releases).
+
+**`package-vc-install`** (built into Emacs 29+, no third-party manager):
+
+```elisp
+(package-vc-install
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v1.3.0"))
+```
+
+**[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
+tag with `:ref`:
+
+```elisp
+(use-package jsonyter
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v1.3.0"))
+```
+
+**[straight.el](https://github.com/radian-software/straight.el):** install
+the recipe below, then lock it to the checked-out revision with
+`M-x straight-freeze-versions`, which records it in your lockfile:
 
 ```elisp
 (straight-use-package
  '(jsonyter :type git :host github :repo "EGuthrieWasTaken/jsonyter.el"))
 ```
 
-**[elpaca](https://github.com/progfolio/elpaca):**
+**package.el, once on MELPA:** the package will build from release tags on
+[MELPA Stable](https://stable.melpa.org):
+
+```elisp
+(use-package jsonyter
+  :ensure t
+  :pin melpa-stable)
+```
+
+### Bleeding edge (from the repo)
+
+Cloning the repository — or tracking it through a package manager without
+pinning a tag — installs whatever is on `main`. That is where unreleased
+work lands: it may be unstable, may change from commit to commit, and may
+break in ways a release won't. Use it only if you want the newest
+features or are helping test them.
+
+**straight.el:**
+
+```elisp
+(straight-use-package
+ '(jsonyter :type git :host github :repo "EGuthrieWasTaken/jsonyter.el"))
+```
+
+**elpaca:**
 
 ```elisp
 (use-package jsonyter
   :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el"))
 ```
 
-**package.el / use-package, once on MELPA:**
-
-```elisp
-(use-package jsonyter
-  :ensure t)
-```
-
 **Manual:**
 
 ```elisp
-(add-to-list 'load-path "/path/to/jsonyter.el")
+(add-to-list 'load-path "/path/to/jsonyter.el")  ; your clone
 (require 'jsonyter)  ; or autoload the jsonyter-start-* commands
 ```
 
