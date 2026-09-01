@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref_name }}
+
+      - name: ";; Version: header must match the tag"
+        run: |
+          tag="${{ github.event.release.tag_name || github.ref_name }}"
+          expected="${tag#v}"
+          found="$(sed -n 's/^;;[[:space:]]*Version:[[:space:]]*//p' jsonyter.el | head -n1 | tr -d '[:space:]')"
+          echo "tag $tag -> expected version '$expected'"
+          echo "jsonyter.el header version: '${found:-<none>}'"
+          if [ "$found" != "$expected" ]; then
+            echo "::error file=jsonyter.el::';; Version:' header ('${found:-<none>}') does not match release tag '$tag' (expected '$expected'). Bump the header in lockstep with the tag."
+            exit 1
+          fi
+
+  attach-asset:
+    needs: verify-version
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Attach jsonyter.el to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload "${{ github.event.release.tag_name }}" jsonyter.el
+          --clobber --repo "${{ github.repository }}"
