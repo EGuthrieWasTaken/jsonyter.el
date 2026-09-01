@@ -1,0 +1,130 @@
+name: harness
+
+# Runs jsonyter.el's scenarios inside a real graphical Emacs, in the
+# emacs-harness container: a frame on an X server, images that actually
+# decode, key bindings driven through the command loop.  The batch ERT
+# suite in test/ answers "is the logic right"; this answers "does it
+# render", which is the half a headless `emacs -Q --batch' cannot see.
+#
+# Almost every scenario runs against `eh-fake-bridge', a scripted stand-in
+# for the jsonyter Python bridge, so no Jupyter server is involved and
+# nothing here reaches the network at run time.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: harness-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned deliberately. Tracking the harness's main branch would let a
+  # change over there turn a pull request red here that touched none of
+  # it -- a failure that teaches nothing and blocks the wrong person.
+  # Bump this on purpose, in its own commit.
+  HARNESS_REF: main
+
+jobs:
+  scenarios:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out jsonyter.el
+        uses: actions/checkout@v4
+
+      - name: Check out emacs-harness
+        uses: actions/checkout@v4
+        with:
+          repository: EGuthrieWasTaken/emacs-harness
+          ref: ${{ env.HARNESS_REF }}
+          path: .harness
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the harness image
+        uses: docker/build-push-action@v6
+        with:
+          context: .harness
+          file: .harness/container/Dockerfile
+          tags: emacs-harness:ci
+          load: true
+          cache-from: type=gha,scope=emacs-harness
+          cache-to: type=gha,scope=emacs-harness,mode=max
+
+      - name: Add the real jsonyter bridge
+        # Only the notebook-save scenarios need it: a save is written by
+        # the bridge's own `write_notebook', so the file it produces
+        # cannot come from a fixture. They skip without this layer.
+        uses: docker/build-push-action@v6
+        with:
+          context: harness
+          tags: jsonyter-harness:ci
+          load: true
+          build-args: BASE=emacs-harness:ci
+          cache-from: type=gha,scope=jsonyter-harness
+          cache-to: type=gha,scope=jsonyter-harness,mode=max
+
+      - name: eh doctor
+        # Always first after a fresh image build: it reports what the
+        # session can actually do (cairo, image types, fonts), so a wave
+        # of skips later reads as "this image lacks X" rather than as a
+        # mystery.
+        run: |
+          mkdir -p runs
+          docker run --rm --shm-size=1gb \
+            -v "$PWD/runs:/var/lib/eh/runs" \
+            jsonyter-harness:ci doctor
+
+      - name: Run the jsonyter profile
+        run: |
+          docker run --rm --shm-size=1gb \
+            -v "$PWD:/srv/package:ro" \
+            -v "$PWD/harness/profile:/srv/profiles/jsonyter:ro" \
+            -v "$PWD/runs:/var/lib/eh/runs" \
+            jsonyter-harness:ci run jsonyter
+
+      - name: Upload run artifacts
+        # Every scenario failure writes screenshots, buffer snapshots,
+        # *Messages*, the bridge's stderr and a backtrace under
+        # runs/<id>/<scenario>/. Without this a CI failure is a one-line
+        # assertion message; with it, it is the frame it happened in.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-runs
+          path: runs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  batch:
+    # The existing headless suite, kept in the same workflow so one check
+    # covers both halves. Fast, and it needs no container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emacs and the jsonyter bridge
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends emacs-nox
+          pip install "jsonyter==1.0.0"
+
+      - name: test/jsonyter-tests.el
+        run: |
+          emacs -Q --batch -L . -l test/jsonyter-tests.el \
+            -f ert-run-tests-batch-and-exit
+
+      - name: Harness scenarios, tier-1 assertions only
+        # The same scenario files under plain batch ERT (emacs-harness
+        # DESIGN 8.1). Everything graphical skips here -- that is what
+        # the container job above is for -- but it catches a broken
+        # scenario file in seconds rather than after an image build.
+        run: |
+          git clone --depth 1 --branch "${HARNESS_REF}" \
+            https://github.com/EGuthrieWasTaken/emacs-harness .harness
+          harness/run-batch.sh --harness .harness

@@ -1,0 +1,75 @@
+# python.jsonl -- the everyday execute rules.  Keyed off the fixture
+# sources in ../fixtures, so the same code runs the same way whether it
+# arrives from the REPL, a notebook cell, a `# %%' cell or a jy: block.
+
+# stdout, streamed and then repeated in the combined reply -- what a real
+# bridge does, and the reconciliation jsonyter has to get right.
+{"on": {"method": "execute", "code": "~^print\\(\"first cell\"\\)~"},
+ "emit": [{"after_ms":  0, "event": {"type": "status", "execution_state": "busy"},
+           "kernel_id": "kernel-python-0001"},
+          {"after_ms": 10, "output": {"type": "stream", "name": "stdout",
+                                      "text": "first cell\n"}},
+          {"after_ms": 30, "event": {"type": "status", "execution_state": "idle"},
+           "kernel_id": "kernel-python-0001"}],
+ "reply": {"status": "ok", "execution_count": 1,
+           "outputs": "<repeat-all-emitted>"}}
+
+{"on": {"method": "execute", "code": "~^print\\(greeting\\)~"},
+ "emit": [{"after_ms": 10, "output": {"type": "stream", "name": "stdout",
+                                      "text": "hello from a stored output\n"}}],
+ "reply": {"status": "ok", "execution_count": 1, "outputs": "<repeat-all-emitted>"}}
+
+# An execute_result -- the `Out[N]:' path, which is not the stream path.
+{"on": {"method": "execute", "code": "~^6 \\* 7~"},
+ "emit": [{"after_ms": 10, "output": {"type": "execute_result", "execution_count": 2,
+                                      "data": {"text/plain": "42"}}}],
+ "reply": {"status": "ok", "execution_count": 2, "outputs": "<repeat-all-emitted>"}}
+
+# A real PNG, base64'd from the fixture on disk.  Nothing about this
+# assertion is meaningful against a placeholder: the point is that the
+# bytes decode and rasterise.
+{"on": {"method": "execute", "code": "~plot_something~"},
+ "emit": [{"after_ms": 10,
+           "output": {"type": "display_data",
+                      "data": {"image/png": {"$file": "../fixtures/tall-plot.png"},
+                               "text/plain": "<Figure size 300x500>"}}}],
+ "reply": {"status": "ok", "execution_count": 3, "outputs": "<repeat-all-emitted>"}}
+
+{"on": {"method": "execute", "code": "~small_plot~"},
+ "emit": [{"after_ms": 10,
+           "output": {"type": "display_data",
+                      "data": {"image/png": {"$file": "../fixtures/plot.png"},
+                               "text/plain": "<Figure size 120x90>"}}}],
+ "reply": {"status": "ok", "execution_count": 4, "outputs": "<repeat-all-emitted>"}}
+
+# text/html, for the shr path.
+{"on": {"method": "execute", "code": "~as_html~"},
+ "emit": [{"after_ms": 10,
+           "output": {"type": "display_data",
+                      "data": {"text/html": "<table><tr><th>n</th></tr><tr><td>42</td></tr></table>",
+                               "text/plain": "   n\n0 42"}}}],
+ "reply": {"status": "ok", "execution_count": 5, "outputs": "<repeat-all-emitted>"}}
+
+# A traceback, with the ANSI escapes a real kernel actually sends.
+{"on": {"method": "execute", "code": "~raise ValueError~"},
+ "emit": [{"after_ms": 10,
+           "output": {"type": "error", "ename": "ValueError", "evalue": "boom",
+                      "traceback": ["\u001b[0;31m---------------------------------------------------------------------------\u001b[0m",
+                                    "\u001b[0;31mValueError\u001b[0m                                Traceback (most recent call last)",
+                                    "Cell \u001b[0;32mIn[1], line 1\u001b[0m",
+                                    "\u001b[0;31mValueError\u001b[0m: boom"]}}],
+ "reply": {"status": "error", "execution_count": 6, "outputs": "<repeat-all-emitted>"}}
+
+# stderr, which is faced differently from stdout.
+{"on": {"method": "execute", "code": "~warn_about_something~"},
+ "emit": [{"after_ms": 10, "output": {"type": "stream", "name": "stderr",
+                                      "text": "UserWarning: careful\n"}}],
+ "reply": {"status": "ok", "execution_count": 7, "outputs": "<repeat-all-emitted>"}}
+
+{"on": {"method": "execute", "code": "~ordinary org babel~"},
+ "emit": [{"after_ms": 10, "output": {"type": "stream", "name": "stdout",
+                                      "text": "ordinary org babel\n"}}],
+ "reply": {"status": "ok", "execution_count": 8, "outputs": "<repeat-all-emitted>"}}
+
+{"on": {"method": "execute", "code": "~^x = 1~"},
+ "reply": {"status": "ok", "execution_count": 9, "outputs": []}}

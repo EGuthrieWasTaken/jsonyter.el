@@ -1,0 +1,7 @@
+# dying-kernel.jsonl -- kernel states that arrive unsolicited, with no
+# request of ours in flight to hang them off.  Killing a real kernel to
+# produce these is racy and destroys the session under test.
+
+# The kernel dies 400ms in, of something that has nothing to do with us.
+{"at": "t+400", "inject": {"event": {"type": "dead", "restart": false},
+                           "kernel_id": "kernel-python-0001"}}

@@ -1,0 +1,64 @@
+# base.jsonl -- the connection lifecycle every jsonyter buffer walks
+# through before it can run anything.  Load this first and layer a
+# behaviour script (python.jsonl, streaming.jsonl, ...) after it: rules
+# are matched in file order, so anything a later script scripts more
+# specifically still has to appear *before* base's catch-alls, which is
+# why the catch-alls live in catch-all.jsonl instead of here.
+
+# Kernel spec resolution.  Two specs, so `jsonyter--resolve-kernel-name'
+# is exercised for real (match on declared language, prefer the server
+# default) rather than trivially finding the only entry.
+{"on": {"method": "list_kernelspecs"},
+ "reply": {"default": "python3",
+           "kernelspecs": {
+             "python3": {"name": "python3",
+                         "spec": {"language": "python", "display_name": "Python 3"}},
+             "ir":      {"name": "ir",
+                         "spec": {"language": "R", "display_name": "R"}}}}}
+
+# Starting a kernel.  The id is fixed, not generated: every assertion
+# about which session an event routed to is an assertion about this id.
+{"on": {"method": "start_kernel", "name": "python3"},
+ "delay_ms": 20,
+ "reply": {"id": "kernel-python-0001", "name": "python3", "execution_state": "idle"}}
+
+{"on": {"method": "start_kernel", "name": "ir"},
+ "delay_ms": 20,
+ "reply": {"id": "kernel-r-0001", "name": "ir", "execution_state": "idle"}}
+
+{"on": {"method": "subscribe"}, "reply": {"execution_state": "idle"}}
+
+{"on": {"method": "list_kernels"},
+ "reply": [{"id": "kernel-python-0001", "name": "python3",
+            "execution_state": "idle", "connections": 1}]}
+
+{"on": {"method": "get_kernel"},
+ "reply": {"id": "kernel-python-0001", "name": "python3",
+           "execution_state": "idle", "connections": 1}}
+
+# Input completeness.  Python's own rule, near enough for a fixture: a
+# line ending in a colon, or a continuation, wants more.
+{"on": {"method": "is_complete", "code": "~:\\s*\\n\\s*$~"},
+ "reply": {"status": "incomplete", "indent": "    "}}
+{"on": {"method": "is_complete"}, "reply": {"status": "complete"}}
+
+{"on": {"method": "complete", "code": "~pri~"},
+ "reply": {"status": "ok", "matches": ["print", "printf", "prio"],
+           "cursor_start": 0, "cursor_end": 3}}
+{"on": {"method": "complete"},
+ "reply": {"status": "ok", "matches": [], "cursor_start": 0, "cursor_end": 0}}
+
+{"on": {"method": "inspect", "code": "~print~"},
+ "reply": {"status": "ok", "found": true,
+           "data": {"text/plain": "print(*values, sep=' ', end='\\n')\n\nPrints the values to a stream."}}}
+{"on": {"method": "inspect"}, "reply": {"status": "ok", "found": false, "data": {}}}
+
+{"on": {"method": "history"},
+ "reply": {"history": [[1, 1, "print(\"first cell\")"], [1, 2, "6 * 7"]]}}
+
+{"on": {"method": "interrupt_kernel"}, "reply": {"status": "ok"}}
+{"on": {"method": "restart_kernel"},
+ "delay_ms": 20,
+ "reply": {"id": "kernel-python-0001", "name": "python3", "execution_state": "idle"}}
+{"on": {"method": "shutdown_kernel"}, "reply": {"status": "ok"}}
+{"on": {"method": "disconnect"}, "reply": {"status": "ok"}}

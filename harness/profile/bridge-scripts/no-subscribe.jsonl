@@ -1,0 +1,5 @@
+# no-subscribe.jsonl -- an older bridge with no `subscribe' method.
+# jsonyter's contract is that the REPL still works and only the mode
+# line goes quiet; the way to prove that is a backend that refuses it.
+{"on": {"method": "subscribe"},
+ "error": {"message": "unknown method: subscribe", "status": 400}}

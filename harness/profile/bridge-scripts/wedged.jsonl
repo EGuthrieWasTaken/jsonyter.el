@@ -1,0 +1,11 @@
+# wedged.jsonl -- a backend that accepts a request and never answers it.
+#
+# Not hypothetical, and jsonyter's own source calls it out: the SAS
+# kernel never answers `history' at all, and the bridge serializes per
+# kernel, so one unanswered message can queue every later execute behind
+# it and leave the REPL looking hung at "kernel is busy".  A real
+# backend cannot be asked to do this on cue.
+
+{"on": {"method": "history"}, "never_reply": true}
+{"on": {"method": "inspect"}, "never_reply": true}
+{"on": {"method": "is_complete"}, "never_reply": true}

@@ -1,0 +1,10 @@
+# unauthorized.jsonl -- a token-protected server answering an
+# unauthenticated request.  Confirmed empirically in jsonyter's own
+# source: the server returns a bare "Forbidden" and nothing else, which
+# is why `jsonyter--error-message' appends the hint that names the fix.
+{"on": {"method": "list_kernelspecs"},
+ "error": {"message": "Forbidden", "status": 403,
+           "url": "http://127.0.0.1:8888"}}
+{"on": {"method": "start_kernel"},
+ "error": {"message": "Forbidden", "status": 403,
+           "url": "http://127.0.0.1:8888"}}
