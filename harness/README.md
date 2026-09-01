@@ -221,3 +221,17 @@ screenshots and snapshots of the frame it failed in.
 The emacs-harness ref is pinned in the workflow's `HARNESS_REF`. Bump it
 on purpose, in its own commit — tracking `main` would let a change over
 there turn a pull request red here that touched none of it.
+
+**One-time setup: `HARNESS_TOKEN`.** emacs-harness is a private
+repository, and a workflow's default `GITHUB_TOKEN` is scoped to the
+repository it runs in — same owner or not. So CI needs a token of its
+own to check the harness out: a fine-grained PAT with `Contents: read`
+on `EGuthrieWasTaken/emacs-harness`, stored as the repository secret
+`HARNESS_TOKEN`. Without it both jobs fail a preflight step that says
+so, rather than dying later on `could not read Username for
+https://github.com`, which names neither the repository nor the fix.
+
+If emacs-harness is ever made public, this goes away: drop the
+preflight steps and the `token:` lines, and the default token reads it
+fine. Neither the container run nor `harness/run-batch.sh` needs any of
+this locally — you already have the checkout.
