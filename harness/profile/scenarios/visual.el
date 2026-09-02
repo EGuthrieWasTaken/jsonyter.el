@@ -27,7 +27,11 @@
   (let* ((region (jy-cell-output-region 3))
          (positions (jy-image-positions (nth 0 region) (nth 1 region))))
     (eh-expect positions "the plot cell's output must carry an image")
-    (eh-expect-display-image (car positions) :type 'png :min-width 300)))
+    (eh-expect-display-image (car positions) :type 'png)
+    ;; tall-plot.png is 300x500. Not asserted as an exact width -- see
+    ;; `jy-expect-decoded-image' for why that would test the font rather
+    ;; than the package.
+    (jy-expect-decoded-image (car positions) 300 500)))
 
 (eh-scenario jsonyter/notebook-image-is-sliced-into-drawable-rows
   :doc "A tall image is inserted sliced, one buffer row per slice, so a
@@ -89,7 +93,9 @@
 
   (let ((positions (jy-image-positions)))
     (eh-expect positions "the REPL must show a decoded image")
-    (eh-expect-display-image (car positions) :type 'png :min-width 120))
+    (eh-expect-display-image (car positions) :type 'png)
+    ;; plot.png is 120x90.
+    (jy-expect-decoded-image (car positions) 120 90))
 
   (eh-expect-no-error
    (eh-shot-to-file (expand-file-name

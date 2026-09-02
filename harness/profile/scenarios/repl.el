@@ -56,10 +56,7 @@
   (eh-wait (lambda () (string-match-p "Out\\[2\\]: 42" (buffer-string))) 20)
   (jy-wait-idle)
 
-  (save-excursion
-    (goto-char (point-min))
-    (search-forward "Out[2]:")
-    (eh-expect-face (match-beginning 0) 'jsonyter-output-prompt-face)))
+  (jy-expect-faced-text "Out[2]:" 'jsonyter-output-prompt-face))
 
 (eh-scenario jsonyter/repl-shows-output-while-the-kernel-is-still-busy
   :doc "The claim is that a long-running cell shows its print output
@@ -122,10 +119,17 @@
   (eh-wait (lambda () (string-match-p "UserWarning" (buffer-string))) 20)
   (jy-wait-idle)
 
+  (jy-expect-faced-text "UserWarning" 'jsonyter-stderr-face)
+
+  ;; The other half of "differently": the stdout the same REPL rendered
+  ;; earlier must *not* carry the stderr face. Asserting only that stderr
+  ;; is faced would pass just as well if everything were.
   (save-excursion
     (goto-char (point-min))
-    (search-forward "UserWarning")
-    (eh-expect-face (match-beginning 0) 'jsonyter-stderr-face)))
+    (search-forward "Jupyter REPL")
+    (eh-expect (not (eq (get-char-property (match-beginning 0) 'face)
+                        'jsonyter-stderr-face))
+               "ordinary REPL text must not carry the stderr face")))
 
 (eh-scenario jsonyter/repl-renders-a-traceback
   :doc "An error output arrives as a list of traceback lines carrying raw

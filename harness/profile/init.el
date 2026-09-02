@@ -226,3 +226,76 @@ and fails in CI."
           (push pos positions)))
       (setq pos (1+ pos)))
     (nreverse positions)))
+
+;;;; Assertion helpers that survive a different Emacs build
+;;
+;; Both of these exist because the first real container run (Emacs 28.2)
+;; failed four assertions that pass on 29.3.  Neither was a jsonyter bug;
+;; both were assertions of mine that had quietly encoded properties of
+;; the *build* rather than of the package.
+
+(defun jy-expect-decoded-image (pos natural-width natural-height)
+  "Assert POS shows a decoded image of the fixture NATURAL-WIDTH x NATURAL-HEIGHT.
+
+Deliberately not an exact pixel-size assertion.  `jsonyter--fit-image-to-lines'
+rescales a sliced image so its height is a whole number of text lines --
+which is precisely what makes slices tile instead of band -- so the
+displayed width is a function of the frame's line height, not of the
+fixture.  A 300x500 fixture comes out 296px wide at a 17px line height,
+302px at 18px, and 298px at 16px.  Asserting the natural width therefore
+tests the font, and passes or fails depending on which Emacs build ran it.
+
+What is invariant, and what actually separates a decoded image from a
+placeholder box or the wrong file: it has a real pixel size, in the
+neighbourhood of the fixture's, with the aspect ratio preserved."
+  (let* ((display (get-char-property pos 'display))
+         (spec (cond
+                ((and (consp display) (consp (car display)) (eq (caar display) 'slice))
+                 (cadr display))
+                ((and (consp display) (eq (car display) 'image)) display)))
+         (size (and spec (ignore-errors (image-size spec t)))))
+    (eh-expect spec (format "no image display property at %d" pos))
+    (eh-expect size "the image has no measurable size -- it did not decode")
+    (let* ((width (float (car size)))
+           (height (float (cdr size)))
+           (natural-aspect (/ (float natural-width) natural-height))
+           (aspect (/ width height)))
+      (eh-expect (and (> width 0) (> height 0))
+                 (format "image decoded to a zero dimension: %sx%s" width height))
+      (eh-expect (< (abs (- aspect natural-aspect)) (* 0.02 natural-aspect))
+                 (format "aspect ratio %.4f is not the fixture's %.4f -- wrong image?"
+                         aspect natural-aspect))
+      ;; Generous, and on purpose: fitting to whole lines can shrink or
+      ;; grow the image by up to half a line per axis. The bound is here
+      ;; to catch a placeholder or the wrong fixture, not to pin pixels.
+      (eh-expect (> width (* 0.7 natural-width))
+                 (format "image is %spx wide, far below the fixture's %d -- placeholder?"
+                         width natural-width)))))
+
+(defun jy-expect-faced-text (text face)
+  "Assert every character of the first match for TEXT carries FACE.
+
+Stronger than checking the first character alone, and self-diagnosing:
+on failure it reports the properties actually present, because \"got
+nil\" on one Emacs build and a pass on another is exactly the kind of
+result a bare assertion cannot explain."
+  (save-excursion
+    (goto-char (point-min))
+    (unless (search-forward text nil t)
+      (ert-fail (format "%S never appears in the buffer" text)))
+    (let ((beg (match-beginning 0))
+          (end (match-end 0))
+          (unfaced '()))
+      (dolist (pos (number-sequence beg (1- end)))
+        (let ((resolved (get-char-property pos 'face)))
+          (unless (or (eq resolved face)
+                      (and (listp resolved) (memq face resolved)))
+            (push pos unfaced))))
+      (when unfaced
+        (setq unfaced (nreverse unfaced))
+        (ert-fail
+         (format "%S is not faced %s at %d of %d positions; properties: %s"
+                 text face (length unfaced) (- end beg)
+                 (mapconcat (lambda (pos)
+                              (format "%d=%S" pos (text-properties-at pos)))
+                            (seq-take unfaced 4) " ")))))))
