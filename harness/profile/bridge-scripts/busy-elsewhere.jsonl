@@ -1,0 +1,6 @@
+# busy-elsewhere.jsonl -- the kernel is busy on behalf of *another*
+# client.  jsonyter distinguishes that (`:run[ext]') from our own
+# request running (`:run'), and staging it for real needs a second
+# client attached at exactly the right moment.
+{"at": "t+300", "inject": {"event": {"type": "status", "execution_state": "busy"},
+                           "kernel_id": "kernel-python-0001"}}

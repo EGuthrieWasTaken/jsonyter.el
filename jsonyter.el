@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.1.2
+;; Version: 2.1.4
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -1024,6 +1024,26 @@ just one, otherwise a count like `:2 kernels' with a `!' if any is busy."
   (set-marker-insertion-type jsonyter--output-end t)
   (setq-local scroll-conservatively 101)
   (jsonyter--suppress-line-spacing)
+  ;; A REPL buffer is entirely output and frozen input -- there is no
+  ;; source here for font-lock to highlight, and `font-lock-defaults' is
+  ;; nil accordingly.  But `global-font-lock-mode' still switches
+  ;; `font-lock-mode' on, and `font-lock-default-unfontify-region' strips
+  ;; the `face' text property wherever it runs.  Every colour in this
+  ;; buffer -- the `Out[N]:' prompts, stderr, resolved ANSI escapes, the
+  ;; bracketed notes -- is a hand-applied `face' property, so the only
+  ;; thing font-lock can accomplish here is erasing all of it the first
+  ;; time redisplay drives jit-lock over the region.
+  ;;
+  ;; Invisible to a batch test, which never redisplays and so never
+  ;; fontifies; found by running the suite in a real frame.
+  ;; `jsonyter-notebook-mode' already defends cell output this way in
+  ;; both directions (`jsonyter--nb-fontify-region' and
+  ;; `jsonyter--nb-unfontify-region'); the REPL needs the same and had
+  ;; nothing.  Overriding the functions rather than turning the mode off
+  ;; because `global-font-lock-mode' re-enables it from
+  ;; `after-change-major-mode-hook', i.e. after this body has run.
+  (setq-local font-lock-fontify-region-function #'ignore)
+  (setq-local font-lock-unfontify-region-function #'ignore)
   (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
   (add-hook 'completion-at-point-functions #'jsonyter-completion-at-point nil t)
   (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
@@ -3649,7 +3669,13 @@ With ADVANCE, move to the next cell afterwards."
   "Move to the previous script cell."
   (interactive)
   (goto-char (car (jsonyter--script-cell-bounds)))
+  ;; Step back over this cell's own `# %%' marker line, not merely onto
+  ;; it.  `jsonyter--script-cell-bounds' called from a marker line
+  ;; resolves to the cell that marker introduces -- the one point is
+  ;; already in -- so stopping there left point exactly where it started
+  ;; and this command never moved at all, from anywhere in the buffer.
   (forward-line -1)
+  (unless (bobp) (forward-line -1))
   (goto-char (car (jsonyter--script-cell-bounds))))
 
 (defun jsonyter-script-clear-all-output ()

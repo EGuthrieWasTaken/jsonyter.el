@@ -798,3 +798,37 @@ obsolete aliases for one release.
 Streaming and the final reply are reconciled by count: the bridge repeats
 every streamed output in the final `outputs` list, so jsonyter.el renders
 only the tail past what it already drew.
+
+## Tests
+
+Two suites, covering different halves of the package.
+
+```bash
+# the headless one: logic, parsing, cell bookkeeping, save round trips
+emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
+```
+
+That runs 91 tests under `emacs -Q --batch`, where there is no frame, no
+X server and no redisplay — so it structurally cannot see whether a
+base64 PNG in a mimebundle actually decodes, whether a tall figure
+becomes drawable rows or one blob, or whether `C-RET` is bound to what
+you think it is.
+
+[`harness/`](harness/) is the other half: 45 scenarios that run in a
+**real graphical Emacs on an X server in a container**, driven through
+the actual command loop, using
+[emacs-harness](https://github.com/EGuthrieWasTaken/emacs-harness).
+Almost all of them run against a scripted stand-in for the `jsonyter`
+Python bridge, which is what makes a dead kernel, a half-open
+connection, a request that is never answered, or a backend chattering on
+stderr something a test can ask for by name.
+
+```bash
+git clone https://github.com/EGuthrieWasTaken/emacs-harness ../emacs-harness
+harness/run.sh --build      # the real thing, in the container
+harness/run-batch.sh        # the same scenarios headlessly, as a fast loop
+```
+
+Both run on every pull request (`.github/workflows/harness.yml`). See
+[`harness/README.md`](harness/README.md) for what is covered, how to
+drive a live session by hand, and how to add a scenario.

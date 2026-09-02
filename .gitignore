@@ -358,3 +358,6 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/python,R,julia,SAS,windows,macos,linux,jupyternotebooks
+
+# emacs-harness run artifacts (harness/run.sh)
+runs/

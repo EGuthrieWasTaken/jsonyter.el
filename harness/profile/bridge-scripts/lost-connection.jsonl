@@ -1,0 +1,7 @@
+# lost-connection.jsonl -- the half-open socket a sleeping laptop
+# produces: the kernel is fine, the connection to it is not.  jsonyter
+# reports this as `:offline' rather than `:dead' because it can come
+# back, and reconnecting is a real command a user reaches for.
+{"at": "t+400", "inject": {"event": {"type": "disconnected",
+                                     "message": "websocket closed"},
+                           "kernel_id": "kernel-python-0001"}}

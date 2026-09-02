@@ -1,0 +1,49 @@
+# streaming.jsonl -- output that arrives over time.  Layer *before*
+# python.jsonl so these more specific rules win.
+
+# A slow cell: output appears while the kernel is still busy, which is
+# the claim "long-running cells show their print output live" and the
+# only way to catch a REPL that renders nothing until the final reply.
+{"on": {"method": "execute", "code": "~slow_loop~"},
+ "emit": [{"after_ms":   0, "event": {"type": "status", "execution_state": "busy"},
+           "kernel_id": "kernel-python-0001"},
+          {"after_ms":  50, "output": {"type": "stream", "name": "stdout", "text": "step 1\n"}},
+          {"after_ms": 250, "output": {"type": "stream", "name": "stdout", "text": "step 2\n"}},
+          {"after_ms": 450, "output": {"type": "stream", "name": "stdout", "text": "step 3\n"}},
+          {"after_ms": 500, "event": {"type": "status", "execution_state": "idle"},
+           "kernel_id": "kernel-python-0001"}],
+ "reply": {"status": "ok", "execution_count": 10, "outputs": "<repeat-all-emitted>"}}
+
+# A progress bar: clear_output with wait=true, then the replacement.
+# That is what makes a bar redraw in place instead of flickering, and
+# getting the deferred clear wrong is invisible in any non-graphical test.
+{"on": {"method": "execute", "code": "~progress_bar~"},
+ "emit": [{"after_ms":   0, "output": {"type": "stream", "name": "stdout", "text": "[#         ] 10%\n"}},
+          {"after_ms":  60, "output": {"type": "clear_output", "wait": true}},
+          {"after_ms":  70, "output": {"type": "stream", "name": "stdout", "text": "[#####     ] 50%\n"}},
+          {"after_ms": 130, "output": {"type": "clear_output", "wait": true}},
+          {"after_ms": 140, "output": {"type": "stream", "name": "stdout", "text": "[##########] 100%\n"}}],
+ "reply": {"status": "ok", "execution_count": 11,
+           "outputs": [{"type": "stream", "name": "stdout", "text": "[##########] 100%\n"}]}}
+
+# A cell that asks for stdin.  `input()' mid-execute is a state a real
+# kernel only reaches when a human is sitting there to answer.
+{"on": {"method": "execute", "code": "~ask_for_input~"},
+ "emit": [{"after_ms":  0, "event": {"type": "status", "execution_state": "busy"},
+           "kernel_id": "kernel-python-0001"},
+          {"after_ms": 20, "input_request": {"prompt": "What is your name? ", "password": false}}],
+ "never_reply": true}
+
+# ... and the reaction to the answer, correlated by id alone.  The reply
+# here IS the execute's final reply -- the rule above deliberately does
+# not send one, because a real kernel does not finish a cell until the
+# stdin it is blocked on arrives.  Without it the session stays busy
+# forever and the mode line sits at `:run', which is a perfectly
+# realistic bug but not the one this fixture is for.
+{"on_input": {"input": "~.~"},
+ "emit": [{"after_ms": 0, "output": {"type": "stream", "name": "stdout",
+                                     "text": "the kernel heard you\n"}},
+          {"after_ms": 20, "event": {"type": "status", "execution_state": "idle"},
+           "kernel_id": "kernel-python-0001"}],
+ "reply": {"status": "ok", "execution_count": 12,
+           "outputs": "<repeat-all-emitted>"}}

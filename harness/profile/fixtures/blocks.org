@@ -1,0 +1,29 @@
+#+TITLE: Harness org fixture
+
+A =jy:= session on a source block makes it an executable jsonyter cell:
+=C-RET= runs it against a kernel and the output lands in an overlay
+beneath the block, leaving the file alone until =C-c C-s= commits it.
+
+* Python
+
+#+begin_src python :session jy:py
+print("first cell")
+#+end_src
+
+#+begin_src python :session jy:py
+6 * 7
+#+end_src
+
+* A second kernel in the same file
+
+#+begin_src python :session jy:other
+print("first cell")
+#+end_src
+
+* Not a jy: block
+
+This one has no =jy:= session and must behave exactly as Org always has.
+
+#+begin_src python
+print("ordinary org babel")
+#+end_src
