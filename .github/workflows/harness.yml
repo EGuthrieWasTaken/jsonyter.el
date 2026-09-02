@@ -26,10 +26,12 @@ env:
   # touched none of it -- a failure that teaches nothing and blocks the
   # wrong person. Bump this on purpose, in its own commit.
   #
-  # 6e49303 is the merge of EGuthrieWasTaken/emacs-harness#5, the first
-  # commit carrying everything this profile needs: eh-fake-bridge,
-  # `:needs (:executable ...)' and `eh-scenario-setup-functions'.
-  HARNESS_REF: 6e493035d198497f3afbc10265e5dc0f64c79e77
+  # 4756dcb is the merge of EGuthrieWasTaken/emacs-harness#7. It carries
+  # what this profile needs -- eh-fake-bridge, `:needs (:executable ...)'
+  # and `eh-scenario-setup-functions' from #5 -- plus #7's fix for `eh
+  # run' inheriting the 30s single-eval timeout, which capped this suite
+  # at 40s and could not be raised from outside the image.
+  HARNESS_REF: 4756dcb841ab3888aa1022cfb642d61d5eaa7621
 
   # The harness is a public repository, so the workflow's default
   # GITHUB_TOKEN checks it out with nothing else to configure.

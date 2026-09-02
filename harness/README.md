@@ -223,6 +223,6 @@ emacs-harness is a public repository, so the workflow's default
 no setup step.
 
 Its ref is pinned to a commit in the workflow's `HARNESS_REF`, currently
-`6e49303`. Bump it on purpose, in its own commit: tracking `main` would
+`4756dcb`. Bump it on purpose, in its own commit: tracking `main` would
 let a change over there turn a pull request red here that touched none
 of it, and the person left debugging that is the one least equipped to.
