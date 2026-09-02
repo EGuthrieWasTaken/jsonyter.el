@@ -100,11 +100,45 @@ jobs:
 
       - name: Run the jsonyter profile
         run: |
+          set -o pipefail
           docker run --rm --shm-size=1gb \
             -v "$PWD:/srv/package:ro" \
             -v "$PWD/harness/profile:/srv/profiles/jsonyter:ro" \
             -v "$PWD/runs:/var/lib/eh/runs" \
-            jsonyter-harness:ci run jsonyter
+            jsonyter-harness:ci run jsonyter | tee runs/summary.json
+
+      - name: Summarise the run
+        # `eh run' reports 45 scenarios as one JSON object on a single
+        # line, which is the right thing for a machine and unreadable in a
+        # CI log -- a failure is a needle in several kilobytes with no
+        # newlines in it. Break it out into one line per non-passing
+        # scenario, on stdout and in the run's job summary, so a red check
+        # says *which* scenario and why without downloading an artifact.
+        if: always()
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, pathlib, sys
+          path = pathlib.Path("runs/summary.json")
+          if not path.exists() or not path.stat().st_size:
+              print("no run summary was written"); sys.exit(0)
+          try:
+              summary = json.loads(path.read_text()).get("summary") or {}
+          except ValueError as err:
+              print(f"run summary is not JSON ({err}); raw output:")
+              print(path.read_text()[:4000]); sys.exit(0)
+          print("```")
+          print("total={total} passed={passed} failed={failed} skipped={skipped}".format(
+              total=summary.get("total"), passed=summary.get("passed"),
+              failed=summary.get("failed"), skipped=summary.get("skipped")))
+          for test in summary.get("tests", []):
+              if test.get("status") == "passed":
+                  continue
+              print(f"\n{test.get('status', '?').upper()}  {test.get('name')}")
+              message = (test.get("message") or "").replace("\\n", "\n")
+              for line in message.splitlines()[:40]:
+                  print("    " + line[:300])
+          print("```")
+          PY
 
       - name: Upload run artifacts
         # Every scenario failure writes screenshots, buffer snapshots,
