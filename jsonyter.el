@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.1.4
+;; Version: 2.1.5
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -901,6 +901,40 @@ the right thing in a jsonyter notebook; see `jsonyter-mode'."
 ;; the text carries — so a buffer that shows slices has to go without
 ;; it.  See `jsonyter-suppress-line-spacing'.
 
+(defvar jsonyter--display-frame-override nil
+  "Frame `jsonyter--display-frame' should answer with, bypassing its own
+buffer-window lookup.  Nil almost everywhere; let-bound by
+`jsonyter--nb-render-string' around the scratch buffer it renders a
+notebook cell's output into, which -- being a `with-temp-buffer' -- has
+no window of its own for that lookup to find.  Left unset there,
+`jsonyter--display-frame' would fall back to the selected frame inside
+the scratch buffer too: the very bug it exists to avoid, one call frame
+further in.")
+
+(defun jsonyter--display-frame ()
+  "A frame whose metrics this buffer's own display can be measured against.
+
+Output arrives through `jsonyter--filter', a process filter: it sets
+`current-buffer' to the REPL or notebook buffer but has no reason to
+touch the selected frame, and normally does not.  `default-font-height',
+`frame-char-height' and `display-graphic-p' all default to measuring
+the *selected* frame when not told otherwise, so a plot that comes in
+while some other frame is selected -- an Emacs daemon with more than one
+`emacsclient' frame, `ace-window' between them, or simply a frame the
+user last clicked into that is not the one showing this buffer -- gets
+sliced to a line height that has nothing to do with the frame it is
+about to appear in.  In a single-frame Emacs `selected-frame' and this
+always agree, which is why the bug is invisible there.
+
+`jsonyter--display-frame-override' wins when set.  Otherwise prefers a
+window actually showing this buffer, on any frame, over the selected
+one; falls back to the selected frame when the buffer is not displayed
+anywhere right now, which measures no worse than before this function
+existed."
+  (or jsonyter--display-frame-override
+      (let ((window (get-buffer-window (current-buffer) t)))
+        (if window (window-frame window) (selected-frame)))))
+
 (defvar-local jsonyter--line-spacing-restore nil
   "How to put `line-spacing' back when jsonyter stops managing it.
 Nil when jsonyter has not set it in this buffer; `kill' when the buffer
@@ -1207,21 +1241,26 @@ Tall images are sliced one text line per row so that line-based
 scrolling can move through them; see `jsonyter-slice-images'.  Output
 bound for a script cell's overlay string is inserted whole instead,
 since slices would not be lines there at all — see
-`jsonyter--string-output'."
-  (let* ((line-height (max 1 (default-font-height)))
-         (rows (jsonyter--image-rows image line-height)))
-    (if (and rows (> rows 1))
-        (progn
-          (jsonyter--fit-image-to-lines image rows line-height)
-          ;; `insert-sliced-image' repeats its string once per row, so it
-          ;; gets a single space (as `doc-view' does) rather than ALT --
-          ;; otherwise the buffer's real text, and anything copied out of
-          ;; it, is the alt text repeated once per slice. It also
-          ;; terminates each row with its own newline, so no trailing one
-          ;; is needed here.
-          (insert-sliced-image image " " nil rows 1))
-      (insert-image image alt)
-      (insert "\n"))))
+`jsonyter--string-output'.
+
+Measured against `jsonyter--display-frame' rather than whatever frame
+Emacs currently has selected — see there for why the two are not always
+the same frame, and what happens to the fit when they are not."
+  (with-selected-frame (jsonyter--display-frame)
+    (let* ((line-height (max 1 (default-font-height)))
+           (rows (jsonyter--image-rows image line-height)))
+      (if (and rows (> rows 1))
+          (progn
+            (jsonyter--fit-image-to-lines image rows line-height)
+            ;; `insert-sliced-image' repeats its string once per row, so it
+            ;; gets a single space (as `doc-view' does) rather than ALT --
+            ;; otherwise the buffer's real text, and anything copied out of
+            ;; it, is the alt text repeated once per slice. It also
+            ;; terminates each row with its own newline, so no trailing one
+            ;; is needed here.
+            (insert-sliced-image image " " nil rows 1))
+        (insert-image image alt)
+        (insert "\n")))))
 
 (defun jsonyter--image-scale-props ()
   "Scaling properties to hand `create-image', per the size options."
@@ -2417,7 +2456,15 @@ does not have.  Only script cells pass it."
         ;; fresh buffer would report the global `line-spacing' and
         ;; `jsonyter--image-rows' would judge slicing by a line grid
         ;; that is not the one the slices end up on.
-        (spacing line-spacing))
+        (spacing line-spacing)
+        ;; Same idea, for which frame's font metrics an image gets fit
+        ;; to: computed here, in the buffer this output is actually
+        ;; headed for, while `jsonyter--display-frame' can still find it
+        ;; from its window.  A temp buffer has no window at all, so
+        ;; without this override the scratch buffer would fall back to
+        ;; the selected frame regardless of which one is showing the
+        ;; notebook -- see `jsonyter--display-frame-override'.
+        (jsonyter--display-frame-override (jsonyter--display-frame)))
     (with-temp-buffer
       (setq-local line-spacing spacing)
       (setq-local jsonyter--clear-pending nil)

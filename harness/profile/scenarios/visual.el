@@ -106,6 +106,60 @@ or the scenario's own bookkeeping, not the assertion below")
        (format "the sliced image shows %d distinct colours inside its box, not 1 -- \
 something other than its own fill is drawn through it" colors)))))
 
+(eh-scenario jsonyter/image-fits-to-the-frame-showing-it-not-the-selected-one
+  :doc "Kernel output arrives through `jsonyter--filter', a process
+        filter: it sets `current-buffer' but has no reason to also
+        select the frame that is actually showing that buffer, and
+        normally does not.  `default-font-height' has no frame argument
+        at all and always measures whichever frame Emacs currently
+        calls selected (see its own docstring) -- invisible in a
+        single-frame Emacs, where the two never differ, but not in a
+        daemon with more than one `emacsclient' frame open, where they
+        routinely do.  This scenario is the one place batch ERT cannot
+        follow: it needs a *second real frame*, which `make-frame'
+        refuses to create without a display.  Puts one in play, with a
+        deliberately different font, and confirms `jsonyter--display-
+        frame' still resolves to the frame actually showing the buffer
+        rather than to the one merely selected."
+  :fixture "solid-plot.ipynb"
+  :needs (:graphic t)
+  :tags (jsonyter notebook visual slicing)
+
+  (let* ((real-frame (selected-frame))
+         (buffer (current-buffer))
+         (other-frame (make-frame '((font . "DejaVu Sans Mono-32")
+                                     (name . "jsonyter-other-frame")))))
+    (unwind-protect
+        (progn
+          ;; A fresh frame's initial window defaults to showing whatever
+          ;; buffer was current when it was made -- this one, unless told
+          ;; otherwise -- which would leave the fixture visible on *both*
+          ;; frames and make `get-buffer-window' free to return either.
+          ;; The scenario is about a frame that is merely selected while
+          ;; showing something else entirely, so make that true.
+          (set-window-buffer (frame-selected-window other-frame)
+                              (get-buffer-create "*scratch*"))
+          (select-frame other-frame)
+          (eh-expect (/= (default-font-height) (with-selected-frame real-frame (default-font-height)))
+                     "the two frames must actually have different line heights, \
+or this scenario is not testing anything")
+          (with-current-buffer buffer
+            (eh-expect (eq (jsonyter--display-frame) real-frame)
+                       "jsonyter--display-frame must resolve to the frame actually \
+showing this buffer, not the merely-selected other-frame")
+            (eh-expect-equal
+             (with-selected-frame (jsonyter--display-frame) (default-font-height))
+             (with-selected-frame real-frame (default-font-height))
+             "an image must be measured against the buffer's own frame, not \
+whichever frame happened to be selected when it arrived")))
+      ;; `eh--scenario-teardown' kills buffers the scenario created but
+      ;; never touches window/frame configuration (jsonyter/notebook-
+      ;; sliced-image-has-no-background-bands' own comment above found
+      ;; this out the hard way) -- so a leaked frame is this scenario's
+      ;; to clean up, not the next one's problem.
+      (when (frame-live-p other-frame) (delete-frame other-frame))
+      (when (frame-live-p real-frame) (select-frame real-frame)))))
+
 (eh-scenario jsonyter/notebook-line-spacing-is-dropped-so-slices-tile
   :doc "A sliced image tiles only if every buffer row is exactly as tall
         as the slice it shows.  `line-spacing' breaks that -- Emacs adds

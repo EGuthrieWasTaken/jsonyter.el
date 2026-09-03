@@ -348,6 +348,112 @@ The fix is for buffers that would otherwise band a plot; everywhere else
       (jsonyter-tests--with-notebook
         (should-not (local-variable-p 'line-spacing))))))
 
+;;;; A plot is measured against the frame showing it, not whichever frame
+;;;; happens to be selected -- see `jsonyter--display-frame'.  Output
+;;;; arrives through `jsonyter--filter', a process filter, which sets
+;;;; `current-buffer' but has no reason to also select the right frame; in
+;;;; anything but a single-frame Emacs (a daemon with more than one
+;;;; `emacsclient' frame, `ace-window' between them) the two routinely
+;;;; differ, and `default-font-height' -- which has no frame argument at
+;;;; all -- always measures whichever one Emacs currently calls selected.
+
+(ert-deftest jsonyter-test-display-frame-prefers-the-buffers-own-window ()
+  "Finds the frame actually showing this buffer over the selected one."
+  (let ((buffer-frame 'buffer-frame)
+        (other-frame 'some-other-selected-frame)
+        (buffer-window 'the-window-showing-the-buffer))
+    (cl-letf (((symbol-function 'selected-frame) (lambda () other-frame))
+              ((symbol-function 'get-buffer-window)
+               (lambda (&rest _) buffer-window))
+              ((symbol-function 'window-frame)
+               (lambda (w) (if (eq w buffer-window) buffer-frame
+                              (error "asked about the wrong window")))))
+      (with-temp-buffer
+        (should (eq (jsonyter--display-frame) buffer-frame))))))
+
+(ert-deftest jsonyter-test-display-frame-falls-back-when-not-displayed ()
+  "Answers with the selected frame when this buffer is not shown anywhere
+right now -- a cell finishing in the background, say -- which measures no
+worse than the code had no opinion at all about which frame to use."
+  (let ((other-frame 'some-other-selected-frame))
+    (cl-letf (((symbol-function 'selected-frame) (lambda () other-frame))
+              ((symbol-function 'get-buffer-window) (lambda (&rest _) nil)))
+      (with-temp-buffer
+        (should (eq (jsonyter--display-frame) other-frame))))))
+
+(ert-deftest jsonyter-test-display-frame-override-wins ()
+  "`jsonyter--display-frame-override', as `jsonyter--nb-render-string' sets
+it around the scratch buffer it renders a cell's output into, is
+consulted before the buffer-window lookup -- needed because a
+`with-temp-buffer' has no window of its own for that lookup to find."
+  (let ((forced-frame 'forced-frame))
+    (cl-letf ((jsonyter--display-frame-override forced-frame)
+              ((symbol-function 'get-buffer-window)
+               (lambda (&rest _) (error "the override should have short-circuited this"))))
+      (with-temp-buffer
+        (should (eq (jsonyter--display-frame) forced-frame))))))
+
+(ert-deftest jsonyter-test-nb-render-string-fits-images-to-the-real-buffers-frame ()
+  "A notebook cell's image is measured against the frame that buffer is
+actually shown on -- not the windowless scratch buffer rendering happens
+in (see `jsonyter--nb-render-string'), and not whichever frame merely
+happens to be selected while the kernel's response is being handled.
+
+`default-font-height' is faked here to record, each time it is called,
+whether it was asked from the buffer's real frame or from the merely-
+selected one -- reproducing the actual mechanism (default-font-height
+has no frame argument at all and always measures the selected frame; see
+its docstring) rather than only asserting on `jsonyter--display-frame' in
+isolation, the way the tests above do."
+  (let* ((real-frame 'the-frame-showing-this-buffer)
+         (other-frame 'some-other-selected-frame)
+         (real-window 'the-window-showing-the-buffer)
+         (notebook-buffer (generate-new-buffer "jsonyter-test-notebook"))
+         (heights-seen nil)
+         ;; `real-frame'/`other-frame' are plain symbols, not live
+         ;; frames -- batch Emacs cannot make a second real one
+         ;; (`make-frame' signals "Unknown terminal type" there) -- so
+         ;; `select-frame' and `frame-live-p', the two primitives
+         ;; `with-selected-frame' expands into besides `selected-frame'
+         ;; itself, are faked too, all three sharing this lexical
+         ;; variable as the frame `selected-frame' answers with.  It
+         ;; must be bound out here, not as a `cl-letf' place below: a
+         ;; plain symbol there is a dynamic binding, and this one was
+         ;; never `defvar'd.
+         (selected-frame-value other-frame))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                  ((symbol-function 'display-images-p) (lambda (&rest _) t))
+                  ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                  ((symbol-function 'image-size) (lambda (&rest _) (cons 400.0 300.0)))
+                  ((symbol-function 'create-image)
+                   (lambda (data &optional type _data-p &rest props)
+                     (append (list 'image :type (or type 'png) :data data) props)))
+                  ((symbol-function 'selected-frame) (lambda () selected-frame-value))
+                  ((symbol-function 'select-frame)
+                   (lambda (frame &optional _norecord) (setq selected-frame-value frame)))
+                  ((symbol-function 'frame-live-p) (lambda (frame) (memq frame (list real-frame other-frame))))
+                  ((symbol-function 'get-buffer-window)
+                   (lambda (buf &optional _all) (and (eq buf notebook-buffer) real-window)))
+                  ((symbol-function 'window-frame)
+                   (lambda (w) (if (eq w real-window) real-frame
+                                  (error "asked about the wrong window"))))
+                  ((symbol-function 'default-font-height)
+                   (lambda ()
+                     (let ((height (if (eq (selected-frame) real-frame) 15 45)))
+                       (push height heights-seen)
+                       height))))
+          (with-current-buffer notebook-buffer
+            (jsonyter--nb-render-string
+             (jsonyter-tests--png (base64-encode-string "not really a png")))))
+      (kill-buffer notebook-buffer))
+    ;; Every measurement has to be the real frame's height (15); the
+    ;; merely-selected frame's (45) never showing up is what proves the
+    ;; scratch buffer's rendering used the override rather than falling
+    ;; through to whatever `default-font-height' would answer on its own.
+    (should heights-seen)
+    (should (equal heights-seen (make-list (length heights-seen) 15)))))
+
 ;;;; Output is protected, but readable
 
 (ert-deftest jsonyter-test-output-is-read-only ()
