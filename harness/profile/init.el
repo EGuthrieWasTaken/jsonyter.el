@@ -227,6 +227,62 @@ and fails in CI."
       (setq pos (1+ pos)))
     (nreverse positions)))
 
+(defun jy-image-pixel-bbox (pos)
+  "Pixel (LEFT TOP WIDTH HEIGHT) of the image at POS, sliced or whole.
+POS must be the image's first character -- its top-left slice if it has
+more than one, the car of `jy-image-positions'.  WIDTH/HEIGHT are the
+image's full displayed extent, every sliced row included however many
+lines it was split across, not just the one glyph at POS.
+
+LEFT/TOP are relative to the frame's own content area -- the coordinate
+space a screenshot from `eh-shot-to-file' (`x-export-frames') is in --
+rather than to the X display.  `window-absolute-pixel-position' answers
+in the latter (DESIGN §6.3: that is what a click needs, since xdotool
+targets the screen), which on a reparenting window manager is the
+frame's position on screen, not (0, 0); using it to crop a screenshot
+directly picks the wrong rectangle by exactly that offset."
+  (let* ((disp (get-char-property pos 'display))
+         (spec (cond
+                ((and (consp disp) (consp (car disp)) (eq (caar disp) 'slice))
+                 (cadr disp))
+                ((and (consp disp) (eq (car disp) 'image)) disp)))
+         (size (and spec (image-size spec t)))
+         (xy (window-absolute-pixel-position pos))
+         (frame-xy (frame-edges nil 'native)))
+    (unless (and spec size xy)
+      (error "jsonyter-harness: no image at %d to measure" pos))
+    (list (- (car xy) (nth 0 frame-xy))
+          (- (cdr xy) (nth 1 frame-xy))
+          (round (car size)) (round (cdr size)))))
+
+(defun jy-bbox-unique-colors (bbox &optional inset)
+  "Screenshot the frame and count the distinct colours inside BBOX.
+BBOX is (LEFT TOP WIDTH HEIGHT), as `jy-image-pixel-bbox' returns; each
+edge is inset by INSET pixels first (default 1) so that anti-aliasing
+against whatever sits just outside the image never enters the count.
+
+For an image with no internal edges of its own -- a flat fill, say --
+this is a direct pixel-level check that slicing actually tiled: a `line-
+spacing' leak or a slice cut a fraction short of its line both draw
+through as an unfilled band, which is a second colour here regardless
+of how clean the slice geometry looks from the display properties
+alone."
+  (cl-destructuring-bind (left top width height) bbox
+    (let* ((inset (or inset 1))
+           (shot (expand-file-name "unique-colors-shot.png" eh-run-dir))
+           (crop (expand-file-name "unique-colors-crop.png" eh-run-dir)))
+      (eh-shot-to-file shot)
+      (let ((code (call-process "convert" nil nil nil shot
+                                 "-crop" (format "%dx%d+%d+%d"
+                                                  (max 1 (- width (* 2 inset)))
+                                                  (max 1 (- height (* 2 inset)))
+                                                  (+ left inset) (+ top inset))
+                                 "+repage" crop)))
+        (unless (zerop code) (error "jsonyter-harness: convert (crop) exited %d" code)))
+      (with-temp-buffer
+        (call-process "identify" nil t nil "-format" "%k" crop)
+        (string-to-number (buffer-string))))))
+
 ;;;; Assertion helpers that survive a different Emacs build
 ;;
 ;; Both of these exist because the first real container run (Emacs 28.2)
