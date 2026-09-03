@@ -15,8 +15,8 @@ which runs a **real graphical Emacs on an X server in a container** and
 lets a test — or an agent — drive it through the actual command loop and
 read back exactly what is on screen.
 
-**46 scenarios.** 39 assert things a batch Emacs can also check and run
-either way; 7 need a frame and skip without one.
+**47 scenarios.** 39 assert things a batch Emacs can also check and run
+either way; 8 need a frame and skip without one.
 
 ---
 
@@ -177,12 +177,14 @@ block *without* a `jy:` session left entirely to Org.
 
 **`kernel-state.el` (8)** — every row of the table above.
 
-**`visual.el` (7, graphical only)** — an image that actually decodes
+**`visual.el` (8, graphical only)** — an image that actually decodes
 rather than a placeholder; a tall image sliced into rows with distinct,
 ordered geometry; a sliced flat-colour image with no pixel of anything
-else showing through it, the direct check behind the two above; `line-
-spacing` dropped so slices tile; a REPL image rasterising in a live
-frame; the mode-line tag reaching the rendered
+else showing through it, the direct check behind the two above; an
+image measured against the frame actually showing its buffer rather
+than whichever one merely happens to be selected, with a second real
+frame in play to prove it; `line-spacing` dropped so slices tile; a REPL
+image rasterising in a live frame; the mode-line tag reaching the rendered
 mode line; one full-frame reference shot.
 
 ---
