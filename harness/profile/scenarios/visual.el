@@ -77,13 +77,17 @@
   :needs (:cairo t)
   :tags (jsonyter notebook visual slicing)
 
-  ;; Put the cell's own source at the top of the window rather than
-  ;; trusting it's already there: the fixture starts with a markdown
-  ;; cell, and where the window happens to be scrolled is not this
-  ;; scenario's business. Needed so the image's whole box, mode-line
-  ;; excluded, ends up on screen for `eh-shot-to-file' to capture --
-  ;; a partly cut-off image would fail below for a reason that has
-  ;; nothing to do with slicing.
+  ;; Give the buffer the whole frame, scrolled to its own top, rather
+  ;; than trusting either is already so: scenario teardown kills the
+  ;; buffers a scenario creates but never touches window configuration
+  ;; (`eh--scenario-teardown'), so a window split earlier in the run
+  ;; carries over -- as it did the first time this ran inside the full
+  ;; suite, where a normal-sized frame split by an earlier scenario left
+  ;; less than half the height on screen. Needed so the image's whole
+  ;; box, mode-line excluded, ends up on screen for `eh-shot-to-file' to
+  ;; capture -- a partly cut-off image would fail below for a reason
+  ;; that has nothing to do with slicing.
+  (delete-other-windows)
   (goto-char (point-min))
   (set-window-start (selected-window) (point-min))
   (eh-settle)
