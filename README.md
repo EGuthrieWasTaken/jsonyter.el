@@ -275,6 +275,14 @@ Set it to nil to keep yours here too, and images are inserted whole
 rather than banded, at the cost of scrolling through them a line at a
 time.
 
+The other thing that can sit on a slice's row is a glyph drawn with the
+buffer's own font — `display-line-numbers-mode` puts one on every row —
+and a row holding both is as tall as the font's ascent plus whatever
+the slice hangs below the baseline. Slices are therefore anchored with
+`:ascent center`, which for a slice exactly one line tall puts its
+baseline where the font's is, so line numbers cost the row nothing and
+the picture tiles either way.
+
 ### Faces
 
 Everything jsonyter draws is themable rather than hardcoded — customize

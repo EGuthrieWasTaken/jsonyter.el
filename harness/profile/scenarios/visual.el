@@ -106,6 +106,64 @@ or the scenario's own bookkeeping, not the assertion below")
        (format "the sliced image shows %d distinct colours inside its box, not 1 -- \
 something other than its own fill is drawn through it" colors)))))
 
+(eh-scenario jsonyter/notebook-sliced-image-tiles-under-display-line-numbers
+  :doc "The scenario above passes in a bare buffer and always did, while a
+        user whose config has `display-line-numbers-mode' on
+        `prog-mode-hook' -- a notebook buffer is a `python-mode' buffer
+        -- kept seeing every plot drawn through a set of blinds.  Line
+        numbers put a glyph from the buffer's text font on every row, and
+        that glyph asks the row for the font's full ascent above the
+        baseline; an image slice with the default `:ascent 50' puts its
+        own baseline at its middle.  Neither is wrong on its own, but
+        together the row is font-ascent plus half a slice tall, and the
+        difference is drawn as a band of background under every slice.
+        Nothing about `line-spacing' or the slice geometry moves, so the
+        other slicing scenarios cannot see it: this one opens the fixture
+        with the user's hook in place and asserts, first, that each
+        sliced row is exactly one text line tall -- the legible failure
+        -- and then the same single-colour pixel check as above."
+  :needs (:cairo t)
+  :tags (jsonyter notebook visual slicing)
+
+  ;; The hook is global; put it back whatever happens, or every later
+  ;; prog-mode buffer in this session gets line numbers it did not ask for.
+  (add-hook 'prog-mode-hook #'display-line-numbers-mode)
+  (unwind-protect
+      (progn
+        (eh-open-fixture "solid-plot.ipynb")
+        (eh-expect display-line-numbers
+                   "the hook must have switched line numbers on in the notebook buffer, \
+or this scenario is not testing anything")
+        ;; Same reasoning as the scenario above: the whole image has to be
+        ;; on screen for the screenshot to see all of it.
+        (delete-other-windows)
+        (goto-char (point-min))
+        (set-window-start (selected-window) (point-min))
+        (eh-settle)
+        (let* ((region (jy-cell-output-region 1))
+               (positions (jy-image-positions (nth 0 region) (nth 1 region)))
+               (line-height (default-font-height)))
+          (eh-expect positions "the plot cell's output must carry an image")
+          (eh-expect (> (length positions) 1)
+                     "solid-plot.png is 240px tall and must be sliced into more than one row")
+          (eh-expect (and (pos-visible-in-window-p (car positions))
+                          (pos-visible-in-window-p (1- (nth 1 region))))
+                     "the sliced image does not fit in the window -- shrink the fixture \
+or the scenario's own bookkeeping, not the assertion below")
+          (let ((heights (mapcar (lambda (pos)
+                                   (save-excursion (goto-char pos) (line-pixel-height)))
+                                 positions)))
+            (eh-expect (seq-every-p (lambda (h) (= h line-height)) heights)
+                       (format "every sliced row must be exactly one text line (%dpx) tall \
+with line numbers on; got %S -- each extra pixel is a band of background under that slice"
+                               line-height heights)))
+          (let ((colors (jy-bbox-unique-colors (jy-image-pixel-bbox (car positions)))))
+            (eh-expect-equal
+             colors 1
+             (format "with line numbers on, the sliced image shows %d distinct colours \
+inside its box, not 1 -- something other than its own fill is drawn through it" colors)))))
+    (remove-hook 'prog-mode-hook #'display-line-numbers-mode)))
+
 (eh-scenario jsonyter/image-fits-to-the-frame-showing-it-not-the-selected-one
   :doc "Kernel output arrives through `jsonyter--filter', a process
         filter: it sets `current-buffer' but has no reason to also
