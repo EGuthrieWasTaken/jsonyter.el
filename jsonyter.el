@@ -1213,27 +1213,44 @@ two."
          (max 1 (round (/ (float (cdr (image-size image t))) line-height))))))
 
 (defun jsonyter--fit-image-to-lines (image rows line-height)
-  "Resize IMAGE so that slicing it into ROWS lands on whole text lines.
-A slice is only as tall as its own share of the image, so unless the
-image's height is an exact multiple of LINE-HEIGHT every slice comes up
-short of the line it sits on, and the shortfall is drawn as a band of
-background — a stripe across the picture, once per slice.  Rounding the
-height to a whole number of lines removes the shortfall.
+  "Fit IMAGE to the line grid so that slicing it into ROWS tiles.
+Two things about the image itself decide whether its slices sit flush
+or each on its own band of background.
 
-That is one of the two ways slices come out banded; `line-spacing' is
-the other, and `jsonyter-suppress-line-spacing' deals with it.
+Its height: a slice is only as tall as its own share of the image, so
+unless that height is an exact multiple of LINE-HEIGHT every slice
+comes up short of the line it sits on, and the shortfall is drawn as a
+stripe across the picture, once per slice.  Rounding the height to a
+whole number of lines removes the shortfall.  Both dimensions are
+pinned rather than just the height because `:max-width' and
+`:max-height' would otherwise still be free to shrink the result to
+preserve the aspect ratio, undoing the fit; `:width' and `:height' take
+precedence over them.
 
-Both dimensions are pinned rather than just the height because
-`:max-width' and `:max-height' would otherwise still be free to shrink
-the result to preserve the aspect ratio, undoing the fit; `:width' and
-`:height' take precedence over them."
+Its baseline: an image glyph's `:ascent' says how much of it sits above
+the text baseline, and the default, 50, puts the baseline through the
+middle of every slice.  That is harmless in a row holding nothing but
+the slice.  But a row that also holds a glyph drawn with the buffer's
+text font -- and `display-line-numbers-mode' puts one on every row --
+is asked for that font's full ascent above the baseline, while the
+slice still asks for half its height below it, and the row grows to
+the sum: with a 17px font, a 13px ascent plus a 9px half-slice makes
+a 22px row for a 17px slice, and the 5px left over are drawn as
+background under each one.  `center' anchors a slice so that its
+ascent is exactly the font's -- `image_ascent' in image.c arranges
+that for a glyph as tall as the font's line -- and every row, line
+numbers or not, comes out one line tall.
+
+Those are two of the three ways slices come out banded; `line-spacing'
+is the third, and `jsonyter-suppress-line-spacing' deals with it."
   (let* ((size (image-size image t))
          (height (cdr size))
          (target (* rows line-height)))
     (unless (zerop height)
       (setf (image-property image :width)
             (max 1 (round (* (car size) (/ (float target) height))))
-            (image-property image :height) target))))
+            (image-property image :height) target
+            (image-property image :ascent) 'center))))
 
 (defun jsonyter--insert-image (image alt)
   "Insert IMAGE at point with ALT as its text fallback.
