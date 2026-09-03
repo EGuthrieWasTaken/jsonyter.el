@@ -62,6 +62,50 @@
                        "slice y offsets must all be distinct"))
     (eh-expect-display-image (car positions) :type 'png :slices t)))
 
+(eh-scenario jsonyter/notebook-sliced-image-has-no-background-bands
+  :doc "The other two slicing scenarios stop at the display properties:
+        distinct increasing y-offsets, and `line-spacing' reading nil.
+        Both stay true even if every sliced row sat on its own bar of
+        background -- neither one looks at an actual pixel.  This one
+        does. `solid-plot.png' is a single flat colour top to bottom,
+        240px tall, with no gradient or gridline anywhere in it, so
+        every pixel inside its rendered box has to be that one colour;
+        a second colour showing up can only be a gap cut through it by
+        `line-spacing' leaking into the buffer, or a slice a fraction
+        short of the line it sits on."
+  :fixture "solid-plot.ipynb"
+  :needs (:cairo t)
+  :tags (jsonyter notebook visual slicing)
+
+  ;; Give the buffer the whole frame, scrolled to its own top, rather
+  ;; than trusting either is already so: scenario teardown kills the
+  ;; buffers a scenario creates but never touches window configuration
+  ;; (`eh--scenario-teardown'), so a window split earlier in the run
+  ;; carries over -- as it did the first time this ran inside the full
+  ;; suite, where a normal-sized frame split by an earlier scenario left
+  ;; less than half the height on screen. Needed so the image's whole
+  ;; box, mode-line excluded, ends up on screen for `eh-shot-to-file' to
+  ;; capture -- a partly cut-off image would fail below for a reason
+  ;; that has nothing to do with slicing.
+  (delete-other-windows)
+  (goto-char (point-min))
+  (set-window-start (selected-window) (point-min))
+  (eh-settle)
+  (let* ((region (jy-cell-output-region 1))
+         (positions (jy-image-positions (nth 0 region) (nth 1 region))))
+    (eh-expect positions "the plot cell's output must carry an image")
+    (eh-expect (> (length positions) 1)
+               "solid-plot.png is 240px tall and must be sliced into more than one row")
+    (eh-expect (and (pos-visible-in-window-p (car positions))
+                    (pos-visible-in-window-p (1- (nth 1 region))))
+               "the sliced image does not fit in the window -- shrink the fixture \
+or the scenario's own bookkeeping, not the assertion below")
+    (let ((colors (jy-bbox-unique-colors (jy-image-pixel-bbox (car positions)))))
+      (eh-expect-equal
+       colors 1
+       (format "the sliced image shows %d distinct colours inside its box, not 1 -- \
+something other than its own fill is drawn through it" colors)))))
+
 (eh-scenario jsonyter/notebook-line-spacing-is-dropped-so-slices-tile
   :doc "A sliced image tiles only if every buffer row is exactly as tall
         as the slice it shows.  `line-spacing' breaks that -- Emacs adds

@@ -15,8 +15,8 @@ which runs a **real graphical Emacs on an X server in a container** and
 lets a test — or an agent — drive it through the actual command loop and
 read back exactly what is on screen.
 
-**45 scenarios.** 39 assert things a batch Emacs can also check and run
-either way; 6 need a frame and skip without one.
+**46 scenarios.** 39 assert things a batch Emacs can also check and run
+either way; 7 need a frame and skip without one.
 
 ---
 
@@ -87,7 +87,7 @@ harness/
 └── profile/
     ├── profile.el      snapshot properties, named waiters, log buffers
     ├── init.el         the only config the Emacs under test sees
-    ├── fixtures/       demo.ipynb, cells.py, blocks.org, two PNGs
+    ├── fixtures/       demo.ipynb, solid-plot.ipynb, cells.py, blocks.org, 3 PNGs
     ├── bridge-scripts/ the scripted stand-ins for the Python bridge
     └── scenarios/      repl · notebook · script · org · kernel-state · visual
 ```
@@ -177,10 +177,12 @@ block *without* a `jy:` session left entirely to Org.
 
 **`kernel-state.el` (8)** — every row of the table above.
 
-**`visual.el` (6, graphical only)** — an image that actually decodes
+**`visual.el` (7, graphical only)** — an image that actually decodes
 rather than a placeholder; a tall image sliced into rows with distinct,
-ordered geometry; `line-spacing` dropped so slices tile; a REPL image
-rasterising in a live frame; the mode-line tag reaching the rendered
+ordered geometry; a sliced flat-colour image with no pixel of anything
+else showing through it, the direct check behind the two above; `line-
+spacing` dropped so slices tile; a REPL image rasterising in a live
+frame; the mode-line tag reaching the rendered
 mode line; one full-frame reference shot.
 
 ---
