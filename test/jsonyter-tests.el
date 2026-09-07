@@ -1448,7 +1448,12 @@ own visibility cycling hides committed-free session output for us."
 (ert-deftest jsonyter-test-org-to-notebook-round-trips-with-bridge ()
   "An unedited round trip through `write_notebook' preserves every cell id."
   (skip-unless (jsonyter-tests--bridge-available-p))
-  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+  ;; Launch the bridge the way the guard checks for it — as a module —
+  ;; so a setup with the package importable but no `jsonyter' console
+  ;; script on PATH runs rather than failing to find the executable.
+  ;; Matches `jsonyter-test-save-*' above.
+  (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
+         (jsonyter-org-markdown-converter (lambda (text _dir) text))
          (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
          (org (make-temp-file "jsonyter-test-" nil ".org")))
     (unwind-protect
@@ -1467,6 +1472,222 @@ own visibility cycling hides committed-free session output for us."
             (should (equal '("aaa" "bbb" "ccc") ids))))
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+;;;; File transfer
+
+;; These never touch a bridge: the dispatch tests feed a JSON line to
+;; `jsonyter--dispatch' directly, and `jsonyter--transfer-run' is driven
+;; with `jsonyter--send' stubbed, in the shape the bridge would answer.
+
+(ert-deftest jsonyter-test-transfer-progress-routes-to-its-handler ()
+  "A `progress' line reaches the :progress handler and leaves the request pending."
+  (with-temp-buffer
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (progress-seen result-seen)
+      (puthash 7 (list :progress (lambda (ev) (setq progress-seen ev))
+                       :result (lambda (_msg) (setq result-seen t)))
+               jsonyter--callbacks)
+      (jsonyter--dispatch
+       nil (concat "{\"id\": 7, \"progress\": {\"phase\": \"upload\", "
+                   "\"bytes_done\": 5, \"bytes_total\": 10}}"))
+      (should (equal "upload" (plist-get progress-seen :phase)))
+      (should (equal 5 (plist-get progress-seen :bytes_done)))
+      (should-not result-seen)
+      ;; A progress line must not complete (remhash) the request.
+      (should (gethash 7 jsonyter--callbacks))
+      ;; The real `result' line still does.
+      (jsonyter--dispatch nil "{\"id\": 7, \"result\": {\"verified\": \"sha256\"}}")
+      (should result-seen)
+      (should-not (gethash 7 jsonyter--callbacks)))))
+
+(ert-deftest jsonyter-test-transfer-progress-reaches-100-and-cleans-up ()
+  "Progress hits 100% on success; the tag and reporter are torn down even on a
+mid-transfer error, not only on success."
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (handlers nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (_m _p hs) (setq handlers hs) 1)))
+        ;; --- success: a final progress event carries done == total ---
+        (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                (list :local_path "/tmp/x" :remote_path "d/x"))
+        (funcall (plist-get handlers :progress) '(:bytes_done 5 :bytes_total 10))
+        (should (equal 50 (plist-get (jsonyter--session-transfer session) :pct)))
+        (funcall (plist-get handlers :progress) '(:bytes_done 10 :bytes_total 10))
+        (should (equal 100 (plist-get (jsonyter--session-transfer session) :pct)))
+        (funcall (plist-get handlers :result)
+                 '(:result (:path "d/x" :local_path "/tmp/x" :bytes 10
+                            :verified "sha256" :elapsed 1)))
+        (should (null (jsonyter--session-transfer session)))
+        (should (null jsonyter--last-failed-transfer))
+        ;; --- error partway: the tag clears and the last failure is recorded ---
+        (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                (list :local_path "/tmp/x" :remote_path "d/x"))
+        (funcall (plist-get handlers :progress) '(:bytes_done 3 :bytes_total 10))
+        (should (jsonyter--session-transfer session))
+        (funcall (plist-get handlers :result)
+                 '(:error (:message "upload failed at chunk 2/4")))
+        (should (null (jsonyter--session-transfer session)))
+        (should (equal "upload"
+                       (plist-get jsonyter--last-failed-transfer :method))))
+      ;; --- jsonyter--send signals synchronously (dead bridge): the tag it
+      ;; just set must be cleared, and the signal must propagate. ---
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (&rest _) (error "bridge process is not running"))))
+        (should-error
+         (jsonyter--transfer-run (cons (current-buffer) session) "download"
+                                 (list :remote_path "d/x" :local_path "/tmp/x")))
+        (should (null (jsonyter--session-transfer session)))))))
+
+(ert-deftest jsonyter-test-error-message-does-not-blame-chunk-size-for-origin-errors ()
+  "A cf-ray on a genuine origin 4xx/5xx (Cloudflare tags every proxied
+response) must NOT be rendered as a chunk-size problem, even though the
+bridge always puts \"chunk\" in an upload-failure message."
+  (let ((m (jsonyter--error-message
+            '(:error "JupyterError"
+              :message "upload of data/missing/x.csv failed at chunk 1/1 (0 B written) — No such file or directory — lower --chunk-size (currently 8.0 MB), then resume from byte 0"
+              :status 404 :cf_ray "cf-abc"))))
+    (should-not (string-match-p "jsonyter-upload-chunk-size" m))
+    ;; a real proxy 413 still is
+    (should (string-match-p
+             "jsonyter-upload-chunk-size"
+             (jsonyter--error-message
+              '(:error "JupyterError" :message "at chunk 1/1 — Request Entity Too Large"
+                :status 413 :cf_ray "cf-abc"))))))
+
+(ert-deftest jsonyter-test-resume-upload-re-reads-the-chunk-size ()
+  "The documented proxy-413 recovery -- lower `jsonyter-upload-chunk-size',
+then resume -- actually takes effect: resume replays the freshly lowered
+size, not the one baked in at the first call."
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (sent nil) (handlers nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (_m params hs) (setq sent params handlers hs) 1))
+                ((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) session))))
+        (let ((jsonyter-upload-chunk-size (* 64 1024 1024)))
+          (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                  (list :local_path "/tmp/x" :remote_path "d/x"
+                                        :chunk_size jsonyter-upload-chunk-size))
+          (funcall (plist-get handlers :result)
+                   '(:error (:message "HTTP 413" :status 413 :cf_ray "z"))))
+        (should (equal "upload"
+                       (plist-get jsonyter--last-failed-transfer :method)))
+        (let ((jsonyter-upload-chunk-size (* 8 1024 1024)))
+          (jsonyter-resume-upload))
+        (should (eq t (plist-get sent :resume)))
+        (should (equal (* 8 1024 1024) (plist-get sent :chunk_size)))))))
+
+(ert-deftest jsonyter-test-remote-completion-slashes-dirs-and-refetches ()
+  "Remote path completion suffixes directories with `/' and lists a directory
+afresh on descent past a `/'."
+  (with-temp-buffer
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'jsonyter--remote-children)
+                 (lambda (_buf path)
+                   (push path calls)
+                   (pcase path
+                     ("" (list '(:name "sub" :type "directory" :path "sub")
+                               '(:name "a.csv" :type "file" :path "a.csv")))
+                     ("sub/" (list '(:name "b.csv" :type "file" :path "sub/b.csv")))
+                     (_ nil))))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt table &rest _)
+                   (let ((root (all-completions "" table)))
+                     (should (member "sub/" root))
+                     (should (member "a.csv" root)))
+                   (let ((down (all-completions "sub/" table)))
+                     (should (member "sub/b.csv" down)))
+                   "sub/b.csv")))
+        (should (equal "sub/b.csv"
+                       (jsonyter--read-remote-path (current-buffer) "Remote")))
+        (should (member "" calls))
+        (should (member "sub/" calls))))))
+
+(ert-deftest jsonyter-test-remote-dired-dims-nonwritable-and-dirs-first ()
+  "`jsonyter--remote-entries' sorts directories first and dims a non-writable row."
+  (let* ((models (list '(:name "ro.csv" :type "file" :path "ro.csv"
+                         :size 10 :writable nil :last_modified "2026-09-07T10:00:00Z")
+                       '(:name "rw.csv" :type "file" :path "rw.csv"
+                         :size 20 :writable t :last_modified "2026-09-07T11:00:00Z")
+                       '(:name "d" :type "directory" :path "d" :writable t)))
+         (sorted (sort (copy-sequence models) #'jsonyter--remote-child-lessp))
+         (entries (jsonyter--remote-entries sorted nil)))
+    (should (equal "d/" (substring-no-properties (aref (cadr (nth 0 entries)) 1))))
+    (let ((ro (seq-find (lambda (e) (equal (car e) "ro.csv")) entries))
+          (rw (seq-find (lambda (e) (equal (car e) "rw.csv")) entries)))
+      (should (eq 'jsonyter-remote-readonly-face
+                  (get-text-property 0 'face (aref (cadr ro) 1))))
+      (should-not (eq 'jsonyter-remote-readonly-face
+                      (get-text-property 0 'face (aref (cadr rw) 1)))))))
+
+(ert-deftest jsonyter-test-remote-dired-copy-reports-server-name ()
+  "After a copy the message names what the server called the copy, not the request."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "trials.csv"
+                      (vector " " "trials.csv" "10 B" "2026-09-07 10:00"))))
+    (puthash "trials.csv" '(:name "trials.csv" :type "file" :path "trials.csv")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (said)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args))))
+                ((symbol-function 'jsonyter--read-remote-path)
+                 (lambda (&rest _) "backup/"))
+                ((symbol-function 'jsonyter--remote-call)
+                 (lambda (method params)
+                   (should (equal method "copy_contents"))
+                   (should (equal (plist-get params :path) "trials.csv"))
+                   '(:name "trials-Copy1.csv" :path "backup/trials-Copy1.csv")))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+        (jsonyter-remote-dired-copy)
+        (should (string-match-p "backup/trials-Copy1\\.csv" said))
+        (should-not (string-match-p "backup/trials\\.csv\\'" said))))))
+
+(ert-deftest jsonyter-test-error-message-renders-transfer-recovery ()
+  "Each TransferConflict reason gets its recovery hint; a proxy 413 names the
+chunk-size option."
+  (should (string-match-p
+           "overwrite"
+           (jsonyter--error-message
+            '(:error "TransferConflict"
+              :message "data/x already exists on the server" :reason "exists"))))
+  (let ((m (jsonyter--error-message
+            '(:error "TransferConflict" :message "data/x changed on the server"
+              :reason "stale" :expected_hash "3f2a1111" :actual_hash "9c11ffff"))))
+    (should (string-match-p "jsonyter-download-file" m))
+    (should (string-match-p "3f2a" m))
+    (should (string-match-p "9c11" m))
+    (should-not (string-match-p "3f2a1111" m)))
+  (should (string-match-p
+           "jsonyter-resume"
+           (jsonyter--error-message
+            '(:error "TransferConflict" :message "the bytes that landed are wrong"
+              :reason "corrupt"))))
+  (let ((m (jsonyter--error-message
+            '(:error "JupyterError"
+              :message "upload failed at chunk 7/23 — HTTP 413 from the proxy, request body exceeded a gateway limit"
+              :status 413 :cf_ray "abc-123"))))
+    (should (string-match-p "jsonyter-upload-chunk-size" m))
+    (should (string-match-p "jsonyter-resume-upload" m))))
+
+(ert-deftest jsonyter-test-kernel-reset-clears-contents-dir ()
+  "A restart drops the stale contents-path mapping so the next transfer re-probes."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-contents-dir s) "work/data"
+            (jsonyter--session-contents-dir-probed s) t
+            (jsonyter--session-remote-directory s) "work/data/")
+      (jsonyter--after-kernel-reset "[kernel restarted]" s)
+      (should (null (jsonyter--session-contents-dir s)))
+      (should (null (jsonyter--session-contents-dir-probed s)))
+      (should (null (jsonyter--session-remote-directory s))))))
 
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
