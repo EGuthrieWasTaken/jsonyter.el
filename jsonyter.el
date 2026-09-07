@@ -282,6 +282,24 @@ Used for a notebook cell's own prompt, and for the session rules in the
 listing `jsonyter-kernel-history' produces."
   :type 'integer)
 
+(defcustom jsonyter-notebook-latex-macros nil
+  "LaTeX macro definitions to seed a notebook's math with.
+
+A list of strings, each one line — typically a \\newcommand or
+\\DeclareMathOperator.  `jsonyter-notebook-new' adds them to a new
+notebook, and \\[jsonyter-notebook-insert-latex-macros] adds or
+refreshes them in the notebook at point: they go in a markdown cell at
+the top, marked so it is updated rather than duplicated, where MathJax
+\(in Jupyter and nbconvert) reads the \\newcommands and makes them
+available to every later cell's math.  nil means add nothing.
+
+Example:
+
+  (setq jsonyter-notebook-latex-macros
+        \\='(\"\\\\newcommand{\\\\R}{\\\\mathbb{R}}\"
+          \"\\\\newcommand{\\\\abs}[1]{\\\\left|#1\\\\right|}\"))"
+  :type '(repeat string))
+
 (defcustom jsonyter-history-size 500
   "Maximum number of inputs kept in the REPL history."
   :type 'integer)
@@ -3351,6 +3369,78 @@ code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
                             (list :id nil :cell_type cell-type :outputs nil))
     (goto-char start)))
 
+(defun jsonyter--nb-put-cell (pos cell-type source)
+  "Insert a CELL-TYPE cell carrying SOURCE, beginning at POS.
+Like `jsonyter--nb-insert-cell' but with content: SOURCE (a string, a
+trailing newline optional) becomes the whole of the new cell's source.
+Returns the new cell overlay."
+  (goto-char pos)
+  (let* ((jsonyter--nb-cell-surgery t)
+         (inhibit-read-only t)
+         (start (point))
+         (adjacent (seq-filter (lambda (o) (= (overlay-start o) start))
+                               (jsonyter--nb-cells)))
+         (text (if (string-suffix-p "\n" source) source (concat source "\n"))))
+    (insert text)
+    (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
+    (prog1 (jsonyter--nb-make-cell
+            start (point)
+            (list :id nil :cell_type cell-type :outputs nil))
+      (goto-char start))))
+
+;;; LaTeX macros
+
+(defconst jsonyter--nb-latex-marker "<!-- jsonyter:latex-macros -->"
+  "Sentinel first line of the markdown cell jsonyter keeps LaTeX macros in.
+An HTML comment, so it renders as nothing; its job is to let
+`jsonyter-notebook-insert-latex-macros' find and replace its own cell
+rather than stack another one on every call.")
+
+(defun jsonyter--nb-latex-source ()
+  "Markdown source for the LaTeX-macros cell, or nil if none are configured."
+  (when jsonyter-notebook-latex-macros
+    (concat jsonyter--nb-latex-marker "\n$$\n"
+            (mapconcat #'identity jsonyter-notebook-latex-macros "\n")
+            "\n$$")))
+
+(defun jsonyter--nb-latex-cell ()
+  "The jsonyter-managed LaTeX-macros cell overlay in this buffer, or nil."
+  (seq-find (lambda (c)
+              (and (equal (overlay-get c 'jsonyter-cell-type) "markdown")
+                   (string-prefix-p jsonyter--nb-latex-marker
+                                    (jsonyter--nb-cell-source c))))
+            (jsonyter--nb-cells)))
+
+;;;###autoload
+(defun jsonyter-notebook-insert-latex-macros ()
+  "Put a markdown cell of LaTeX macro definitions at the top of the notebook.
+
+The macros come from `jsonyter-notebook-latex-macros' — one entry per
+line, typically a \\newcommand.  The cell is marked with a sentinel HTML
+comment, so calling this again replaces that cell rather than adding a
+second one; MathJax in Jupyter (and nbconvert) reads the \\newcommands
+and applies them to every later cell's math.
+
+With `jsonyter-notebook-latex-macros' nil, an existing macros cell is
+removed."
+  (interactive)
+  (jsonyter--nb-ensure-notebook)
+  (let ((existing (jsonyter--nb-latex-cell))
+        (source (jsonyter--nb-latex-source))
+        (n (length jsonyter-notebook-latex-macros)))
+    (unless (or existing source)
+      (user-error "jsonyter: set `jsonyter-notebook-latex-macros' first"))
+    (when existing (jsonyter--nb-excise-cell existing))
+    (if source
+        (progn
+          (jsonyter--nb-put-cell (point-min) "markdown" source)
+          (goto-char (point-min))
+          (set-buffer-modified-p t)
+          (message "jsonyter: %d LaTeX macro%s at the top of the notebook"
+                   n (if (= n 1) "" "s")))
+      (set-buffer-modified-p t)
+      (message "jsonyter: removed the LaTeX-macros cell"))))
+
 (defun jsonyter--nb-ensure-notebook ()
   "Signal an error unless the current buffer is a rendered notebook.
 The cell-editing commands are autoloaded and may be bound outside
@@ -3379,6 +3469,25 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
                               (if markdown "markdown" "code"))))
 
+(defun jsonyter--nb-excise-cell (cell)
+  "Remove CELL from the buffer — source and output together — no questions asked."
+  (let* ((jsonyter--nb-cell-surgery t)
+         (inhibit-read-only t)
+         (start (overlay-start cell))
+         (end (overlay-end cell))
+         (source-end (overlay-get cell 'jsonyter-source-end))
+         (src-end (marker-position source-end)))
+    ;; The output leaves the way it arrived: as text that was never part
+    ;; of the document.  Deleting it along with the source would put it
+    ;; in the undo history, and undoing would then restore a read-only
+    ;; block with no cell left to own it — text the buffer would give no
+    ;; way to remove again.
+    (with-silent-modifications (delete-region src-end end))
+    (jsonyter--forget-undo-after src-end)
+    (set-marker source-end nil)
+    (delete-overlay cell)
+    (delete-region start src-end)))
+
 ;;;###autoload
 (defun jsonyter-delete-cell ()
   "Delete the cell at point, source and output together."
@@ -3388,22 +3497,7 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (unless cell (user-error "No cell at point"))
     (when (or (string-blank-p (jsonyter--nb-cell-source cell))
               (yes-or-no-p "Delete this cell? "))
-      (let* ((jsonyter--nb-cell-surgery t)
-             (inhibit-read-only t)
-             (start (overlay-start cell))
-             (end (overlay-end cell))
-             (source-end (overlay-get cell 'jsonyter-source-end))
-             (src-end (marker-position source-end)))
-        ;; The output leaves the way it arrived: as text that was never
-        ;; part of the document.  Deleting it along with the source would
-        ;; put it in the undo history, and undoing would then restore a
-        ;; read-only block with no cell left to own it — text the buffer
-        ;; would give no way to remove again.
-        (with-silent-modifications (delete-region src-end end))
-        (jsonyter--forget-undo-after src-end)
-        (set-marker source-end nil)
-        (delete-overlay cell)
-        (delete-region start src-end)))))
+      (jsonyter--nb-excise-cell cell))))
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
@@ -3712,6 +3806,8 @@ Interactively, prompts for the language and the file name."
     (find-file file)
     (unless (bound-and-true-p jsonyter-notebook-mode)
       (jsonyter-notebook-open))
+    (when jsonyter-notebook-latex-macros
+      (jsonyter-notebook-insert-latex-macros))
     (message
      "jsonyter: new %s notebook — C-c C-i add a cell · C-RET run · C-x C-s save"
      language)

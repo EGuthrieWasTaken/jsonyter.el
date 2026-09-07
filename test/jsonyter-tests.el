@@ -1515,6 +1515,74 @@ cell and opens it rendered."
         (should-error (jsonyter-notebook-new path "python") :type 'user-error)
       (delete-file path))))
 
+;;;; LaTeX macros cell
+
+(ert-deftest jsonyter-test-latex-macros-source-shape ()
+  "The macros cell is a marked markdown block wrapping the \\newcommands in $$."
+  (let ((jsonyter-notebook-latex-macros
+         '("\\newcommand{\\R}{\\mathbb{R}}" "\\newcommand{\\Z}{\\mathbb{Z}}")))
+    (let ((s (jsonyter--nb-latex-source)))
+      (should (string-prefix-p jsonyter--nb-latex-marker s))
+      ;; opens with `$$' on its own line right after the marker line
+      (should (string-match-p (concat "\\`" (regexp-quote jsonyter--nb-latex-marker)
+                                      "\n\\$\\$\n")
+                              s))
+      (should (string-match-p "\\\\newcommand{\\\\R}{\\\\mathbb{R}}" s))
+      ;; ...and closes with `$$' on its own line
+      (should (string-match-p "\n\\$\\$\\'" s))))
+  (let ((jsonyter-notebook-latex-macros nil))
+    (should (null (jsonyter--nb-latex-source)))))
+
+(ert-deftest jsonyter-test-latex-macros-insert-replace-remove ()
+  "Inserting adds one marked markdown cell at the top; re-running replaces it
+in place; setting the option to nil removes it."
+  (jsonyter-tests--with-notebook
+    (let* ((jsonyter-notebook-latex-macros
+            '("\\newcommand{\\R}{\\mathbb{R}}" "\\newcommand{\\Z}{\\mathbb{Z}}"))
+           (before (length (jsonyter--nb-cells))))
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= (1+ before) (length (jsonyter--nb-cells))))
+      (let ((cell (jsonyter-tests--cell 0)))
+        (should (equal "markdown" (overlay-get cell 'jsonyter-cell-type)))
+        (should (string-prefix-p jsonyter--nb-latex-marker
+                                 (jsonyter--nb-cell-source cell)))
+        (should (string-match-p "mathbb{R}" (jsonyter--nb-cell-source cell))))
+      ;; The original first cell is still there, now second, untouched.
+      (should (equal "x = 1" (jsonyter--nb-cell-source (jsonyter-tests--cell 1))))
+      ;; Re-running replaces rather than stacks.
+      (setq jsonyter-notebook-latex-macros '("\\newcommand{\\N}{\\mathbb{N}}"))
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= (1+ before) (length (jsonyter--nb-cells))))
+      (should (string-match-p "mathbb{N}"
+                              (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))
+      (should-not (string-match-p "mathbb{R}"
+                                  (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))
+      ;; nil removes it.
+      (setq jsonyter-notebook-latex-macros nil)
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= before (length (jsonyter--nb-cells))))
+      (should-not (jsonyter--nb-latex-cell)))))
+
+(ert-deftest jsonyter-test-notebook-new-seeds-latex-macros ()
+  "`jsonyter-notebook-new' seeds the macros cell when the option is set."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}"))
+        (buf nil))
+    (delete-file path)
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "python"))
+          (with-current-buffer buf
+            (should (= 2 (length (jsonyter--nb-cells))))
+            (should (jsonyter--nb-latex-cell))
+            (should (string-match-p
+                     "mathbb{R}"
+                     (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
 ;;;; File transfer
 
 ;; These never touch a bridge: the dispatch tests feed a JSON line to

@@ -470,6 +470,22 @@ These were named `jsonyter-notebook-insert-cell-below` and so on through
 execution counts, leaving the notebook as though nothing had been run. It
 does the equivalent thing in a REPL or script buffer too.
 
+### LaTeX macros
+
+Set `jsonyter-notebook-latex-macros` to a list of `\newcommand` lines and
+`M-x jsonyter-notebook-insert-latex-macros` puts them in a markdown cell
+at the top of the notebook — inside `$$…$$`, behind a sentinel HTML
+comment so re-running it replaces that cell rather than adding another.
+MathJax, in Jupyter and in `nbconvert`, reads the `\newcommand`s and
+applies them to every later cell's math. `jsonyter-notebook-new` seeds
+the cell automatically when the option is set.
+
+```elisp
+(setq jsonyter-notebook-latex-macros
+      '("\\newcommand{\\R}{\\mathbb{R}}"
+        "\\newcommand{\\abs}[1]{\\left|#1\\right|}"))
+```
+
 Outputs stored in the file are rendered when it opens, including figures.
 Running a cell **replaces** its output rather than appending, and results
 are session-only — they are never written back to the file.
@@ -899,7 +915,7 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 106 tests under `emacs -Q --batch`, where there is no frame, no
+That runs 109 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
