@@ -182,8 +182,9 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-subscribe-events` | `t` | Subscribe to kernel state events for the mode-line indicator. |
 | `jsonyter-use-is-complete` | `t` | Ask the kernel whether input is complete before sending on RET. |
 | `jsonyter-exec-timeout` | `nil` | Kernel-silence timeout passed to the bridge; `nil` waits indefinitely (right for SAS's slow startup). |
-| `jsonyter-image-max-width` | `800` | Max pixel width for inline images. |
+| `jsonyter-image-max-width` | `800` | Max pixel width for inline images (a REPL; in a notebook or script cell `jsonyter-notebook-output-width` also applies). |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
+| `jsonyter-notebook-output-width` | `80` | Columns wide the rules framing a notebook/script cell's output are drawn, and the column ceiling an image in that output is scaled to line up with them. |
 | `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
 | `jsonyter-suppress-line-spacing` | `t` | Drop `line-spacing` in REPL and notebook buffers, where its leading would band a sliced image. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
@@ -245,11 +246,14 @@ was already at the end, so you can read back through the buffer while a
 cell is still running.
 
 In notebook and `# %%` script buffers, each output block is **framed**
-above and below by a labelled rule, so where a cell's code ends and its
-results begin stays clear however long the output runs. A cell with no
-output has no frame at all. Edit a cell's source after it has run and its
-frame changes face and reads `output (stale)`, flagging results that may
-no longer match the code in front of you; re-running the cell clears it,
+above and below by a labelled rule `jsonyter-notebook-output-width`
+columns wide (80 by default), so where a cell's code ends and its
+results begin stays clear however long the output runs — and an image in
+that output is scaled to fit the same width, so a wide figure lines up
+with the frame rather than running past it. A cell with no output has no
+frame at all. Edit a cell's source after it has run and its frame
+changes face and reads `output (stale)`, flagging results that may no
+longer match the code in front of you; re-running the cell clears it,
 and so does undoing back to the source that produced the output. The
 check is a hash of that one cell's source per edit, so it costs nothing
 even on cells with very large outputs.
@@ -915,7 +919,7 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 109 tests under `emacs -Q --batch`, where there is no frame, no
+That runs 112 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what

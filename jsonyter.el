@@ -282,6 +282,18 @@ Used for a notebook cell's own prompt, and for the session rules in the
 listing `jsonyter-kernel-history' produces."
   :type 'integer)
 
+(defcustom jsonyter-notebook-output-width 80
+  "Column width of the frame around a notebook (or script) cell's output.
+
+The rules above and below the output block are drawn this many columns
+wide, and an image in that output is scaled so it is no wider than this
+many columns either — so a wide figure lines up with the frame rather
+than running past it.  A REPL keeps `jsonyter-image-max-width' instead.
+
+The image cap is a ceiling: a smaller `jsonyter-image-max-width', or a
+`jsonyter-image-max-height' that bites first, still wins."
+  :type 'integer)
+
 (defcustom jsonyter-notebook-latex-macros nil
   "LaTeX macro definitions to seed a notebook's math with.
 
@@ -1391,12 +1403,24 @@ the same frame, and what happens to the fit when they are not."
         (insert-image image alt)
         (insert "\n")))))
 
+(defvar jsonyter--output-image-max-width nil
+  "Pixel ceiling on image width for the output being rendered, or nil.
+Bound by `jsonyter--nb-render-string' to `jsonyter-notebook-output-width'
+columns' worth of pixels so a figure in a notebook or script cell lines
+up with the output frame; `jsonyter--image-scale-props' takes the
+tighter of this and `jsonyter-image-max-width'.  Unset in a REPL.")
+
 (defun jsonyter--image-scale-props ()
   "Scaling properties to hand `create-image', per the size options."
-  (append (and jsonyter-image-max-width
-               (list :max-width jsonyter-image-max-width))
-          (and jsonyter-image-max-height
-               (list :max-height jsonyter-image-max-height))))
+  (let ((max-width (cond ((and jsonyter-image-max-width
+                               jsonyter--output-image-max-width)
+                          (min jsonyter-image-max-width
+                               jsonyter--output-image-max-width))
+                         (t (or jsonyter-image-max-width
+                                jsonyter--output-image-max-width)))))
+    (append (and max-width (list :max-width max-width))
+            (and jsonyter-image-max-height
+                 (list :max-height jsonyter-image-max-height)))))
 
 (defun jsonyter--insert-encoded-image (base64-data type)
   "Insert an inline image of TYPE from BASE64-DATA, with a text fallback."
@@ -2601,7 +2625,17 @@ does not have.  Only script cells pass it."
         ;; without this override the scratch buffer would fall back to
         ;; the selected frame regardless of which one is showing the
         ;; notebook -- see `jsonyter--display-frame-override'.
-        (jsonyter--display-frame-override (jsonyter--display-frame)))
+        (jsonyter--display-frame-override (jsonyter--display-frame))
+        ;; Cap image width at `jsonyter-notebook-output-width' columns so
+        ;; a figure lines up with the output frame.  Computed here for
+        ;; the same reason as the frame override -- the scratch buffer
+        ;; has no frame of its own to ask.  A failure to measure (no
+        ;; usable frame) just means no cap, exactly as before.
+        (jsonyter--output-image-max-width
+         (and (natnump jsonyter-notebook-output-width)
+              (ignore-errors
+                (* jsonyter-notebook-output-width
+                   (frame-char-width (jsonyter--display-frame)))))))
     (with-temp-buffer
       (setq-local line-spacing spacing)
       (setq-local jsonyter--clear-pending nil)
@@ -2634,15 +2668,14 @@ string there is nothing to protect, and as buffer text the whole span
            (label (if stale "output (stale)" "output"))
            (help (and stale
                       "Source edited since this output was produced — re-run the cell to refresh it"))
-           (rule (make-string (max 4 (- jsonyter-notebook-separator-width
-                                        (1+ (length label))))
-                              ?─)))
+           (width (max (+ 5 (length label)) jsonyter-notebook-output-width))
+           (rule (make-string (- width (1+ (length label))) ?─)))
       (concat
        (propertize (concat label " " rule "\n") 'face face 'help-echo help)
        rendered
        (if (string-suffix-p "\n" rendered) "" "\n")
        (propertize
-        (concat (make-string jsonyter-notebook-separator-width ?─) "\n")
+        (concat (make-string width ?─) "\n")
         'face face 'help-echo help)))))
 
 ;;; Cell overlays

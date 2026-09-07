@@ -127,7 +127,10 @@ sliced image is expected to occupy HEIGHT/LINE-HEIGHT of them."
              ((symbol-function 'create-image)
               (lambda (data &optional type _data-p &rest props)
                 (append (list 'image :type (or type 'png) :data data) props)))
-             ((symbol-function 'default-font-height) (lambda (&rest _) ,line-height)))
+             ((symbol-function 'default-font-height) (lambda (&rest _) ,line-height))
+             ;; A monospace cell of 10px, so an image capped at N columns
+             ;; comes out :max-width (* 10 N).
+             ((symbol-function 'frame-char-width) (lambda (&rest _) 10)))
      ,@body))
 
 (defmacro jsonyter-tests--with-global-line-spacing (spacing &rest body)
@@ -1562,6 +1565,60 @@ in place; setting the option to nil removes it."
       (jsonyter-notebook-insert-latex-macros)
       (should (= before (length (jsonyter--nb-cells))))
       (should-not (jsonyter--nb-latex-cell)))))
+
+;;;; Output frame and image width
+
+(ert-deftest jsonyter-test-notebook-output-frame-spans-the-configured-width ()
+  "The rules framing a cell's output span `jsonyter-notebook-output-width'."
+  (let* ((jsonyter-notebook-output-width 80)
+         (framed (jsonyter--nb-outputs-string "hello\n" nil))
+         (lines (split-string framed "\n")))
+    (should (= 80 (length (nth 0 lines))))            ; "output " + rule
+    (should (member (make-string 80 ?─) lines)))      ; the closing rule
+  ;; a narrow setting still leaves room for the label
+  (let* ((jsonyter-notebook-output-width 3)
+         (lines (split-string (jsonyter--nb-outputs-string "x\n" t) "\n")))
+    (should (string-prefix-p "output (stale) " (nth 0 lines)))))
+
+(defun jsonyter-tests--image-spec (propertized)
+  "The `image' spec carried by the first display-propertied char of PROPERTIED,
+unwrapping a `(slice ... IMAGE)' if the image was sliced."
+  (let* ((pos (text-property-not-all 0 (length propertized) 'display nil
+                                     propertized))
+         (disp (and pos (get-text-property pos 'display propertized))))
+    (cond ((null disp) nil)
+          ((eq (car-safe disp) 'image) disp)
+          ((eq (car-safe (car-safe disp)) 'slice) (cadr disp))
+          (t disp))))
+
+(ert-deftest jsonyter-test-notebook-image-capped-to-output-width ()
+  "An image in notebook output is scaled to at most
+`jsonyter-notebook-output-width' columns, taking the tighter of that and
+`jsonyter-image-max-width'."
+  (jsonyter-tests--with-notebook
+    (jsonyter-tests--with-fake-display 40 20
+      (let ((jsonyter-slice-images nil)          ; one glyph, :max-width intact
+            (jsonyter-notebook-output-width 50)  ; 50 cols * 10px stub = 500
+            (jsonyter-image-max-width 800)
+            (cell (jsonyter-tests--cell 0)))
+        (jsonyter--nb-append-output
+         cell (jsonyter-tests--png (base64-encode-string "png")))
+        (let ((spec (jsonyter-tests--image-spec
+                     (overlay-get cell 'jsonyter-output-string))))
+          (should (eq 'image (car spec)))
+          (should (= 500 (plist-get (cdr spec) :max-width))))))))
+
+(ert-deftest jsonyter-test-repl-image-keeps-image-max-width ()
+  "The REPL path does not go through the notebook output cap."
+  (jsonyter-tests--with-fake-display 40 20
+    (with-temp-buffer
+      (let ((jsonyter-slice-images nil)
+            (jsonyter-image-max-width 800)
+            (jsonyter-notebook-output-width 50))
+        (jsonyter--insert-encoded-image (base64-encode-string "png") 'png)
+        (let ((spec (jsonyter-tests--image-spec (buffer-string))))
+          (should (eq 'image (car spec)))
+          (should (= 800 (plist-get (cdr spec) :max-width))))))))
 
 (ert-deftest jsonyter-test-notebook-new-seeds-latex-macros ()
   "`jsonyter-notebook-new' seeds the macros cell when the option is set."
