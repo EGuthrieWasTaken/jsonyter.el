@@ -1473,6 +1473,48 @@ own visibility cycling hides committed-free session output for us."
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
 
+;;;; Creating a blank notebook
+
+(ert-deftest jsonyter-test-notebook-new-writes-a-valid-blank-notebook ()
+  "`jsonyter-notebook-new' writes an nbformat 4.5 file with one empty code
+cell and opens it rendered."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (buf nil))
+    (delete-file path)                   ; the command refuses an existing file
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "python"))
+          (should (file-exists-p path))
+          (with-current-buffer buf
+            (should (bound-and-true-p jsonyter-notebook-mode))
+            (should (= 1 (length (jsonyter--nb-cells))))
+            (should (equal "code" (overlay-get (jsonyter-tests--cell 0)
+                                               'jsonyter-cell-type)))
+            (should (equal "" (jsonyter--nb-cell-source (jsonyter-tests--cell 0)))))
+          (let* ((json (with-temp-buffer
+                         (insert-file-contents path)
+                         (json-parse-buffer :object-type 'plist :array-type 'list)))
+                 (cell (car (plist-get json :cells))))
+            (should (= 4 (plist-get json :nbformat)))
+            (should (= 5 (plist-get json :nbformat_minor)))
+            (should (equal "python"
+                           (plist-get (plist-get (plist-get json :metadata)
+                                                 :kernelspec)
+                                      :language)))
+            (should (equal "code" (plist-get cell :cell_type)))
+            (should (stringp (plist-get cell :id)))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest jsonyter-test-notebook-new-refuses-to-clobber ()
+  "`jsonyter-notebook-new' will not overwrite a file that is already there."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb")))
+    (unwind-protect
+        (should-error (jsonyter-notebook-new path "python") :type 'user-error)
+      (delete-file path))))
+
 ;;;; File transfer
 
 ;; These never touch a bridge: the dispatch tests feed a JSON line to

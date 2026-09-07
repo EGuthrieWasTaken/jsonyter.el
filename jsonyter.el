@@ -3645,6 +3645,78 @@ font-lock, so undo and editing still see only the cell source.
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
     (jsonyter-mode -1)))
 
+(defun jsonyter--nb-new-id ()
+  "A fresh cell id for a notebook written at nbformat 4.5."
+  (substring (md5 (format "%s-%s-%s" (float-time)
+                          (random most-positive-fixnum) (emacs-pid)))
+             0 12))
+
+(defun jsonyter--nb-blank-json (language)
+  "The JSON text of a blank nbformat 4.5 notebook for LANGUAGE.
+One empty code cell, a `kernelspec' whose name comes from
+`jsonyter-kernel-names' (falling back to LANGUAGE itself), and
+Jupyter's own one-space indentation so an unedited save is a no-op."
+  (let ((name (or (cdr (assoc-string language jsonyter-kernel-names t))
+                  language))
+        (id (jsonyter--nb-new-id)))
+    (format "{
+ \"cells\": [
+  {
+   \"cell_type\": \"code\",
+   \"execution_count\": null,
+   \"id\": %S,
+   \"metadata\": {},
+   \"outputs\": [],
+   \"source\": []
+  }
+ ],
+ \"metadata\": {
+  \"kernelspec\": {
+   \"display_name\": %S,
+   \"language\": %S,
+   \"name\": %S
+  },
+  \"language_info\": {
+   \"name\": %S
+  }
+ },
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+            id (capitalize language) language name language)))
+
+;;;###autoload
+(defun jsonyter-notebook-new (path &optional language)
+  "Create a new blank notebook at PATH and open it rendered.
+
+The file is a valid nbformat 4.5 notebook with one empty code cell and
+a kernelspec for LANGUAGE (default \"python\"; resolved through
+`jsonyter-kernel-names' for the spec name).  No kernel is started and
+the server is not contacted — that happens on the first run, exactly as
+for a notebook opened from disk.
+
+Interactively, prompts for the language and the file name."
+  (interactive
+   (let ((language (read-string "Notebook kernel language: " nil nil "python")))
+     (list (read-file-name "New notebook: " nil nil nil "untitled.ipynb")
+           language)))
+  (let ((file (expand-file-name path))
+        (language (or language "python")))
+    (unless (string-suffix-p ".ipynb" file)
+      (setq file (concat file ".ipynb")))
+    (when (file-exists-p file)
+      (user-error "jsonyter: %s already exists" file))
+    (with-temp-file file
+      (insert (jsonyter--nb-blank-json language)))
+    (find-file file)
+    (unless (bound-and-true-p jsonyter-notebook-mode)
+      (jsonyter-notebook-open))
+    (message
+     "jsonyter: new %s notebook — C-c C-i add a cell · C-RET run · C-x C-s save"
+     language)
+    (current-buffer)))
+
 ;;;###autoload
 (defun jsonyter-notebook-open ()
   "Render the current buffer's .ipynb content as a notebook.

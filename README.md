@@ -390,6 +390,11 @@ JSON:
 (add-to-list 'auto-mode-alist '("\\.ipynb\\'" . jsonyter-notebook-open))
 ```
 
+`M-x jsonyter-notebook-new` writes a fresh nbformat 4.5 notebook — one
+empty code cell, a kernelspec for the language you name — and opens it
+rendered. No kernel starts and the server is not contacted until the
+first run.
+
 Cell source is ordinary buffer text, edited in the notebook language's own
 major mode — `python-mode`, `ess-r-mode`, and so on, per
 `jsonyter-notebook-language-modes` — so syntax highlighting, indentation
@@ -894,7 +899,7 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 104 tests under `emacs -Q --batch`, where there is no frame, no
+That runs 106 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
