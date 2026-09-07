@@ -127,7 +127,10 @@ sliced image is expected to occupy HEIGHT/LINE-HEIGHT of them."
              ((symbol-function 'create-image)
               (lambda (data &optional type _data-p &rest props)
                 (append (list 'image :type (or type 'png) :data data) props)))
-             ((symbol-function 'default-font-height) (lambda (&rest _) ,line-height)))
+             ((symbol-function 'default-font-height) (lambda (&rest _) ,line-height))
+             ;; A monospace cell of 10px, so an image capped at N columns
+             ;; comes out :max-width (* 10 N).
+             ((symbol-function 'frame-char-width) (lambda (&rest _) 10)))
      ,@body))
 
 (defmacro jsonyter-tests--with-global-line-spacing (spacing &rest body)
@@ -1448,7 +1451,12 @@ own visibility cycling hides committed-free session output for us."
 (ert-deftest jsonyter-test-org-to-notebook-round-trips-with-bridge ()
   "An unedited round trip through `write_notebook' preserves every cell id."
   (skip-unless (jsonyter-tests--bridge-available-p))
-  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+  ;; Launch the bridge the way the guard checks for it — as a module —
+  ;; so a setup with the package importable but no `jsonyter' console
+  ;; script on PATH runs rather than failing to find the executable.
+  ;; Matches `jsonyter-test-save-*' above.
+  (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
+         (jsonyter-org-markdown-converter (lambda (text _dir) text))
          (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
          (org (make-temp-file "jsonyter-test-" nil ".org")))
     (unwind-protect
@@ -1467,6 +1475,452 @@ own visibility cycling hides committed-free session output for us."
             (should (equal '("aaa" "bbb" "ccc") ids))))
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+;;;; Creating a blank notebook
+
+(ert-deftest jsonyter-test-notebook-new-writes-a-valid-blank-notebook ()
+  "`jsonyter-notebook-new' writes an nbformat 4.5 file with one empty code
+cell and opens it rendered."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (buf nil))
+    (delete-file path)                   ; the command refuses an existing file
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "python"))
+          (should (file-exists-p path))
+          (with-current-buffer buf
+            (should (bound-and-true-p jsonyter-notebook-mode))
+            (should (= 1 (length (jsonyter--nb-cells))))
+            (should (equal "code" (overlay-get (jsonyter-tests--cell 0)
+                                               'jsonyter-cell-type)))
+            (should (equal "" (jsonyter--nb-cell-source (jsonyter-tests--cell 0)))))
+          (let* ((json (with-temp-buffer
+                         (insert-file-contents path)
+                         (json-parse-buffer :object-type 'plist :array-type 'list)))
+                 (cell (car (plist-get json :cells))))
+            (should (= 4 (plist-get json :nbformat)))
+            (should (= 5 (plist-get json :nbformat_minor)))
+            (should (equal "python"
+                           (plist-get (plist-get (plist-get json :metadata)
+                                                 :kernelspec)
+                                      :language)))
+            (should (equal "code" (plist-get cell :cell_type)))
+            (should (stringp (plist-get cell :id)))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest jsonyter-test-notebook-new-refuses-to-clobber ()
+  "`jsonyter-notebook-new' will not overwrite a file that is already there."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb")))
+    (unwind-protect
+        (should-error (jsonyter-notebook-new path "python") :type 'user-error)
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-notebook-new-refuses-a-missing-directory ()
+  "`jsonyter-notebook-new' reports a friendly error, not a raw file-error,
+when the target directory does not exist."
+  (should-error
+   (jsonyter-notebook-new "/no/such/dir/anywhere/x.ipynb" "python")
+   :type 'user-error))
+
+(ert-deftest jsonyter-test-nb-blank-json-is-always-valid-json ()
+  "An odd LANGUAGE (control chars, quotes) still yields a parseable notebook."
+  (dolist (language '("python" "R" "sas" "py\nthon" "a\"b" "x\ty"))
+    (let ((json (json-parse-string (jsonyter--nb-blank-json language)
+                                   :object-type 'plist :array-type 'list)))
+      (should (= 4 (plist-get json :nbformat)))
+      (should (equal language
+                     (plist-get (plist-get (plist-get json :metadata)
+                                           :kernelspec)
+                                :language)))))
+  ;; the well-known kernels get their conventional name and label
+  (let ((json (json-parse-string (jsonyter--nb-blank-json "python")
+                                 :object-type 'plist)))
+    (should (equal "python3"
+                   (plist-get (plist-get (plist-get json :metadata) :kernelspec)
+                              :name)))
+    (should (equal "Python 3"
+                   (plist-get (plist-get (plist-get json :metadata) :kernelspec)
+                              :display_name)))))
+
+(ert-deftest jsonyter-test-notebook-new-defaults-a-blank-language ()
+  "An empty or whitespace LANGUAGE falls back to python rather than an
+unresolvable empty kernelspec."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (buf nil))
+    (delete-file path)
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "   "))
+          (with-current-buffer buf
+            (should (equal "python" jsonyter--nb-lang))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
+;;;; LaTeX macros cell
+
+(ert-deftest jsonyter-test-latex-macros-source-shape ()
+  "The macros cell is a marked markdown block wrapping the \\newcommands in $$."
+  (let ((jsonyter-notebook-latex-macros
+         '("\\newcommand{\\R}{\\mathbb{R}}" "\\newcommand{\\Z}{\\mathbb{Z}}")))
+    (let ((s (jsonyter--nb-latex-source)))
+      (should (string-prefix-p jsonyter--nb-latex-marker s))
+      ;; opens with `$$' on its own line right after the marker line
+      (should (string-match-p (concat "\\`" (regexp-quote jsonyter--nb-latex-marker)
+                                      "\n\\$\\$\n")
+                              s))
+      (should (string-match-p "\\\\newcommand{\\\\R}{\\\\mathbb{R}}" s))
+      ;; ...and closes with `$$' on its own line
+      (should (string-match-p "\n\\$\\$\\'" s))))
+  (let ((jsonyter-notebook-latex-macros nil))
+    (should (null (jsonyter--nb-latex-source)))))
+
+(ert-deftest jsonyter-test-latex-macros-insert-replace-remove ()
+  "Inserting adds one marked markdown cell at the top; re-running replaces it
+in place; setting the option to nil removes it."
+  (jsonyter-tests--with-notebook
+    (let* ((jsonyter-notebook-latex-macros
+            '("\\newcommand{\\R}{\\mathbb{R}}" "\\newcommand{\\Z}{\\mathbb{Z}}"))
+           (before (length (jsonyter--nb-cells))))
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= (1+ before) (length (jsonyter--nb-cells))))
+      (let ((cell (jsonyter-tests--cell 0)))
+        (should (equal "markdown" (overlay-get cell 'jsonyter-cell-type)))
+        (should (string-prefix-p jsonyter--nb-latex-marker
+                                 (jsonyter--nb-cell-source cell)))
+        (should (string-match-p "mathbb{R}" (jsonyter--nb-cell-source cell))))
+      ;; The original first cell is still there, now second, untouched.
+      (should (equal "x = 1" (jsonyter--nb-cell-source (jsonyter-tests--cell 1))))
+      ;; Re-running replaces rather than stacks.
+      (setq jsonyter-notebook-latex-macros '("\\newcommand{\\N}{\\mathbb{N}}"))
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= (1+ before) (length (jsonyter--nb-cells))))
+      (should (string-match-p "mathbb{N}"
+                              (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))
+      (should-not (string-match-p "mathbb{R}"
+                                  (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))
+      ;; nil removes it.
+      (setq jsonyter-notebook-latex-macros nil)
+      (jsonyter-notebook-insert-latex-macros)
+      (should (= before (length (jsonyter--nb-cells))))
+      (should-not (jsonyter--nb-latex-cell)))))
+
+(ert-deftest jsonyter-test-latex-macros-refresh-keeps-undo-history ()
+  "Refreshing the managed macros cell (a top-of-buffer cell with no output)
+does not throw away the buffer's undo history."
+  (jsonyter-tests--with-notebook
+    (buffer-enable-undo)
+    (let ((jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}")))
+      (jsonyter-notebook-insert-latex-macros)
+      (setq buffer-undo-list nil)
+      ;; an ordinary, undoable edit further down the buffer
+      (let ((cell (jsonyter-tests--cell 1)))
+        (goto-char (1- (marker-position (overlay-get cell 'jsonyter-source-end))))
+        (insert "42"))
+      (should (string-match-p "x = 142" (buffer-string)))
+      ;; refresh the macros cell: excises the top cell, re-inserts it
+      (setq jsonyter-notebook-latex-macros '("\\newcommand{\\Z}{\\mathbb{Z}}"))
+      (jsonyter-notebook-insert-latex-macros)
+      ;; the edit further down is still in the history and can be undone
+      (let ((n 0))
+        (while (and (consp buffer-undo-list) (< n 100))
+          (setq buffer-undo-list (primitive-undo 1 buffer-undo-list)
+                n (1+ n))))
+      (should-not (string-match-p "x = 142" (buffer-string))))))
+
+;;;; Output frame and image width
+
+(ert-deftest jsonyter-test-notebook-output-frame-spans-the-configured-width ()
+  "The rules framing a cell's output span `jsonyter-notebook-output-width'."
+  (let* ((jsonyter-notebook-output-width 80)
+         (framed (jsonyter--nb-outputs-string "hello\n" nil))
+         (lines (split-string framed "\n")))
+    (should (= 80 (length (nth 0 lines))))            ; "output " + rule
+    (should (member (make-string 80 ?─) lines)))      ; the closing rule
+  ;; a narrow setting still leaves room for the label
+  (let* ((jsonyter-notebook-output-width 3)
+         (lines (split-string (jsonyter--nb-outputs-string "x\n" t) "\n")))
+    (should (string-prefix-p "output (stale) " (nth 0 lines)))))
+
+(defun jsonyter-tests--image-spec (propertized)
+  "The `image' spec carried by the first display-propertied char of PROPERTIED,
+unwrapping a `(slice ... IMAGE)' if the image was sliced."
+  (let* ((pos (text-property-not-all 0 (length propertized) 'display nil
+                                     propertized))
+         (disp (and pos (get-text-property pos 'display propertized))))
+    (cond ((null disp) nil)
+          ((eq (car-safe disp) 'image) disp)
+          ((eq (car-safe (car-safe disp)) 'slice) (cadr disp))
+          (t disp))))
+
+(ert-deftest jsonyter-test-notebook-image-capped-to-output-width ()
+  "An image in notebook output is scaled to at most
+`jsonyter-notebook-output-width' columns, taking the tighter of that and
+`jsonyter-image-max-width'."
+  (jsonyter-tests--with-notebook
+    (jsonyter-tests--with-fake-display 40 20
+      (let ((jsonyter-slice-images nil)          ; one glyph, :max-width intact
+            (jsonyter-notebook-output-width 50)  ; 50 cols * 10px stub = 500
+            (jsonyter-image-max-width 800)
+            (cell (jsonyter-tests--cell 0)))
+        (jsonyter--nb-append-output
+         cell (jsonyter-tests--png (base64-encode-string "png")))
+        (let ((spec (jsonyter-tests--image-spec
+                     (overlay-get cell 'jsonyter-output-string))))
+          (should (eq 'image (car spec)))
+          (should (= 500 (plist-get (cdr spec) :max-width))))))))
+
+(ert-deftest jsonyter-test-repl-image-keeps-image-max-width ()
+  "The REPL path does not go through the notebook output cap."
+  (jsonyter-tests--with-fake-display 40 20
+    (with-temp-buffer
+      (let ((jsonyter-slice-images nil)
+            (jsonyter-image-max-width 800)
+            (jsonyter-notebook-output-width 50))
+        (jsonyter--insert-encoded-image (base64-encode-string "png") 'png)
+        (let ((spec (jsonyter-tests--image-spec (buffer-string))))
+          (should (eq 'image (car spec)))
+          (should (= 800 (plist-get (cdr spec) :max-width))))))))
+
+(ert-deftest jsonyter-test-notebook-new-seeds-latex-macros ()
+  "`jsonyter-notebook-new' seeds the macros cell when the option is set."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}"))
+        (buf nil))
+    (delete-file path)
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "python"))
+          (with-current-buffer buf
+            (should (= 2 (length (jsonyter--nb-cells))))
+            (should (jsonyter--nb-latex-cell))
+            (should (string-match-p
+                     "mathbb{R}"
+                     (jsonyter--nb-cell-source (jsonyter-tests--cell 0))))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
+;;;; File transfer
+
+;; These never touch a bridge: the dispatch tests feed a JSON line to
+;; `jsonyter--dispatch' directly, and `jsonyter--transfer-run' is driven
+;; with `jsonyter--send' stubbed, in the shape the bridge would answer.
+
+(ert-deftest jsonyter-test-transfer-progress-routes-to-its-handler ()
+  "A `progress' line reaches the :progress handler and leaves the request pending."
+  (with-temp-buffer
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (progress-seen result-seen)
+      (puthash 7 (list :progress (lambda (ev) (setq progress-seen ev))
+                       :result (lambda (_msg) (setq result-seen t)))
+               jsonyter--callbacks)
+      (jsonyter--dispatch
+       nil (concat "{\"id\": 7, \"progress\": {\"phase\": \"upload\", "
+                   "\"bytes_done\": 5, \"bytes_total\": 10}}"))
+      (should (equal "upload" (plist-get progress-seen :phase)))
+      (should (equal 5 (plist-get progress-seen :bytes_done)))
+      (should-not result-seen)
+      ;; A progress line must not complete (remhash) the request.
+      (should (gethash 7 jsonyter--callbacks))
+      ;; The real `result' line still does.
+      (jsonyter--dispatch nil "{\"id\": 7, \"result\": {\"verified\": \"sha256\"}}")
+      (should result-seen)
+      (should-not (gethash 7 jsonyter--callbacks)))))
+
+(ert-deftest jsonyter-test-transfer-progress-reaches-100-and-cleans-up ()
+  "Progress hits 100% on success; the tag and reporter are torn down even on a
+mid-transfer error, not only on success."
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (handlers nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (_m _p hs) (setq handlers hs) 1)))
+        ;; --- success: a final progress event carries done == total ---
+        (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                (list :local_path "/tmp/x" :remote_path "d/x"))
+        (funcall (plist-get handlers :progress) '(:bytes_done 5 :bytes_total 10))
+        (should (equal 50 (plist-get (jsonyter--session-transfer session) :pct)))
+        (funcall (plist-get handlers :progress) '(:bytes_done 10 :bytes_total 10))
+        (should (equal 100 (plist-get (jsonyter--session-transfer session) :pct)))
+        (funcall (plist-get handlers :result)
+                 '(:result (:path "d/x" :local_path "/tmp/x" :bytes 10
+                            :verified "sha256" :elapsed 1)))
+        (should (null (jsonyter--session-transfer session)))
+        (should (null jsonyter--last-failed-transfer))
+        ;; --- error partway: the tag clears and the last failure is recorded ---
+        (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                (list :local_path "/tmp/x" :remote_path "d/x"))
+        (funcall (plist-get handlers :progress) '(:bytes_done 3 :bytes_total 10))
+        (should (jsonyter--session-transfer session))
+        (funcall (plist-get handlers :result)
+                 '(:error (:message "upload failed at chunk 2/4")))
+        (should (null (jsonyter--session-transfer session)))
+        (should (equal "upload"
+                       (plist-get jsonyter--last-failed-transfer :method))))
+      ;; --- jsonyter--send signals synchronously (dead bridge): the tag it
+      ;; just set must be cleared, and the signal must propagate. ---
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (&rest _) (error "bridge process is not running"))))
+        (should-error
+         (jsonyter--transfer-run (cons (current-buffer) session) "download"
+                                 (list :remote_path "d/x" :local_path "/tmp/x")))
+        (should (null (jsonyter--session-transfer session)))))))
+
+(ert-deftest jsonyter-test-error-message-does-not-blame-chunk-size-for-origin-errors ()
+  "A cf-ray on a genuine origin 4xx/5xx (Cloudflare tags every proxied
+response) must NOT be rendered as a chunk-size problem, even though the
+bridge always puts \"chunk\" in an upload-failure message."
+  (let ((m (jsonyter--error-message
+            '(:error "JupyterError"
+              :message "upload of data/missing/x.csv failed at chunk 1/1 (0 B written) — No such file or directory — lower --chunk-size (currently 8.0 MB), then resume from byte 0"
+              :status 404 :cf_ray "cf-abc"))))
+    (should-not (string-match-p "jsonyter-upload-chunk-size" m))
+    ;; a real proxy 413 still is
+    (should (string-match-p
+             "jsonyter-upload-chunk-size"
+             (jsonyter--error-message
+              '(:error "JupyterError" :message "at chunk 1/1 — Request Entity Too Large"
+                :status 413 :cf_ray "cf-abc"))))))
+
+(ert-deftest jsonyter-test-resume-upload-re-reads-the-chunk-size ()
+  "The documented proxy-413 recovery -- lower `jsonyter-upload-chunk-size',
+then resume -- actually takes effect: resume replays the freshly lowered
+size, not the one baked in at the first call."
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (sent nil) (handlers nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                 (lambda (_m params hs) (setq sent params handlers hs) 1))
+                ((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) session))))
+        (let ((jsonyter-upload-chunk-size (* 64 1024 1024)))
+          (jsonyter--transfer-run (cons (current-buffer) session) "upload"
+                                  (list :local_path "/tmp/x" :remote_path "d/x"
+                                        :chunk_size jsonyter-upload-chunk-size))
+          (funcall (plist-get handlers :result)
+                   '(:error (:message "HTTP 413" :status 413 :cf_ray "z"))))
+        (should (equal "upload"
+                       (plist-get jsonyter--last-failed-transfer :method)))
+        (let ((jsonyter-upload-chunk-size (* 8 1024 1024)))
+          (jsonyter-resume-upload))
+        (should (eq t (plist-get sent :resume)))
+        (should (equal (* 8 1024 1024) (plist-get sent :chunk_size)))))))
+
+(ert-deftest jsonyter-test-remote-completion-slashes-dirs-and-refetches ()
+  "Remote path completion suffixes directories with `/' and lists a directory
+afresh on descent past a `/'."
+  (with-temp-buffer
+    (let ((calls nil))
+      (cl-letf (((symbol-function 'jsonyter--remote-children)
+                 (lambda (_buf path)
+                   (push path calls)
+                   (pcase path
+                     ("" (list '(:name "sub" :type "directory" :path "sub")
+                               '(:name "a.csv" :type "file" :path "a.csv")))
+                     ("sub/" (list '(:name "b.csv" :type "file" :path "sub/b.csv")))
+                     (_ nil))))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt table &rest _)
+                   (let ((root (all-completions "" table)))
+                     (should (member "sub/" root))
+                     (should (member "a.csv" root)))
+                   (let ((down (all-completions "sub/" table)))
+                     (should (member "sub/b.csv" down)))
+                   "sub/b.csv")))
+        (should (equal "sub/b.csv"
+                       (jsonyter--read-remote-path (current-buffer) "Remote")))
+        (should (member "" calls))
+        (should (member "sub/" calls))))))
+
+(ert-deftest jsonyter-test-remote-dired-dims-nonwritable-and-dirs-first ()
+  "`jsonyter--remote-entries' sorts directories first and dims a non-writable row."
+  (let* ((models (list '(:name "ro.csv" :type "file" :path "ro.csv"
+                         :size 10 :writable nil :last_modified "2026-09-07T10:00:00Z")
+                       '(:name "rw.csv" :type "file" :path "rw.csv"
+                         :size 20 :writable t :last_modified "2026-09-07T11:00:00Z")
+                       '(:name "d" :type "directory" :path "d" :writable t)))
+         (sorted (sort (copy-sequence models) #'jsonyter--remote-child-lessp))
+         (entries (jsonyter--remote-entries sorted nil)))
+    (should (equal "d/" (substring-no-properties (aref (cadr (nth 0 entries)) 1))))
+    (let ((ro (seq-find (lambda (e) (equal (car e) "ro.csv")) entries))
+          (rw (seq-find (lambda (e) (equal (car e) "rw.csv")) entries)))
+      (should (eq 'jsonyter-remote-readonly-face
+                  (get-text-property 0 'face (aref (cadr ro) 1))))
+      (should-not (eq 'jsonyter-remote-readonly-face
+                      (get-text-property 0 'face (aref (cadr rw) 1)))))))
+
+(ert-deftest jsonyter-test-remote-dired-copy-reports-server-name ()
+  "After a copy the message names what the server called the copy, not the request."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "trials.csv"
+                      (vector " " "trials.csv" "10 B" "2026-09-07 10:00"))))
+    (puthash "trials.csv" '(:name "trials.csv" :type "file" :path "trials.csv")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (said)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args))))
+                ((symbol-function 'jsonyter--read-remote-path)
+                 (lambda (&rest _) "backup/"))
+                ((symbol-function 'jsonyter--remote-call)
+                 (lambda (method params)
+                   (should (equal method "copy_contents"))
+                   (should (equal (plist-get params :path) "trials.csv"))
+                   '(:name "trials-Copy1.csv" :path "backup/trials-Copy1.csv")))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+        (jsonyter-remote-dired-copy)
+        (should (string-match-p "backup/trials-Copy1\\.csv" said))
+        (should-not (string-match-p "backup/trials\\.csv\\'" said))))))
+
+(ert-deftest jsonyter-test-error-message-renders-transfer-recovery ()
+  "Each TransferConflict reason gets its recovery hint; a proxy 413 names the
+chunk-size option."
+  (should (string-match-p
+           "overwrite"
+           (jsonyter--error-message
+            '(:error "TransferConflict"
+              :message "data/x already exists on the server" :reason "exists"))))
+  (let ((m (jsonyter--error-message
+            '(:error "TransferConflict" :message "data/x changed on the server"
+              :reason "stale" :expected_hash "3f2a1111" :actual_hash "9c11ffff"))))
+    (should (string-match-p "jsonyter-download-file" m))
+    (should (string-match-p "3f2a" m))
+    (should (string-match-p "9c11" m))
+    (should-not (string-match-p "3f2a1111" m)))
+  (should (string-match-p
+           "jsonyter-resume"
+           (jsonyter--error-message
+            '(:error "TransferConflict" :message "the bytes that landed are wrong"
+              :reason "corrupt"))))
+  (let ((m (jsonyter--error-message
+            '(:error "JupyterError"
+              :message "upload failed at chunk 7/23 — HTTP 413 from the proxy, request body exceeded a gateway limit"
+              :status 413 :cf_ray "abc-123"))))
+    (should (string-match-p "jsonyter-upload-chunk-size" m))
+    (should (string-match-p "jsonyter-resume-upload" m))))
+
+(ert-deftest jsonyter-test-kernel-reset-clears-contents-dir ()
+  "A restart drops the stale contents-path mapping so the next transfer re-probes."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-contents-dir s) "work/data"
+            (jsonyter--session-contents-dir-probed s) t
+            (jsonyter--session-remote-directory s) "work/data/")
+      (jsonyter--after-kernel-reset "[kernel restarted]" s)
+      (should (null (jsonyter--session-contents-dir s)))
+      (should (null (jsonyter--session-contents-dir-probed s)))
+      (should (null (jsonyter--session-remote-directory s))))))
 
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

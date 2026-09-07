@@ -105,6 +105,7 @@
 (require 'image)
 
 (declare-function shr-render-region "shr" (begin end &optional buffer))
+(declare-function json-encode-string "json" (string))
 
 ;;;; Customization
 
@@ -282,6 +283,36 @@ Used for a notebook cell's own prompt, and for the session rules in the
 listing `jsonyter-kernel-history' produces."
   :type 'integer)
 
+(defcustom jsonyter-notebook-output-width 80
+  "Column width of the frame around a notebook (or script) cell's output.
+
+The rules above and below the output block are drawn this many columns
+wide, and an image in that output is scaled so it is no wider than this
+many columns either — so a wide figure lines up with the frame rather
+than running past it.  A REPL keeps `jsonyter-image-max-width' instead.
+
+The image cap is a ceiling: a smaller `jsonyter-image-max-width', or a
+`jsonyter-image-max-height' that bites first, still wins."
+  :type 'integer)
+
+(defcustom jsonyter-notebook-latex-macros nil
+  "LaTeX macro definitions to seed a notebook's math with.
+
+A list of strings, each one line — typically a \\newcommand or
+\\DeclareMathOperator.  `jsonyter-notebook-new' adds them to a new
+notebook, and \\[jsonyter-notebook-insert-latex-macros] adds or
+refreshes them in the notebook at point: they go in a markdown cell at
+the top, marked so it is updated rather than duplicated, where MathJax
+\(in Jupyter and nbconvert) reads the \\newcommands and makes them
+available to every later cell's math.  nil means add nothing.
+
+Example:
+
+  (setq jsonyter-notebook-latex-macros
+        \\='(\"\\\\newcommand{\\\\R}{\\\\mathbb{R}}\"
+          \"\\\\newcommand{\\\\abs}[1]{\\\\left|#1\\\\right|}\"))"
+  :type '(repeat string))
+
 (defcustom jsonyter-history-size 500
   "Maximum number of inputs kept in the REPL history."
   :type 'integer)
@@ -293,6 +324,39 @@ client that ever attached to it — and so has nothing to do with
 `jsonyter-history-size', which bounds only the inputs this Emacs
 session typed at a REPL prompt."
   :type 'integer)
+
+(defcustom jsonyter-upload-chunk-size (* 8 1024 1024)
+  "Raw bytes per chunk of an upload, passed through to the bridge.
+8 MiB by default.  The request body is roughly 4/3 of this once base64
+encoded, and a gateway such as Cloudflare caps the body at 100 MB by
+default, so values above ~74 MB fail with a proxy 413.  Raise it only
+where the deployment allows a larger body; lower it (and then
+\\[jsonyter-resume-upload]) when a proxy rejects the current size."
+  :type 'integer)
+
+(defcustom jsonyter-remote-root nil
+  "The server's `root_dir' as an absolute path, or an alist keyed by server URL.
+Only consulted when the sentinel probe cannot resolve the kernel's
+working directory to a Contents-API path — the manual override for a
+kernel running outside `root_dir'.  nil means \"probe only\": with no
+probe result and no override, transfer commands simply have no default
+remote directory."
+  :type '(choice (const :tag "Probe only" nil)
+                 (directory :tag "Single absolute root")
+                 (alist :key-type (string :tag "Server URL")
+                        :value-type (directory :tag "Absolute root"))))
+
+(defcustom jsonyter-download-directory nil
+  "Default local destination for `jsonyter-download-file'.
+nil means the `default-directory' of the buffer the command was invoked
+from."
+  :type '(choice (const :tag "Invoking buffer's directory" nil) directory))
+
+(defcustom jsonyter-remote-confirm-delete t
+  "Whether `jsonyter-remote-dired' asks before deleting marked entries.
+Set to nil once you trust yourself with `x'; the mark step (`d') still
+stands between you and a deletion either way."
+  :type 'boolean)
 
 ;;;; Faces
 
@@ -366,7 +430,15 @@ state this stays a plain buffer-local.")
   state               ; last execution_state from a subscription event
   busy                ; non-nil while an execute of ours is in flight
   own                 ; kernel-id iff this buffer started it (shutdown rule)
-  last-kernel)        ; plist (:id :name); outlives KERNEL-ID being cleared
+  last-kernel         ; plist (:id :name); outlives KERNEL-ID being cleared
+  contents-dir        ; the kernel's cwd as a Contents-API path, or nil
+  contents-dir-probed ; t once the probe has run, so a nil result is not
+                      ; retried on every transfer command
+  remote-directory    ; current directory in the remote browser, sticky
+                      ; per session; seeded from CONTENTS-DIR, else ""
+  transfer)           ; plist (:phase :pct :name) while a transfer of
+                      ; ours runs on this session, else nil -- drives the
+                      ; mode-line tag, see `jsonyter--session-status-tag'
 
 (defvar-local jsonyter--sessions nil
   "Hash table mapping a session key (LANGUAGE . NAME) to a `jsonyter--session'.
@@ -594,8 +666,8 @@ buffer records exactly how it was launched."
 (defun jsonyter--dispatch (proc line)
   "Handle one JSON LINE from bridge PROC.  Current buffer is the REPL.
 Every line is a JSON object; which key is present says what it is:
-`result'/`error' complete a request, while `output', `input_request'
-and `event' are out-of-band and leave the request pending."
+`result'/`error' complete a request, while `output', `input_request',
+`progress' and `event' are out-of-band and leave the request pending."
   (let ((msg (condition-case err
                  (json-parse-string line
                                     :object-type 'plist
@@ -617,6 +689,11 @@ and `event' are out-of-band and leave the request pending."
          ((plist-member msg :output)
           (let ((handler (plist-get handlers :output)))
             (when handler (funcall handler (plist-get msg :output)))))
+         ;; Progress from a running upload/download.  Out-of-band like
+         ;; `output': the request stays pending until its `result'.
+         ((plist-member msg :progress)
+          (let ((handler (plist-get handlers :progress)))
+            (when handler (funcall handler (plist-get msg :progress)))))
          ;; The kernel wants stdin.
          ((plist-member msg :input_request)
           (jsonyter--answer-input proc id (plist-get msg :input_request)))
@@ -693,7 +770,10 @@ The one bridge serves every session, so its death takes them all down."
         (when (eq proc jsonyter--process)
           (dolist (session (jsonyter--session-list))
             (setf (jsonyter--session-busy session) nil
-                  (jsonyter--session-state session) "dead"))
+                  (jsonyter--session-state session) "dead"
+                  ;; A transfer in flight has no reply coming now; drop its
+                  ;; mode-line tag so it does not mask `:dead' forever.
+                  (jsonyter--session-transfer session) nil))
           (jsonyter--announce (format "\n[jsonyter bridge exited: %s]"
                                   (string-trim event)))
           (force-mode-line-update))))))
@@ -701,7 +781,9 @@ The one bridge serves every session, so its death takes them all down."
 (defun jsonyter--send (method params &optional handlers)
   "Send METHOD with PARAMS on this buffer's bridge.
 HANDLERS is a plist: :result is called with the final reply plist,
-:output with each incremental output.  Returns the request id."
+:output with each incremental output, :progress with each transfer
+progress plist from a running `upload'/`download'.  Returns the request
+id."
   (unless (process-live-p jsonyter--process)
     (error "jsonyter: bridge process is not running (M-x jsonyter-kernel-reconnect)"))
   ;; Every mode that talks to a kernel sets this up, but a buffer can
@@ -726,13 +808,47 @@ Appends a pointed hint for authentication failures (HTTP 401/403),
 which the Jupyter server and the bridge otherwise report as a bare
 \"Unauthorized\" or \"Forbidden\" with no indication of what actually
 fixes it — confirmed empirically: an unauthenticated request against a
-token-protected server returns exactly \"Forbidden\" and nothing else."
+token-protected server returns exactly \"Forbidden\" and nothing else.
+
+The same shape covers the structured errors a file transfer raises: a
+`reason' key (a `TransferConflict') drives the recovery hint, and a
+`cf_ray' key on a body-size failure names `jsonyter-upload-chunk-size'
+rather than the bridge's own `--chunk-size', since a bare \"Request
+Entity Too Large\" says nothing about which knob fixes it."
   (let ((message (or (plist-get err :message) (format "%s" err)))
-        (status (plist-get err :status)))
-    (if (memq status '(401 403))
-        (format "%s (set `jsonyter-server-token' or `jsonyter-server-token-file' if %s requires a token)"
-               message (or (plist-get err :url) "the server"))
-      message)))
+        (status (plist-get err :status))
+        (reason (plist-get err :reason))
+        (cf-ray (plist-get err :cf_ray)))
+    (cond
+     ((memq status '(401 403))
+      (format "%s (set `jsonyter-server-token' or `jsonyter-server-token-file' if %s requires a token)"
+              message (or (plist-get err :url) "the server")))
+     ;; A gateway refused the request itself — a 413 (body too large) or a
+     ;; proxy 5xx — carrying cf-ray: not the Jupyter server talking, and a
+     ;; different knob fixes it.  Same shape as the 401/403 case: key on
+     ;; `status', not on words in the message, since the bridge injects
+     ;; \"lower --chunk-size\" into *every* upload failure it re-raises —
+     ;; an origin 404 for a missing directory would otherwise match too.
+     ((and cf-ray (memq status '(413 429 502 503 504 520 521 522 523 524 525 526 530)))
+      (format "%s [set `jsonyter-upload-chunk-size' below its current %s, then M-x jsonyter-resume-upload]"
+              message
+              (file-size-human-readable jsonyter-upload-chunk-size nil " " "B")))
+     ;; A `TransferConflict': `reason' says which recovery to offer.
+     ((equal reason "exists")
+      (format "%s [pass a prefix argument (C-u) to the command to overwrite]" message))
+     ((equal reason "stale")
+      (let ((mine (plist-get err :expected_hash))
+            (theirs (plist-get err :actual_hash)))
+        (format "%s%s [download the server's copy first (M-x jsonyter-download-file), or C-u to overwrite]"
+                message
+                (if (and (stringp mine) (stringp theirs))
+                    (format " (yours %s, server %s)"
+                            (substring mine 0 (min 4 (length mine)))
+                            (substring theirs 0 (min 4 (length theirs))))
+                  ""))))
+     ((equal reason "corrupt")
+      (format "%s [retry, or M-x jsonyter-resume-upload / M-x jsonyter-resume-download]" message))
+     (t message))))
 
 (defun jsonyter--stderr-tail (proc &optional max-lines)
   "Last MAX-LINES (default 6) non-blank lines of PROC's bridge stderr.
@@ -1012,8 +1128,16 @@ buffer had of its own rather than assuming it had none."
 
 (defun jsonyter--session-status-tag (session)
   "The mode-line tag for one SESSION: our request state, else the kernel's."
-  (let ((state (jsonyter--session-state session)))
+  (let ((state (jsonyter--session-state session))
+        (transfer (jsonyter--session-transfer session)))
     (cond
+     ;; A transfer runs on the REST pool, so it can be in flight while the
+     ;; kernel is idle or even busy; when there is one, its progress is
+     ;; what the user is watching for.
+     (transfer (format ":%s %d%%"
+                       (if (equal (plist-get transfer :phase) "download")
+                           "down" "up")
+                       (or (plist-get transfer :pct) 0)))
      ((jsonyter--session-busy session) ":run")
      ((equal state "dead") ":dead")
      ((equal state "restarting") ":restarting")
@@ -1041,9 +1165,10 @@ just one, otherwise a count like `:2 kernels' with a `!' if any is busy."
      ((null (jsonyter--session-list)) "")
      ((cdr (jsonyter--session-list))
       (let ((sessions (jsonyter--session-list)))
-        (format ":%d kernel%s%s" (length sessions)
+        (format ":%d kernel%s%s%s" (length sessions)
                 (if (cdr sessions) "s" "")
-                (if (seq-some #'jsonyter--session-busy sessions) "!" ""))))
+                (if (seq-some #'jsonyter--session-busy sessions) "!" "")
+                (if (seq-some #'jsonyter--session-transfer sessions) "~" ""))))
      (t (jsonyter--session-status-tag (car (jsonyter--session-list)))))))
 
 (define-derived-mode jsonyter-repl-mode fundamental-mode "Jsonyter"
@@ -1279,12 +1404,24 @@ the same frame, and what happens to the fit when they are not."
         (insert-image image alt)
         (insert "\n")))))
 
+(defvar jsonyter--output-image-max-width nil
+  "Pixel ceiling on image width for the output being rendered, or nil.
+Bound by `jsonyter--nb-render-string' to `jsonyter-notebook-output-width'
+columns' worth of pixels so a figure in a notebook or script cell lines
+up with the output frame; `jsonyter--image-scale-props' takes the
+tighter of this and `jsonyter-image-max-width'.  Unset in a REPL.")
+
 (defun jsonyter--image-scale-props ()
   "Scaling properties to hand `create-image', per the size options."
-  (append (and jsonyter-image-max-width
-               (list :max-width jsonyter-image-max-width))
-          (and jsonyter-image-max-height
-               (list :max-height jsonyter-image-max-height))))
+  (let ((max-width (cond ((and jsonyter-image-max-width
+                               jsonyter--output-image-max-width)
+                          (min jsonyter-image-max-width
+                               jsonyter--output-image-max-width))
+                         (t (or jsonyter-image-max-width
+                                jsonyter--output-image-max-width)))))
+    (append (and max-width (list :max-width max-width))
+            (and jsonyter-image-max-height
+                 (list :max-height jsonyter-image-max-height)))))
 
 (defun jsonyter--insert-encoded-image (base64-data type)
   "Insert an inline image of TYPE from BASE64-DATA, with a text fallback."
@@ -1699,6 +1836,14 @@ neither — writing into its text would corrupt the document — but its
 cells' execution counts are blanked, since the kernel's counter has gone
 back to zero and the old numbers no longer mean anything.  SESSION names
 the affected session for the echo-area note in a multi-kernel buffer."
+  ;; A restarted kernel may have a different working directory, and a
+  ;; stale contents-path mapping is worse than none -- so drop it and let
+  ;; the next transfer command re-probe.  The remote browser's sticky
+  ;; directory goes with it, since it was seeded from that mapping.
+  (when session
+    (setf (jsonyter--session-contents-dir session) nil
+          (jsonyter--session-contents-dir-probed session) nil
+          (jsonyter--session-remote-directory session) nil))
   (if (derived-mode-p 'jsonyter-repl-mode)
       (progn (jsonyter--note (concat "\n" text))
              (jsonyter--insert-prompt))
@@ -2481,7 +2626,18 @@ does not have.  Only script cells pass it."
         ;; without this override the scratch buffer would fall back to
         ;; the selected frame regardless of which one is showing the
         ;; notebook -- see `jsonyter--display-frame-override'.
-        (jsonyter--display-frame-override (jsonyter--display-frame)))
+        (jsonyter--display-frame-override (jsonyter--display-frame))
+        ;; Cap image width at `jsonyter-notebook-output-width' columns so
+        ;; a figure lines up with the output frame.  Computed here for
+        ;; the same reason as the frame override -- the scratch buffer
+        ;; has no frame of its own to ask.  A failure to measure (no
+        ;; usable frame) just means no cap, exactly as before.
+        (jsonyter--output-image-max-width
+         (and (integerp jsonyter-notebook-output-width)
+              (> jsonyter-notebook-output-width 0)
+              (ignore-errors
+                (* jsonyter-notebook-output-width
+                   (frame-char-width (jsonyter--display-frame)))))))
     (with-temp-buffer
       (setq-local line-spacing spacing)
       (setq-local jsonyter--clear-pending nil)
@@ -2514,15 +2670,14 @@ string there is nothing to protect, and as buffer text the whole span
            (label (if stale "output (stale)" "output"))
            (help (and stale
                       "Source edited since this output was produced — re-run the cell to refresh it"))
-           (rule (make-string (max 4 (- jsonyter-notebook-separator-width
-                                        (1+ (length label))))
-                              ?─)))
+           (width (max (+ 5 (length label)) jsonyter-notebook-output-width))
+           (rule (make-string (- width (1+ (length label))) ?─)))
       (concat
        (propertize (concat label " " rule "\n") 'face face 'help-echo help)
        rendered
        (if (string-suffix-p "\n" rendered) "" "\n")
        (propertize
-        (concat (make-string jsonyter-notebook-separator-width ?─) "\n")
+        (concat (make-string width ?─) "\n")
         'face face 'help-echo help)))))
 
 ;;; Cell overlays
@@ -3249,6 +3404,78 @@ code cell touched, the same as `jsonyter-notebook-clear-cell-output'."
                             (list :id nil :cell_type cell-type :outputs nil))
     (goto-char start)))
 
+(defun jsonyter--nb-put-cell (pos cell-type source)
+  "Insert a CELL-TYPE cell carrying SOURCE, beginning at POS.
+Like `jsonyter--nb-insert-cell' but with content: SOURCE (a string, a
+trailing newline optional) becomes the whole of the new cell's source.
+Returns the new cell overlay."
+  (goto-char pos)
+  (let* ((jsonyter--nb-cell-surgery t)
+         (inhibit-read-only t)
+         (start (point))
+         (adjacent (seq-filter (lambda (o) (= (overlay-start o) start))
+                               (jsonyter--nb-cells)))
+         (text (if (string-suffix-p "\n" source) source (concat source "\n"))))
+    (insert text)
+    (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
+    (prog1 (jsonyter--nb-make-cell
+            start (point)
+            (list :id nil :cell_type cell-type :outputs nil))
+      (goto-char start))))
+
+;;; LaTeX macros
+
+(defconst jsonyter--nb-latex-marker "<!-- jsonyter:latex-macros -->"
+  "Sentinel first line of the markdown cell jsonyter keeps LaTeX macros in.
+An HTML comment, so it renders as nothing; its job is to let
+`jsonyter-notebook-insert-latex-macros' find and replace its own cell
+rather than stack another one on every call.")
+
+(defun jsonyter--nb-latex-source ()
+  "Markdown source for the LaTeX-macros cell, or nil if none are configured."
+  (when jsonyter-notebook-latex-macros
+    (concat jsonyter--nb-latex-marker "\n$$\n"
+            (mapconcat #'identity jsonyter-notebook-latex-macros "\n")
+            "\n$$")))
+
+(defun jsonyter--nb-latex-cell ()
+  "The jsonyter-managed LaTeX-macros cell overlay in this buffer, or nil."
+  (seq-find (lambda (c)
+              (and (equal (overlay-get c 'jsonyter-cell-type) "markdown")
+                   (string-prefix-p jsonyter--nb-latex-marker
+                                    (jsonyter--nb-cell-source c))))
+            (jsonyter--nb-cells)))
+
+;;;###autoload
+(defun jsonyter-notebook-insert-latex-macros ()
+  "Put a markdown cell of LaTeX macro definitions at the top of the notebook.
+
+The macros come from `jsonyter-notebook-latex-macros' — one entry per
+line, typically a \\newcommand.  The cell is marked with a sentinel HTML
+comment, so calling this again replaces that cell rather than adding a
+second one; MathJax in Jupyter (and nbconvert) reads the \\newcommands
+and applies them to every later cell's math.
+
+With `jsonyter-notebook-latex-macros' nil, an existing macros cell is
+removed."
+  (interactive)
+  (jsonyter--nb-ensure-notebook)
+  (let ((existing (jsonyter--nb-latex-cell))
+        (source (jsonyter--nb-latex-source))
+        (n (length jsonyter-notebook-latex-macros)))
+    (unless (or existing source)
+      (user-error "jsonyter: set `jsonyter-notebook-latex-macros' first"))
+    (when existing (jsonyter--nb-excise-cell existing))
+    (if source
+        (progn
+          (jsonyter--nb-put-cell (point-min) "markdown" source)
+          (goto-char (point-min))
+          (set-buffer-modified-p t)
+          (message "jsonyter: %d LaTeX macro%s at the top of the notebook"
+                   n (if (= n 1) "" "s")))
+      (set-buffer-modified-p t)
+      (message "jsonyter: removed the LaTeX-macros cell"))))
+
 (defun jsonyter--nb-ensure-notebook ()
   "Signal an error unless the current buffer is a rendered notebook.
 The cell-editing commands are autoloaded and may be bound outside
@@ -3277,6 +3504,31 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
                               (if markdown "markdown" "code"))))
 
+(defun jsonyter--nb-excise-cell (cell)
+  "Remove CELL from the buffer — source and output together — no questions asked."
+  (let* ((jsonyter--nb-cell-surgery t)
+         (inhibit-read-only t)
+         (start (overlay-start cell))
+         (end (overlay-end cell))
+         (source-end (overlay-get cell 'jsonyter-source-end))
+         (src-end (marker-position source-end)))
+    ;; The output leaves the way it arrived: as text that was never part
+    ;; of the document.  Deleting it along with the source would put it
+    ;; in the undo history, and undoing would then restore a read-only
+    ;; block with no cell left to own it — text the buffer would give no
+    ;; way to remove again.
+    (with-silent-modifications (delete-region src-end end))
+    ;; Only that silent delete needs the history trimmed after it; a cell
+    ;; with no output (src-end = end) had nothing removed silently, so
+    ;; trimming here would throw away undo entries for the whole rest of
+    ;; the buffer for no reason — which `jsonyter-notebook-insert-latex-macros'
+    ;; would hit every time it refreshes the top-of-buffer macros cell.
+    (when (> end src-end)
+      (jsonyter--forget-undo-after src-end))
+    (set-marker source-end nil)
+    (delete-overlay cell)
+    (delete-region start src-end)))
+
 ;;;###autoload
 (defun jsonyter-delete-cell ()
   "Delete the cell at point, source and output together."
@@ -3286,22 +3538,7 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     (unless cell (user-error "No cell at point"))
     (when (or (string-blank-p (jsonyter--nb-cell-source cell))
               (yes-or-no-p "Delete this cell? "))
-      (let* ((jsonyter--nb-cell-surgery t)
-             (inhibit-read-only t)
-             (start (overlay-start cell))
-             (end (overlay-end cell))
-             (source-end (overlay-get cell 'jsonyter-source-end))
-             (src-end (marker-position source-end)))
-        ;; The output leaves the way it arrived: as text that was never
-        ;; part of the document.  Deleting it along with the source would
-        ;; put it in the undo history, and undoing would then restore a
-        ;; read-only block with no cell left to own it — text the buffer
-        ;; would give no way to remove again.
-        (with-silent-modifications (delete-region src-end end))
-        (jsonyter--forget-undo-after src-end)
-        (set-marker source-end nil)
-        (delete-overlay cell)
-        (delete-region start src-end)))))
+      (jsonyter--nb-excise-cell cell))))
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
@@ -3543,6 +3780,103 @@ font-lock, so undo and editing still see only the cell source.
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
     (jsonyter-mode -1)))
 
+(defun jsonyter--nb-new-id ()
+  "A fresh cell id for a notebook written at nbformat 4.5."
+  (substring (md5 (format "%s-%s-%s" (float-time)
+                          (random most-positive-fixnum) (emacs-pid)))
+             0 12))
+
+(defconst jsonyter--nb-kernelspec-defaults
+  '(("python" "python3" "Python 3")
+    ("r"      "ir"      "R")
+    ("julia"  "julia"   "Julia")
+    ("sas"    "sas"     "SAS"))
+  "(LANGUAGE NAME DISPLAY-NAME) triples for a blank notebook's kernelspec.
+`jsonyter-kernel-names' still overrides NAME; a language not listed here
+falls back to the language string for NAME and its capitalization for
+DISPLAY-NAME.  The value is only a hint for other tools — jsonyter
+resolves the real spec from the server on the first run either way.")
+
+(defun jsonyter--nb-blank-json (language)
+  "The JSON text of a blank nbformat 4.5 notebook for LANGUAGE.
+One empty code cell, a `kernelspec' resolved through
+`jsonyter-kernel-names' then `jsonyter--nb-kernelspec-defaults', and
+Jupyter's own one-space indentation so an unedited save is a no-op.
+Every interpolated string is JSON-encoded, so an odd LANGUAGE cannot
+produce a file that will not parse."
+  (require 'json)
+  (let* ((known (assoc-string language jsonyter--nb-kernelspec-defaults t))
+         (name (json-encode-string
+                (or (cdr (assoc-string language jsonyter-kernel-names t))
+                    (nth 1 known)
+                    language)))
+         (display (json-encode-string (or (nth 2 known) (capitalize language))))
+         (lang (json-encode-string language))
+         (id (json-encode-string (jsonyter--nb-new-id))))
+    (format "{
+ \"cells\": [
+  {
+   \"cell_type\": \"code\",
+   \"execution_count\": null,
+   \"id\": %s,
+   \"metadata\": {},
+   \"outputs\": [],
+   \"source\": []
+  }
+ ],
+ \"metadata\": {
+  \"kernelspec\": {
+   \"display_name\": %s,
+   \"language\": %s,
+   \"name\": %s
+  },
+  \"language_info\": {
+   \"name\": %s
+  }
+ },
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+            id display lang name lang)))
+
+;;;###autoload
+(defun jsonyter-notebook-new (path &optional language)
+  "Create a new blank notebook at PATH and open it rendered.
+
+The file is a valid nbformat 4.5 notebook with one empty code cell and
+a kernelspec for LANGUAGE (default \"python\"; resolved through
+`jsonyter-kernel-names' for the spec name).  No kernel is started and
+the server is not contacted — that happens on the first run, exactly as
+for a notebook opened from disk.
+
+Interactively, prompts for the language and the file name."
+  (interactive
+   (let ((language (read-string "Notebook kernel language: " nil nil "python")))
+     (list (read-file-name "New notebook: " nil nil nil "untitled.ipynb")
+           language)))
+  (let ((file (expand-file-name path))
+        (language (if (or (null language) (string-blank-p language))
+                      "python"
+                    (string-trim language))))
+    (unless (string-suffix-p ".ipynb" file)
+      (setq file (concat file ".ipynb")))
+    (when (file-exists-p file)
+      (user-error "jsonyter: %s already exists" file))
+    (unless (file-directory-p (file-name-directory file))
+      (user-error "jsonyter: no such directory: %s" (file-name-directory file)))
+    (with-temp-file file
+      (insert (jsonyter--nb-blank-json language)))
+    (find-file file)
+    (unless (bound-and-true-p jsonyter-notebook-mode)
+      (jsonyter-notebook-open))
+    (when jsonyter-notebook-latex-macros
+      (jsonyter-notebook-insert-latex-macros))
+    (message
+     "jsonyter: new %s notebook — C-c C-i add a cell · C-RET run · C-x C-s save"
+     language)
+    (current-buffer)))
+
 ;;;###autoload
 (defun jsonyter-notebook-open ()
   "Render the current buffer's .ipynb content as a notebook.
@@ -3574,6 +3908,886 @@ Intended for `auto-mode-alist':
      "jsonyter: %d cells, %s kernel — C-RET run · S-RET run+advance · C-c C-b run all%s"
      (length (plist-get notebook :cells)) language
      (if (display-images-p) "" " (no image display: text output only)"))))
+
+
+;;;; File transfer
+
+;; The pipeline `jupyter server <-> jsonyter <-> Emacs' moves code and
+;; notebook source freely; this section adds the missing leg -- data
+;; files, in either direction, without dropping out to scp or the
+;; JupyterLab UI.  The heavy lifting (chunking, hashing, file I/O) is the
+;; bridge's; Emacs only issues the request and renders progress.
+;;
+;; The one idea to hold on to: a *remote path here is a Contents-API
+;; path*.  POSIX-style, relative to the server's `root_dir', no leading
+;; slash.  It is not the kernel's absolute cwd, and the two must never be
+;; silently interchanged -- every prompt says "Remote (contents) path".
+;; The bridge's `kernel_contents_dir' probe learns the mapping so an
+;; "upload here" default can be right; when it cannot (a kernel outside
+;; `root_dir'), the default is simply absent rather than a guess, and
+;; `jsonyter-remote-root' is the manual override.
+
+(require 'tabulated-list)
+
+(declare-function dired-get-filename "dired"
+                  (&optional localp no-error-if-not-filep))
+(declare-function dired-get-marked-files "dired"
+                  (&optional localp arg filter distinguish-one-marked error))
+(declare-function dired-marker-regexp "dired" ())
+(defvar dired-mode-map)
+
+;;; Small helpers
+
+(defun jsonyter--human-size (n)
+  "N bytes as a short human string: `184.3 MB', `412.0 KB', `0 B'.
+Mirrors the bridge's own formatting so a size shown here and one quoted
+in a bridge error read alike."
+  (cond
+   ((null n) "unknown size")
+   ((< n 1024) (format "%d B" n))
+   (t (let ((x (float n)) (out nil))
+        (dolist (unit '("KB" "MB" "GB" "TB"))
+          (unless out
+            (setq x (/ x 1024.0))
+            (when (or (< x 1024) (equal unit "TB"))
+              (setq out (format "%.1f %s" x unit)))))
+        out))))
+
+(defun jsonyter--remote-dir-slash (path)
+  "PATH as a Contents-API directory: no leading slash, trailing slash unless empty."
+  (let ((p (replace-regexp-in-string "\\`/+" "" (or path ""))))
+    (cond ((string-empty-p p) "")
+          ((string-suffix-p "/" p) p)
+          (t (concat p "/")))))
+
+(defun jsonyter--remote-dir-parent (path)
+  "The parent of Contents-API directory PATH, or \"\" at the root."
+  (let ((p (directory-file-name (jsonyter--remote-dir-slash path))))
+    (if (string-match "\\`\\(.*/\\)[^/]+\\'" p)
+        (match-string 1 p)
+      "")))
+
+(defun jsonyter--transfer-verified-phrase (verified)
+  "A words-not-jargon rendering of a transfer result's VERIFIED field."
+  (pcase verified
+    ("sha256" "sha256 verified")
+    ("size" "size verified only")
+    (_ "unverified")))
+
+;;; Resolving a transfer context: a bridge-owning buffer, and maybe a session
+
+;; A transfer runs REST-only, so it needs a buffer with a live bridge to
+;; issue it through; a session on top of that supplies the kernel for the
+;; contents-path probe, the sticky browser directory, and the mode-line
+;; tag.  Commands invoked from a jsonyter buffer use its own; invoked
+;; from a `dired' buffer or bare `M-x', they resolve the one live
+;; jsonyter session, or prompt among several.
+
+(defvar-local jsonyter--last-failed-transfer nil
+  "Plist (:method :params) of the last transfer that failed in this buffer.
+Buffer-local to the bridge-owning buffer.  `jsonyter-resume-upload' and
+`jsonyter-resume-download' re-issue it with `resume' set; cleared on any
+transfer that then succeeds.")
+
+;; State a `jsonyter-remote-dired' buffer carries.  Declared up here
+;; because `jsonyter--resolve-transfer-context' reads the first two to
+;; recover a remote browser's origin session.
+(defvar-local jsonyter--remote-owner nil
+  "The bridge-owning jsonyter buffer this remote browser issues requests through.")
+(defvar-local jsonyter--remote-session-key nil
+  "Session key (LANGUAGE . NAME) in `jsonyter--remote-owner', or nil.")
+(defvar-local jsonyter--remote-cwd ""
+  "The Contents-API directory this remote browser is showing.")
+(defvar-local jsonyter--remote-marks nil
+  "Contents paths marked for deletion in this remote browser.")
+(defvar-local jsonyter--remote-models nil
+  "Hash of contents path -> child model plist for the current listing.")
+
+(defun jsonyter--transfer-buffers ()
+  "Every live jsonyter buffer whose bridge process is running."
+  (seq-filter
+   (lambda (buf)
+     (and (buffer-local-value 'jsonyter-mode buf)
+          (process-live-p (buffer-local-value 'jsonyter--process buf))))
+   (buffer-list)))
+
+(defun jsonyter--transfer-candidates ()
+  "List of (LABEL BUFFER . SESSION) a transfer could run through."
+  (let (out)
+    (dolist (buf (jsonyter--transfer-buffers))
+      (let ((sessions (buffer-local-value 'jsonyter--sessions buf)))
+        (if (and sessions (> (hash-table-count sessions) 0))
+            (maphash
+             (lambda (_key session)
+               (let ((n (jsonyter--session-name session)))
+                 (push (cons (format "%s  %s%s  %s"
+                                     (buffer-name buf)
+                                     (or (jsonyter--session-language session) "?")
+                                     (if (and n (not (string-empty-p n)))
+                                         (format "[%s]" n) "")
+                                     (jsonyter--short-id
+                                      (jsonyter--session-kernel-id session)))
+                             (cons buf session))
+                       out)))
+             sessions)
+          (push (cons (format "%s  (no session)" (buffer-name buf))
+                      (cons buf nil))
+                out))))
+    (nreverse out)))
+
+(defun jsonyter--resolve-transfer-context ()
+  "Return (BUFFER . SESSION) for a transfer command to act through.
+
+The current buffer's own context when it has one -- a jsonyter buffer,
+or a `jsonyter-remote-dired' buffer that records its origin.  Otherwise
+the sole live jsonyter session, or a `completing-read' among several."
+  (cond
+   ((derived-mode-p 'jsonyter-remote-dired-mode)
+    (let ((owner jsonyter--remote-owner)
+          (key jsonyter--remote-session-key))
+      (unless (buffer-live-p owner)
+        (user-error "jsonyter: this remote browser's session is gone"))
+      (cons owner (and key (with-current-buffer owner (jsonyter--session key))))))
+   ((and (bound-and-true-p jsonyter-mode) (process-live-p jsonyter--process))
+    (cons (current-buffer)
+          (or (jsonyter--session)
+              (and (derived-mode-p 'org-mode)
+                   (fboundp 'jsonyter--org-session-at-point)
+                   (jsonyter--org-session-at-point 'noerror))
+              (car (jsonyter--session-list)))))
+   (t
+    (let ((cands (jsonyter--transfer-candidates)))
+      (cond
+       ((null cands)
+        (user-error "jsonyter: no running jsonyter session — start a REPL or open a notebook first"))
+       ((null (cdr cands)) (cdr (car cands)))
+       (t (let ((pick (assoc (completing-read "Transfer through session: "
+                                              (mapcar #'car cands) nil t)
+                             cands)))
+            (cdr (or pick (car cands))))))))))
+
+(defun jsonyter--remote-root-for (url)
+  "The configured `jsonyter-remote-root' for server URL, or nil."
+  (cond
+   ((null jsonyter-remote-root) nil)
+   ((stringp jsonyter-remote-root) jsonyter-remote-root)
+   ((consp jsonyter-remote-root)
+    (cdr (assoc-string url jsonyter-remote-root)))))
+
+(defun jsonyter--transfer-probe (buffer session)
+  "Ensure SESSION's contents-dir mapping is known; return it (a path, or nil).
+
+Runs the bridge's `kernel_contents_dir' once, lazily, through BUFFER: it
+costs an `execute' on the kernel, and most sessions never transfer a
+file.  A nil result -- the kernel is outside `root_dir' and no
+`jsonyter-remote-root' resolves it -- is remembered so it is not retried
+on every command."
+  (when (and session (not (jsonyter--session-contents-dir-probed session)))
+    (setf (jsonyter--session-contents-dir-probed session) t)
+    (let* ((kid (jsonyter--session-kernel-id session))
+           (root (jsonyter--remote-root-for
+                  (or (buffer-local-value 'jsonyter--url buffer)
+                      jsonyter-server-url)))
+           (reply (and kid
+                       (ignore-errors
+                         (with-current-buffer buffer
+                           (jsonyter--request-sync
+                            "kernel_contents_dir"
+                            (append (list :kernel_id kid)
+                                    (and root (list :root root)))
+                            jsonyter-startup-timeout)))))
+           (dir (plist-get reply :contents_dir)))
+      (setf (jsonyter--session-contents-dir session)
+            (and (stringp dir) dir))))
+  (and session (jsonyter--session-contents-dir session)))
+
+(defun jsonyter--transfer-remote-dir (buffer session)
+  "SESSION's sticky remote-browser directory, seeded once from the probe.
+Always a Contents-API directory string: no leading slash, and either
+empty or trailing-slashed."
+  (if (null session)
+      ""
+    (or (jsonyter--session-remote-directory session)
+        (setf (jsonyter--session-remote-directory session)
+              (jsonyter--remote-dir-slash
+               (or (jsonyter--transfer-probe buffer session) ""))))))
+
+;;; list_contents
+
+(defun jsonyter--remote-children (buffer path)
+  "Children of remote directory PATH via BUFFER's bridge, directories first.
+Each element is the child model plist from `list_contents'."
+  (let* ((model (with-current-buffer buffer
+                  (jsonyter--request-sync "list_contents"
+                                          (list :path (or path "")))))
+         (children (append (plist-get model :content) nil)))
+    (sort children #'jsonyter--remote-child-lessp)))
+
+(defun jsonyter--remote-child-lessp (a b)
+  "Order child models A before B: directories first, then by name."
+  (let ((ad (equal (plist-get a :type) "directory"))
+        (bd (equal (plist-get b :type) "directory")))
+    (cond ((and ad (not bd)) t)
+          ((and bd (not ad)) nil)
+          (t (string-lessp (or (plist-get a :name) "")
+                           (or (plist-get b :name) ""))))))
+
+;;; Remote path completion -- one listing per directory, on demand (§7)
+
+(defun jsonyter--read-remote-path (buffer prompt &optional default directoryp)
+  "Read a Contents-API path with directory-at-a-time completion.
+
+The collection is `list_contents' on the directory portion of the
+current input, fetched once and cached; typing past a `/' is a new
+directory and a fresh listing.  Directories complete with a trailing
+`/', so descending is a single TAB.  Deliberately not a completion over
+the whole tree -- one round trip per directory, against a server that
+may be on the far side of a slow link.
+
+DEFAULT is the initial input.  With DIRECTORYP, the result is coerced to
+a directory (trailing slash); otherwise it is returned as typed, minus
+any leading slash."
+  (let ((cache (make-hash-table :test #'equal)))
+    (cl-labels
+        ((names (dir)
+           (let ((hit (gethash dir cache 'miss)))
+             (if (not (eq hit 'miss))
+                 hit
+               (puthash dir
+                        (condition-case nil
+                            (mapcar
+                             (lambda (c)
+                               (concat (plist-get c :name)
+                                       (if (equal (plist-get c :type) "directory")
+                                           "/" "")))
+                             (jsonyter--remote-children buffer dir))
+                          (error nil))
+                        cache))))
+         (table (string pred action)
+           (let* ((dir (if (string-match "\\`\\(.*/\\)" string)
+                           (match-string 1 string)
+                         ""))
+                  (cands (mapcar (lambda (n) (concat dir n)) (names dir))))
+             (if (eq action 'metadata)
+                 '(metadata (category . file)
+                            (display-sort-function . identity)
+                            (cycle-sort-function . identity))
+               (complete-with-action action cands string pred)))))
+      (let ((raw (replace-regexp-in-string
+                  "\\`/+" ""
+                  (completing-read (format "%s: " prompt) #'table
+                                   nil nil default))))
+        (if directoryp (jsonyter--remote-dir-slash raw) raw)))))
+
+;;; Running a transfer, with progress (§6)
+
+(defun jsonyter--transfer-run (context method params &optional on-success)
+  "Run transfer METHOD (\"upload\"/\"download\") with PARAMS through CONTEXT.
+
+CONTEXT is (BUFFER . SESSION) from `jsonyter--resolve-transfer-context'.
+Asynchronous -- it uses `jsonyter--send', never a synchronous request,
+since a large transfer runs for minutes.  A `progress-reporter' tracks
+bytes and percentage in the echo area, and, when SESSION is set, a
+`:up NN%%' / `:down NN%%' tag in that session's mode line, so a transfer
+started from a `dired' buffer is still visible from the REPL it belongs
+to.  ON-SUCCESS, if given, is called with the result plist after the
+completion message."
+  (let* ((buffer (car context))
+         (session (cdr context))
+         (phase (if (equal method "download") "download" "upload"))
+         (local (or (plist-get params :local_path) "?"))
+         (remote (or (plist-get params :remote_path) "?"))
+         (name (file-name-nondirectory
+                (directory-file-name
+                 (if (equal phase "upload") local remote))))
+         (reporter (make-progress-reporter
+                    (format "%s %s" (capitalize (concat phase "ing")) name)
+                    0 100 0 1 0.01))
+         (started (float-time)))
+    (with-current-buffer buffer
+      (when session
+        (setf (jsonyter--session-transfer session)
+              (list :phase phase :pct 0 :name name))
+        (force-mode-line-update t))
+      (condition-case err
+          (jsonyter--send
+           method params
+           (list
+            :progress
+            (lambda (ev)
+              (let* ((done (or (plist-get ev :bytes_done) 0))
+                     (total (or (plist-get ev :bytes_total) 0))
+                     (pct (if (> total 0)
+                              (min 100 (floor (* 100.0 (/ done (float total)))))
+                            0)))
+                (progress-reporter-update
+                 reporter pct
+                 (format "(%s / %s)" (jsonyter--human-size done)
+                         (jsonyter--human-size total)))
+                (when session
+                  (setf (jsonyter--session-transfer session)
+                        (list :phase phase :pct pct :name name))
+                  (force-mode-line-update t))))
+            :result
+            (lambda (msg)
+              (when session
+                (setf (jsonyter--session-transfer session) nil)
+                (force-mode-line-update t))
+              (progress-reporter-done reporter)
+              (let ((rerr (plist-get msg :error))
+                    (result (plist-get msg :result)))
+                (cond
+                 (rerr
+                  (setq-local jsonyter--last-failed-transfer
+                              (list :method method :params params))
+                  (let ((rendered (jsonyter--error-message rerr)))
+                    ;; §9: name the resume command whenever resuming is
+                    ;; possible -- it always is here, the failure was just
+                    ;; recorded -- unless the rendered text already did (its
+                    ;; cf-ray and `corrupt' branches).
+                    (message "jsonyter: %s of %s failed — %s%s"
+                             phase name rendered
+                             (if (string-match-p "jsonyter-resume" rendered) ""
+                               (format " [M-x jsonyter-resume-%s to continue from where it stopped]"
+                                       phase)))))
+                 (result
+                  (setq-local jsonyter--last-failed-transfer nil)
+                  (jsonyter--transfer-report phase result started)
+                  (when on-success (funcall on-success result))))))))
+        (error
+         ;; `jsonyter--send' signalled synchronously (a dead bridge):
+         ;; no reply is coming, so clear the tag it just set.
+         (when session
+           (setf (jsonyter--session-transfer session) nil)
+           (force-mode-line-update t))
+         (signal (car err) (cdr err)))))))
+
+(defun jsonyter--transfer-report (phase result started)
+  "Announce a finished transfer: both ends, the size, the guarantee, the time."
+  (let* ((remote (plist-get result :path))
+         (local (plist-get result :local_path))
+         (bytes (plist-get result :bytes))
+         (elapsed (or (plist-get result :elapsed)
+                      (and started (- (float-time) started))
+                      0))
+         (note (plist-get result :resume_note))
+         (src (if (equal phase "upload")
+                  (file-name-nondirectory (directory-file-name (or local "?")))
+                remote))
+         (dst (if (equal phase "upload") remote local)))
+    (message "jsonyter: %s → %s (%s, %s, %ds)%s"
+             src dst
+             (jsonyter--human-size bytes)
+             (jsonyter--transfer-verified-phrase (plist-get result :verified))
+             (round elapsed)
+             (if (and note (stringp note) (not (string-empty-p note)))
+                 (format " — %s" note) ""))))
+
+;;; Commands (§5)
+
+;;;###autoload
+(defun jsonyter-upload-file (local-path remote-path &optional overwrite context)
+  "Upload LOCAL-PATH to REMOTE-PATH on the Jupyter server, asynchronously.
+
+REMOTE-PATH is a Contents-API path: POSIX-style, relative to the
+server's `root_dir', with no leading slash -- not a kernel-side absolute
+path.  A prefix argument sets OVERWRITE, so an existing destination is
+replaced rather than refused.
+
+Interactively the local side is `read-file-name' (the file at point in a
+`dired' buffer); the remote side defaults to the session's current
+browser directory plus the local basename and completes one directory
+at a time.  On a conflict the error names the recovery -- a prefix
+argument to overwrite, or \\[jsonyter-download-file] first for a stale
+file.
+
+CONTEXT is the (BUFFER . SESSION) the transfer runs through; the
+interactive form resolves it once and threads it here so the request
+goes through exactly the session the remote path was completed against.
+A Lisp caller may omit it, and one is resolved from the current buffer."
+  (interactive
+   (let* ((context (jsonyter--resolve-transfer-context))
+          (buffer (car context))
+          (session (cdr context))
+          (at-point (and (derived-mode-p 'dired-mode)
+                         (ignore-errors (dired-get-filename nil t))))
+          (local (read-file-name "Upload local file: " nil nil t
+                                 (and at-point
+                                      (file-name-nondirectory at-point))))
+          (remote-dir (with-current-buffer buffer
+                        (jsonyter--transfer-remote-dir buffer session)))
+          (default (concat remote-dir (file-name-nondirectory
+                                       (directory-file-name local)))))
+     (list local
+           (jsonyter--read-remote-path buffer "Remote (contents) path" default)
+           current-prefix-arg context)))
+  (let ((expanded (expand-file-name local-path)))
+    (unless (file-readable-p expanded)
+      (user-error "jsonyter: cannot read %s" local-path))
+    (when (file-directory-p expanded)
+      (user-error "jsonyter: %s is a directory — only single files transfer" local-path))
+    (when (string-empty-p (jsonyter--remote-dir-slash remote-path))
+      (user-error "jsonyter: a remote (contents) path is required"))
+    (jsonyter--transfer-run
+     (or context (jsonyter--resolve-transfer-context)) "upload"
+     (append (list :local_path expanded
+                   :remote_path remote-path
+                   :chunk_size jsonyter-upload-chunk-size)
+             (and overwrite (list :overwrite t))))))
+
+;;;###autoload
+(defun jsonyter-download-file (remote-path local-path &optional overwrite context)
+  "Download REMOTE-PATH from the Jupyter server to LOCAL-PATH, asynchronously.
+
+REMOTE-PATH is a Contents-API path (see `jsonyter-upload-file').  The
+local side defaults to `jsonyter-download-directory' (or the invoking
+buffer's directory) plus the remote basename.  A prefix argument sets
+OVERWRITE for an existing local file.
+
+CONTEXT is the (BUFFER . SESSION) the transfer runs through; the
+interactive form resolves it once (so the download uses the same session
+the remote path was completed against) and threads it here.  A Lisp
+caller may omit it."
+  (interactive
+   (let* ((context (jsonyter--resolve-transfer-context))
+          (buffer (car context))
+          (session (cdr context))
+          (start (with-current-buffer buffer
+                   (jsonyter--transfer-remote-dir buffer session)))
+          (remote (jsonyter--read-remote-path buffer "Remote (contents) path" start))
+          (dir (or jsonyter-download-directory default-directory)))
+     (list remote
+           (read-file-name "Save to: " dir nil nil
+                           (file-name-nondirectory
+                            (directory-file-name remote)))
+           current-prefix-arg context)))
+  (when (string-empty-p (jsonyter--remote-dir-slash remote-path))
+    (user-error "jsonyter: a remote file path is required, not the root"))
+  (let ((expanded (expand-file-name local-path)))
+    (when (file-directory-p expanded)
+      (setq expanded (expand-file-name (file-name-nondirectory
+                                        (directory-file-name remote-path))
+                                       expanded)))
+    (jsonyter--transfer-run
+     (or context (jsonyter--resolve-transfer-context)) "download"
+     (append (list :remote_path remote-path :local_path expanded)
+             (and overwrite (list :overwrite t))))))
+
+;;;###autoload
+(defun jsonyter-resume-upload ()
+  "Re-run the last upload that failed, continuing from where it stopped.
+The bridge appends blindly, so a whole-chunk partial is continued; a
+chunk that landed torn is restarted from the beginning and the message
+says so.  With no failed upload on record, says so rather than prompting
+from scratch."
+  (interactive)
+  (jsonyter--resume-transfer "upload"))
+
+;;;###autoload
+(defun jsonyter-resume-download ()
+  "Re-run the last download that failed, continuing from the local `.part' file."
+  (interactive)
+  (jsonyter--resume-transfer "download"))
+
+(defun jsonyter--resume-transfer (want-method)
+  "Re-issue the last failed transfer of type WANT-METHOD with `resume' set."
+  (let* ((context (jsonyter--resolve-transfer-context))
+         (buffer (car context))
+         (record (buffer-local-value 'jsonyter--last-failed-transfer buffer)))
+    (cond
+     ((null record)
+      (user-error "jsonyter: no failed transfer to resume in %s"
+                  (buffer-name buffer)))
+     ((not (equal (plist-get record :method) want-method))
+      (user-error "jsonyter: the last failed transfer was %s, not %s"
+                  (plist-get record :method) want-method))
+     (t
+      (let ((params (plist-put (copy-sequence (plist-get record :params))
+                               :resume t)))
+        ;; Re-read the chunk size: the documented proxy-413 recovery is
+        ;; \"lower `jsonyter-upload-chunk-size', then M-x jsonyter-resume-upload\",
+        ;; which is a no-op if we replay the size baked in at the first
+        ;; call.  The bridge handles a changed chunk size on resume (it
+        ;; either resumes at the new offset or restarts from scratch).
+        (when (equal want-method "upload")
+          (setq params (plist-put params :chunk_size jsonyter-upload-chunk-size)))
+        (jsonyter--transfer-run context want-method params))))))
+
+;;; dired: send marked files (§5)
+
+;;;###autoload
+(defun jsonyter-dired-upload-marked (&optional remote-dir)
+  "Upload the marked files in this `dired' buffer into a remote directory.
+
+Reads the remote (contents) directory once (REMOTE-DIR when called from
+Lisp) and uploads the files sequentially -- never concurrently: the
+bridge serialises REST work across four workers, and a burst of uploads
+would stall unrelated calls."
+  (interactive)
+  (require 'dired)
+  (unless (derived-mode-p 'dired-mode)
+    (user-error "jsonyter: not a dired buffer"))
+  (let* ((files (dired-get-marked-files nil nil #'file-regular-p))
+         (context (jsonyter--resolve-transfer-context))
+         (buffer (car context))
+         (session (cdr context))
+         (dir (or (and remote-dir (jsonyter--remote-dir-slash remote-dir))
+                  (jsonyter--read-remote-path
+                   buffer "Remote (contents) directory"
+                   (with-current-buffer buffer
+                     (jsonyter--transfer-remote-dir buffer session))
+                   t))))
+    (unless files
+      (user-error "jsonyter: no marked regular files to upload"))
+    (jsonyter--dired-upload-seq context dir files (length files) 0)))
+
+(defun jsonyter--dired-upload-seq (context dir files total done)
+  "Upload FILES into remote DIR one at a time; each starts after the last."
+  (if (null files)
+      (message "jsonyter: uploaded %d of %d file%s to %s"
+               done total (if (= total 1) "" "s")
+               (if (string-empty-p dir) "the server root" dir))
+    (let ((file (car files)))
+      (jsonyter--transfer-run
+       context "upload"
+       (list :local_path (expand-file-name file)
+             :remote_path (concat dir (file-name-nondirectory
+                                       (directory-file-name file)))
+             :chunk_size jsonyter-upload-chunk-size)
+       (lambda (_result)
+         (jsonyter--dired-upload-seq context dir (cdr files)
+                                     total (1+ done)))))))
+
+;;;###autoload
+(defun jsonyter-dired-setup ()
+  "Bind the transfer commands in `dired-mode-map' (opt-in).
+
+Call this from your init to get \\`C-c C-u' -- upload the marked files,
+or the file at point when none are marked -- in every `dired' buffer.
+jsonyter never touches `dired-mode-map' on its own."
+  (require 'dired)
+  (define-key dired-mode-map (kbd "C-c C-u") #'jsonyter-dired-upload-dwim))
+
+;;;###autoload
+(defun jsonyter-dired-upload-dwim ()
+  "Upload the marked `dired' files, or the file at point if none are marked."
+  (interactive)
+  (require 'dired)
+  (if (save-excursion
+        (goto-char (point-min))
+        (re-search-forward (dired-marker-regexp) nil t))
+      (call-interactively #'jsonyter-dired-upload-marked)
+    (call-interactively #'jsonyter-upload-file)))
+
+;;; jsonyter-remote-dired: a dired-like browser over the Contents API (§8)
+
+(defface jsonyter-remote-directory-face
+  '((t :inherit font-lock-function-name-face))
+  "Face for a directory entry in `jsonyter-remote-dired'.")
+
+(defface jsonyter-remote-readonly-face
+  '((t :inherit shadow))
+  "Face for a non-writable entry in `jsonyter-remote-dired'.")
+
+(defvar jsonyter-remote-dired-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'jsonyter-remote-dired-find)
+    (define-key map (kbd "^")   #'jsonyter-remote-dired-up)
+    (define-key map (kbd "g")   #'jsonyter-remote-dired-refresh)
+    (define-key map (kbd "U")   #'jsonyter-remote-dired-upload)
+    (define-key map (kbd "D")   #'jsonyter-remote-dired-download)
+    (define-key map (kbd "R")   #'jsonyter-remote-dired-rename)
+    (define-key map (kbd "C")   #'jsonyter-remote-dired-copy)
+    (define-key map (kbd "+")   #'jsonyter-remote-dired-mkdir)
+    (define-key map (kbd "d")   #'jsonyter-remote-dired-mark-delete)
+    (define-key map (kbd "u")   #'jsonyter-remote-dired-unmark)
+    (define-key map (kbd "x")   #'jsonyter-remote-dired-execute)
+    (define-key map (kbd "q")   #'quit-window)
+    map)
+  "Keymap for `jsonyter-remote-dired-mode'.")
+
+(define-derived-mode jsonyter-remote-dired-mode tabulated-list-mode
+  "Jsonyter-Remote"
+  "Browse the Jupyter server's filesystem over the Contents API.
+
+Every path here is a Contents-API path -- relative to the server's
+`root_dir', no leading slash -- not a kernel-side absolute path.
+
+\\{jsonyter-remote-dired-mode-map}"
+  (setq tabulated-list-format [("" 1 nil)
+                               ("Name" 44 nil)
+                               ("Size" 10 nil :right-align t)
+                               ("Modified" 20 nil)]
+        tabulated-list-sort-key nil
+        jsonyter--remote-models (make-hash-table :test #'equal))
+  (setq-local revert-buffer-function
+              (lambda (&rest _) (jsonyter-remote-dired-refresh)))
+  (tabulated-list-init-header)
+  ;; `jsonyter-remote-dired-refresh' puts the current directory in the
+  ;; header line, dired-style, in place of `tabulated-list''s column
+  ;; labels -- the three columns (a name, a size, a date) read plainly
+  ;; enough without them.
+  )
+
+;;;###autoload
+(defun jsonyter-remote-dired ()
+  "Open a `dired'-like browser on the Jupyter server's filesystem.
+
+One buffer per session.  Starts in the session's current browser
+directory -- seeded from the kernel's working directory the first time,
+where that resolves to a Contents-API path."
+  (interactive)
+  (let* ((context (jsonyter--resolve-transfer-context))
+         (buffer (car context))
+         (session (cdr context))
+         (server (or (buffer-local-value 'jsonyter--url buffer)
+                     jsonyter-server-url))
+         (start (with-current-buffer buffer
+                  (jsonyter--transfer-remote-dir buffer session)))
+         ;; Discriminate by the owning buffer, not by the session name:
+         ;; a REPL and a notebook on the same server both hold a session
+         ;; named "" and would otherwise collide on one browser buffer
+         ;; that `get-buffer-create' then silently repoints.  Each origin
+         ;; buffer drives one kernel, so this is one browser per session
+         ;; and re-invoking from the same buffer reuses it.
+         (owner-tag (string-trim (buffer-name buffer) "[* ]+" "[* ]+"))
+         (session-name (and session (jsonyter--session-name session)))
+         (bufname (format "*jsonyter-remote: %s [%s%s]*" server owner-tag
+                          (if (and session-name (not (string-empty-p session-name)))
+                              (concat " " session-name) "")))
+         (buf (get-buffer-create bufname)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'jsonyter-remote-dired-mode)
+        (jsonyter-remote-dired-mode))
+      (setq jsonyter--remote-owner buffer
+            jsonyter--remote-session-key (and session (jsonyter--session-key session))
+            jsonyter--remote-cwd start
+            jsonyter--remote-marks nil)
+      (jsonyter-remote-dired-refresh))
+    (pop-to-buffer buf)))
+
+(defun jsonyter--remote-call (method params)
+  "Issue METHOD/PARAMS synchronously through this remote browser's owner."
+  (let ((owner jsonyter--remote-owner))
+    (unless (buffer-live-p owner)
+      (user-error "jsonyter: this remote browser's session is gone"))
+    (with-current-buffer owner
+      (jsonyter--request-sync method params))))
+
+(defun jsonyter--remote-entries (models marks)
+  "Build `tabulated-list' entries from child MODELS, flagging MARKS for deletion.
+Directories sort first and are suffixed `/'; a non-writable entry is
+dimmed.  Pure -- no I/O -- so the rendering is unit-testable."
+  (mapcar
+   (lambda (child)
+     (let* ((path (plist-get child :path))
+            (dir (equal (plist-get child :type) "directory"))
+            (name (concat (plist-get child :name) (if dir "/" "")))
+            (writable (if (plist-member child :writable)
+                          (and (plist-get child :writable) t)
+                        t))
+            (face (cond ((not writable) 'jsonyter-remote-readonly-face)
+                        (dir 'jsonyter-remote-directory-face)
+                        (t 'default)))
+            (size (if dir "" (jsonyter--human-size (plist-get child :size))))
+            (modified (plist-get child :last_modified)))
+       (list path
+             (vector (if (member path marks) "D" " ")
+                     (propertize name 'face face)
+                     size
+                     (if (stringp modified)
+                         (replace-regexp-in-string
+                          "T" " " (substring modified 0 (min 16 (length modified))))
+                       "")))))
+   models))
+
+(defun jsonyter-remote-dired-refresh ()
+  "Re-list the current remote directory."
+  (interactive)
+  (let* ((cwd jsonyter--remote-cwd)
+         (children (condition-case err
+                       (jsonyter--remote-children jsonyter--remote-owner cwd)
+                     (error
+                      (user-error "jsonyter: cannot list %s — %s"
+                                  (if (string-empty-p cwd) "the server root" cwd)
+                                  (error-message-string err))))))
+    (clrhash jsonyter--remote-models)
+    (dolist (child children)
+      (puthash (plist-get child :path) child jsonyter--remote-models))
+    (setq jsonyter--remote-marks
+          (seq-filter (lambda (p) (gethash p jsonyter--remote-models))
+                      jsonyter--remote-marks))
+    (setq tabulated-list-entries
+          (jsonyter--remote-entries children jsonyter--remote-marks))
+    (setq-local header-line-format
+                (format "  %s : /%s   %d item%s%s"
+                        (or (buffer-local-value 'jsonyter--url jsonyter--remote-owner)
+                            jsonyter-server-url)
+                        jsonyter--remote-cwd
+                        (length children) (if (= (length children) 1) "" "s")
+                        (if jsonyter--remote-marks
+                            (format "   %d marked" (length jsonyter--remote-marks))
+                          "")))
+    (tabulated-list-print t)))
+
+(defun jsonyter--remote-at-point ()
+  "The child model plist for the entry at point, or nil."
+  (let ((id (tabulated-list-get-id)))
+    (and id jsonyter--remote-models (gethash id jsonyter--remote-models))))
+
+(defun jsonyter-remote-dired-find ()
+  "Descend into the directory at point, or download the file at point."
+  (interactive)
+  (let ((child (jsonyter--remote-at-point)))
+    (unless child (user-error "jsonyter: no entry here"))
+    (if (equal (plist-get child :type) "directory")
+        (progn
+          (setq jsonyter--remote-cwd
+                (jsonyter--remote-dir-slash (plist-get child :path)))
+          (jsonyter-remote-dired-refresh))
+      (jsonyter-remote-dired-download))))
+
+(defun jsonyter-remote-dired-up ()
+  "Go up one directory."
+  (interactive)
+  (setq jsonyter--remote-cwd (jsonyter--remote-dir-parent jsonyter--remote-cwd))
+  (jsonyter-remote-dired-refresh))
+
+(defun jsonyter-remote-dired-download ()
+  "Download the file at point to the local disk."
+  (interactive)
+  (let ((child (jsonyter--remote-at-point)))
+    (unless child (user-error "jsonyter: no entry here"))
+    (when (equal (plist-get child :type) "directory")
+      (user-error "jsonyter: %s is a directory" (plist-get child :name)))
+    (let* ((remote (plist-get child :path))
+           (dir (or jsonyter-download-directory default-directory))
+           (local (read-file-name "Save to: " dir nil nil
+                                  (file-name-nondirectory
+                                   (directory-file-name remote))))
+           (overwrite (and (file-exists-p (expand-file-name local))
+                           (yes-or-no-p (format "%s exists — overwrite? " local)))))
+      (jsonyter--transfer-run
+       (jsonyter--resolve-transfer-context) "download"
+       (append (list :remote_path remote :local_path (expand-file-name local))
+               (and overwrite (list :overwrite t)))))))
+
+(defun jsonyter-remote-dired-upload ()
+  "Upload a local file into the directory being shown."
+  (interactive)
+  (let* ((context (jsonyter--resolve-transfer-context))
+         (local (read-file-name "Upload local file: " nil nil t))
+         (remote (concat jsonyter--remote-cwd
+                         (file-name-nondirectory (directory-file-name local))))
+         (overwrite (and (gethash remote jsonyter--remote-models)
+                         (yes-or-no-p
+                          (format "%s exists on the server — overwrite? " remote))))
+         (buf (current-buffer)))
+    (jsonyter--transfer-run
+     context "upload"
+     (append (list :local_path (expand-file-name local)
+                   :remote_path remote
+                   :chunk_size jsonyter-upload-chunk-size)
+             (and overwrite (list :overwrite t)))
+     (lambda (_r)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf (jsonyter-remote-dired-refresh)))))))
+
+(defun jsonyter-remote-dired-rename ()
+  "Rename or move the entry at point (`rename_contents')."
+  (interactive)
+  (let ((child (jsonyter--remote-at-point)))
+    (unless child (user-error "jsonyter: no entry here"))
+    (let* ((old (plist-get child :path))
+           (new (jsonyter--read-remote-path
+                 jsonyter--remote-owner "Rename to (contents path)" old)))
+      (when (or (null new) (string-empty-p new) (equal new old))
+        (user-error "jsonyter: unchanged"))
+      (jsonyter--remote-call "rename_contents" (list :path old :new_path new))
+      (message "jsonyter: %s → %s" old new)
+      (jsonyter-remote-dired-refresh))))
+
+(defun jsonyter-remote-dired-copy ()
+  "Copy the entry at point into a directory the server names (`copy_contents')."
+  (interactive)
+  (let ((child (jsonyter--remote-at-point)))
+    (unless child (user-error "jsonyter: no entry here"))
+    (let* ((src (plist-get child :path))
+           (to-dir (jsonyter--read-remote-path
+                    jsonyter--remote-owner "Copy into (contents directory)"
+                    jsonyter--remote-cwd t))
+           (model (jsonyter--remote-call
+                   "copy_contents"
+                   (list :path src
+                         :to_dir (if (string-empty-p to-dir)
+                                     ""     ; the contents root
+                                   (directory-file-name to-dir)))))
+           ;; The server picks the name (appending -Copy1 and so on);
+           ;; report what it chose, not what was asked for.
+           (chosen (or (plist-get model :path) (plist-get model :name) "?")))
+      (message "jsonyter: copied %s → %s" src chosen)
+      (jsonyter-remote-dired-refresh))))
+
+(defun jsonyter-remote-dired-mkdir (name)
+  "Create directory NAME in the directory being shown (`make_directory')."
+  (interactive (list (read-string "New directory name: ")))
+  (when (or (null name) (string-empty-p name))
+    (user-error "jsonyter: a name is required"))
+  (jsonyter--remote-call "make_directory"
+                         (list :path (concat jsonyter--remote-cwd name)))
+  (message "jsonyter: created %s%s" jsonyter--remote-cwd name)
+  (jsonyter-remote-dired-refresh))
+
+(defun jsonyter-remote-dired-mark-delete ()
+  "Mark the entry at point for deletion and move to the next line."
+  (interactive)
+  (let ((id (tabulated-list-get-id)))
+    (unless id (user-error "jsonyter: no entry here"))
+    (cl-pushnew id jsonyter--remote-marks :test #'equal)
+    (jsonyter-remote-dired-refresh)
+    (forward-line 1)))
+
+(defun jsonyter-remote-dired-unmark ()
+  "Unmark the entry at point."
+  (interactive)
+  (let ((id (tabulated-list-get-id)))
+    (when id
+      (setq jsonyter--remote-marks (delete id jsonyter--remote-marks))
+      (jsonyter-remote-dired-refresh)
+      (forward-line 1))))
+
+(defun jsonyter-remote-dired-execute ()
+  "Delete every entry marked with `d', per `jsonyter-remote-confirm-delete'.
+A delete that fails -- a non-empty directory, a permission -- does not
+abort the rest: each entry is tried, the ones that went through drop
+their mark and the listing is refreshed either way, and any failures
+are reported together."
+  (interactive)
+  (let ((marks jsonyter--remote-marks))
+    (unless marks (user-error "jsonyter: nothing marked for deletion"))
+    (when (or (not jsonyter-remote-confirm-delete)
+              (yes-or-no-p (format "Delete %d entr%s on the server? "
+                                   (length marks)
+                                   (if (= (length marks) 1) "y" "ies"))))
+      (let ((done 0) (failures nil))
+        (unwind-protect
+            (dolist (path marks)
+              (condition-case err
+                  (progn
+                    (jsonyter--remote-call "delete_contents" (list :path path))
+                    (setq jsonyter--remote-marks
+                          (delete path jsonyter--remote-marks))
+                    (cl-incf done))
+                (error
+                 (push (format "%s (%s)" path (error-message-string err))
+                       failures))))
+          (jsonyter-remote-dired-refresh))
+        (if failures
+            (message "jsonyter: deleted %d, %d failed — %s"
+                     done (length failures)
+                     (mapconcat #'identity (nreverse failures) "; "))
+          (message "jsonyter: deleted %d entr%s" done
+                   (if (= done 1) "y" "ies")))))))
 
 
 ;;;; Script cells (# %%)

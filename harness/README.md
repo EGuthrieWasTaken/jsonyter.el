@@ -15,7 +15,7 @@ which runs a **real graphical Emacs on an X server in a container** and
 lets a test — or an agent — drive it through the actual command loop and
 read back exactly what is on screen.
 
-**48 scenarios.** 39 assert things a batch Emacs can also check and run
+**51 scenarios.** 42 assert things a batch Emacs can also check and run
 either way; 9 need a frame and skip without one.
 
 ---
@@ -121,6 +121,7 @@ a whole class of states:
 | `unauthorized.jsonl` | a token-protected server's bare `Forbidden` | needs a server configured to reject you |
 | `no-subscribe.jsonl` | an older bridge with no `subscribe` method | needs an old bridge installed |
 | `streaming.jsonl` | output over time, a progress bar redrawing in place, `input()` mid-cell | needs byte-level control of timing, and a human to answer the prompt |
+| `transfer.jsonl` | a whole-command upload and its reply; a `TransferConflict`; a `kernel_contents_dir` probe and a `list_contents` listing | a real server needs a kernel whose cwd maps cleanly to a known contents path, and cannot produce a conflict on cue |
 | `--fault stderr-noise` | the backend chattering on stderr while the protocol runs | needs a backend that misbehaves on request |
 
 `base.jsonl` is the connection lifecycle every buffer walks through;
@@ -176,6 +177,16 @@ file is never touched; cell navigation.
 block *without* a `jy:` session left entirely to Org.
 
 **`kernel-state.el` (8)** — every row of the table above.
+
+**`transfer.el` (3)** — a whole-command `jsonyter-upload-file` reporting
+a completion line that names both ends and the verification level, tag
+back to `:idle`; a conflict coming back as a recovery hint (`pass a
+prefix argument to overwrite`) rather than a bare failure, with the last
+failure recorded for `jsonyter-resume-upload`; `jsonyter-remote-dired`
+seeding itself from the working-directory probe, listing over
+`list_contents`, and dimming a non-writable entry. (The mid-flight
+`progress` stream is a batch `jsonyter-test-transfer-*` concern —
+`eh-fake-bridge` has no `progress` emit key.)
 
 **`visual.el` (9, graphical only)** — an image that actually decodes
 rather than a placeholder; a tall image sliced into rows with distinct,

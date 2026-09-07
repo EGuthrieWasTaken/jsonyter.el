@@ -1,0 +1,66 @@
+# transfer.jsonl -- the file-transfer verbs.  Layered *before* base.jsonl
+# so these win; base still answers the connection lifecycle around them.
+#
+# A real Jupyter server could answer list_contents and the Contents-API
+# PUTs, but not on cue and not with a kernel whose cwd maps cleanly to a
+# known contents path -- and it cannot emit the `progress' lines a
+# chunked upload streams while it runs, which is the whole point of the
+# interactive scenarios these stage.  Hand-written, like the other
+# state-staging scripts here.
+
+# The working-directory probe (kernel_contents_dir): the kernel says its
+# cwd is /srv/work and the sentinel resolves that to the contents path
+# "work", so "upload here" has a sensible default.
+{"on": {"method": "kernel_contents_dir"},
+ "reply": {"kernel_id": "kernel-python-0001", "cwd": "/srv/work",
+           "contents_dir": "work", "root_dir": "/srv", "method": "probe",
+           "language": "python", "cached": false}}
+
+# A directory listing of "work" -- feeds remote-path completion and the
+# `jsonyter-remote-dired' browser.  `readonly.csv' is not writable, which
+# the browser must render dimmed rather than leave to fail on use.
+{"on": {"method": "list_contents", "path": "~^work/?$~"},
+ "reply": {"name": "work", "path": "work", "type": "directory",
+           "content": [
+             {"name": "data", "path": "work/data", "type": "directory",
+              "size": null, "last_modified": "2026-09-07T09:00:00Z",
+              "writable": true},
+             {"name": "notes.txt", "path": "work/notes.txt", "type": "file",
+              "size": 24, "last_modified": "2026-09-07T09:30:00Z",
+              "writable": true},
+             {"name": "readonly.csv", "path": "work/readonly.csv", "type": "file",
+              "size": 4096, "last_modified": "2026-09-06T09:31:00Z",
+              "writable": false}]}}
+
+# Anything else lists as empty rather than erroring, so a stray descent
+# in a scenario fails an assertion, not the bridge.
+{"on": {"method": "list_contents"},
+ "reply": {"name": "", "path": "", "type": "directory", "content": []}}
+
+# A clean upload, run end to end.
+#
+# NOTE: no `progress' emits here.  `eh-fake-bridge' (at the pinned
+# HARNESS_REF, and on emacs-harness main -- the key was never added)
+# understands only `output' / `event' / `input_request' / `raw' in an
+# `emit' item, so a `{"progress": ...}' item is logged and dropped.  The
+# mid-flight progress *rendering* (a `progress' line routed to its
+# handler, the reporter reaching 100%, the tag set and cleared) is
+# covered by the batch ERT suite instead (jsonyter-test-transfer-*),
+# which feeds real `progress' lines to `jsonyter--dispatch'.  This
+# scenario proves the command runs through the bridge and reports its
+# completion; teaching the fake bridge to emit `progress' would let it
+# also assert the streaming, and is the only thing missing.
+{"on": {"method": "upload", "remote_path": "~work/data/fresh\\.csv$~"},
+ "reply": {"path": "work/data/fresh.csv", "local_path": "/tmp/fresh.csv",
+           "bytes": 192, "chunks": 3, "hash": "abcd1234",
+           "hash_algorithm": "sha256", "verified": "sha256",
+           "resumed_at": 0, "resume_note": null, "elapsed": 0.31}}
+
+# An upload onto a file that already exists, with no overwrite: the
+# structured TransferConflict the front end turns into a recovery hint.
+{"on": {"method": "upload", "remote_path": "~work/notes\\.txt$~"},
+ "error": {"error": "TransferConflict",
+           "message": "work/notes.txt already exists on the server (24 B, modified 2026-09-07T09:30Z)",
+           "status": null, "url": null,
+           "path": "work/notes.txt", "expected_hash": null,
+           "actual_hash": null, "reason": "exists"}}

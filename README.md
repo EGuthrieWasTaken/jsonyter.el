@@ -182,13 +182,18 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-subscribe-events` | `t` | Subscribe to kernel state events for the mode-line indicator. |
 | `jsonyter-use-is-complete` | `t` | Ask the kernel whether input is complete before sending on RET. |
 | `jsonyter-exec-timeout` | `nil` | Kernel-silence timeout passed to the bridge; `nil` waits indefinitely (right for SAS's slow startup). |
-| `jsonyter-image-max-width` | `800` | Max pixel width for inline images. |
+| `jsonyter-image-max-width` | `800` | Max pixel width for inline images (a REPL; in a notebook or script cell `jsonyter-notebook-output-width` also applies). |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
+| `jsonyter-notebook-output-width` | `80` | Columns wide the rules framing a notebook/script cell's output are drawn, and the column ceiling an image in that output is scaled to line up with them. |
 | `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
 | `jsonyter-suppress-line-spacing` | `t` | Drop `line-spacing` in REPL and notebook buffers, where its leading would band a sliced image. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
 | `jsonyter-insecure-tls` | `nil` | Skip TLS verification (self-signed remote servers). |
 | `jsonyter-shutdown-on-kill` | `t` | Shut the kernel down when the REPL buffer is killed. |
+| `jsonyter-upload-chunk-size` | `8 MiB` | Raw bytes per upload chunk. The request body is ~4/3 of this, and a proxy such as Cloudflare caps it at 100 MB, so values above ~74 MB fail with a 413 — [see below](#transferring-files). |
+| `jsonyter-remote-root` | `nil` | The server's `root_dir` as an absolute path (or an alist keyed by server URL), for the case where the working-directory probe cannot place a kernel that runs outside `root_dir`. |
+| `jsonyter-download-directory` | `nil` | Default local destination for `jsonyter-download-file`; `nil` means the invoking buffer's directory. |
+| `jsonyter-remote-confirm-delete` | `t` | Whether `jsonyter-remote-dired` asks before deleting marked entries. |
 
 ## Usage
 
@@ -241,11 +246,14 @@ was already at the end, so you can read back through the buffer while a
 cell is still running.
 
 In notebook and `# %%` script buffers, each output block is **framed**
-above and below by a labelled rule, so where a cell's code ends and its
-results begin stays clear however long the output runs. A cell with no
-output has no frame at all. Edit a cell's source after it has run and its
-frame changes face and reads `output (stale)`, flagging results that may
-no longer match the code in front of you; re-running the cell clears it,
+above and below by a labelled rule `jsonyter-notebook-output-width`
+columns wide (80 by default), so where a cell's code ends and its
+results begin stays clear however long the output runs — and an image in
+that output is scaled to fit the same width, so a wide figure lines up
+with the frame rather than running past it. A cell with no output has no
+frame at all. Edit a cell's source after it has run and its frame
+changes face and reads `output (stale)`, flagging results that may no
+longer match the code in front of you; re-running the cell clears it,
 and so does undoing back to the source that produced the output. The
 check is a hash of that one cell's source per edit, so it costs nothing
 even on cells with very large outputs.
@@ -386,6 +394,11 @@ JSON:
 (add-to-list 'auto-mode-alist '("\\.ipynb\\'" . jsonyter-notebook-open))
 ```
 
+`M-x jsonyter-notebook-new` writes a fresh nbformat 4.5 notebook — one
+empty code cell, a kernelspec for the language you name — and opens it
+rendered. No kernel starts and the server is not contacted until the
+first run.
+
 Cell source is ordinary buffer text, edited in the notebook language's own
 major mode — `python-mode`, `ess-r-mode`, and so on, per
 `jsonyter-notebook-language-modes` — so syntax highlighting, indentation
@@ -461,6 +474,22 @@ These were named `jsonyter-notebook-insert-cell-below` and so on through
 execution counts, leaving the notebook as though nothing had been run. It
 does the equivalent thing in a REPL or script buffer too.
 
+### LaTeX macros
+
+Set `jsonyter-notebook-latex-macros` to a list of `\newcommand` lines and
+`M-x jsonyter-notebook-insert-latex-macros` puts them in a markdown cell
+at the top of the notebook — inside `$$…$$`, behind a sentinel HTML
+comment so re-running it replaces that cell rather than adding another.
+MathJax, in Jupyter and in `nbconvert`, reads the `\newcommand`s and
+applies them to every later cell's math. `jsonyter-notebook-new` seeds
+the cell automatically when the option is set.
+
+```elisp
+(setq jsonyter-notebook-latex-macros
+      '("\\newcommand{\\R}{\\mathbb{R}}"
+        "\\newcommand{\\abs}[1]{\\left|#1\\right|}"))
+```
+
 Outputs stored in the file are rendered when it opens, including figures.
 Running a cell **replaces** its output rather than appending, and results
 are session-only — they are never written back to the file.
@@ -508,6 +537,80 @@ rather than clobbering the other change; revert to reload.
 Saving is a local filesystem operation and does not need a kernel or a
 reachable Jupyter server — a notebook opened purely to read can still be
 edited and saved offline.
+
+## Transferring files
+
+Code and notebook source move through the bridge in both directions;
+data files did not, until now. `jsonyter-upload-file` and
+`jsonyter-download-file` copy a single file either way, asynchronously,
+with a progress indicator; `jsonyter-remote-dired` browses the server's
+filesystem with the usual file-management verbs; and, once you opt in
+with `jsonyter-dired-setup`, `C-c C-u` in a local `dired` buffer sends
+the marked files (or the file at point) to the server.
+
+The chunking, hashing and file I/O all happen in the jsonyter Python
+package — Emacs never holds a multi-hundred-megabyte string, only the
+progress counters cross the pipe.
+
+### Contents paths are not kernel paths
+
+**A remote path here is a Contents-API path**: POSIX-style, relative to
+the server's `root_dir`, with no leading slash — `data/trials.csv`, not
+`/home/jovyan/work/data/trials.csv`. The kernel's working directory is a
+different coordinate system, and the two are never silently
+interchanged. Every prompt says `Remote (contents) path:` so there is no
+doubt which one it wants.
+
+To make an "upload here" default sensible, the first transfer command in
+a session runs a one-off probe (`kernel_contents_dir`) that maps the
+kernel's cwd to a Contents-API path. When the kernel runs outside
+`root_dir` the probe returns nothing rather than a guess, and there is
+simply no default until you set `jsonyter-remote-root`. The mapping is
+dropped on a kernel restart, since a restarted kernel may have moved.
+
+### `jsonyter-remote-dired`
+
+A `tabulated-list` buffer, one per session, over `list_contents`.
+Directories sort first and carry a trailing `/`; a non-writable entry is
+shown dimmed rather than left to fail at the point of use.
+
+| Key | Action |
+| --- | --- |
+| `RET` | Descend into a directory; on a file, download it |
+| `^` | Up one directory |
+| `g` | Refresh |
+| `U` | Upload a local file into this directory |
+| `D` | Download the file at point |
+| `R` | Rename / move (`rename_contents`) |
+| `C` | Copy on the server (`copy_contents`) — the server picks the name (`-Copy1`, …) and the report shows the name it chose |
+| `+` | Create a directory (`make_directory`) |
+| `d` / `u` / `x` | Mark for deletion / unmark / delete the marked entries (confirmed per `jsonyter-remote-confirm-delete`) |
+| `q` | Bury the buffer |
+
+### Progress, errors, and resuming
+
+A running transfer shows `Uploading trials.csv… 24.0 MB / 184.3 MB
+(13%)` in the echo area and a `:up 13%` / `:down 13%` tag in the mode
+line of the REPL the session belongs to, so a transfer started from a
+`dired` buffer is still visible from where it runs. On completion:
+
+```
+trials.csv → data/trials.csv (184.3 MB, sha256 verified, 41s)
+```
+
+`sha256 verified` becomes `size verified only` against a server older
+than jupyter_server 2.11, and `unverified` when the integrity check
+itself times out.
+
+Errors name the recovery. An existing destination says to pass a prefix
+argument to overwrite; a file that changed on the server offers
+`jsonyter-download-file` first and shows both digests abbreviated. When
+a proxy — not the Jupyter server — rejects the request body with a 413,
+the message names **`jsonyter-upload-chunk-size`** and its current
+value: that is the knob to lower behind a gateway with a body-size
+limit. After any failure, `jsonyter-resume-upload` /
+`jsonyter-resume-download` re-issue the last transfer from where it
+stopped.
 
 ## Script cells (`# %%`)
 
@@ -816,13 +919,13 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 91 tests under `emacs -Q --batch`, where there is no frame, no
+That runs 116 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
 you think it is.
 
-[`harness/`](harness/) is the other half: 45 scenarios that run in a
+[`harness/`](harness/) is the other half: 51 scenarios that run in a
 **real graphical Emacs on an X server in a container**, driven through
 the actual command loop, using
 [emacs-harness](https://github.com/EGuthrieWasTaken/emacs-harness).
