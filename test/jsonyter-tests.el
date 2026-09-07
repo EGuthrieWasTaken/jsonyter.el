@@ -1518,6 +1518,49 @@ cell and opens it rendered."
         (should-error (jsonyter-notebook-new path "python") :type 'user-error)
       (delete-file path))))
 
+(ert-deftest jsonyter-test-notebook-new-refuses-a-missing-directory ()
+  "`jsonyter-notebook-new' reports a friendly error, not a raw file-error,
+when the target directory does not exist."
+  (should-error
+   (jsonyter-notebook-new "/no/such/dir/anywhere/x.ipynb" "python")
+   :type 'user-error))
+
+(ert-deftest jsonyter-test-nb-blank-json-is-always-valid-json ()
+  "An odd LANGUAGE (control chars, quotes) still yields a parseable notebook."
+  (dolist (language '("python" "R" "sas" "py\nthon" "a\"b" "x\ty"))
+    (let ((json (json-parse-string (jsonyter--nb-blank-json language)
+                                   :object-type 'plist :array-type 'list)))
+      (should (= 4 (plist-get json :nbformat)))
+      (should (equal language
+                     (plist-get (plist-get (plist-get json :metadata)
+                                           :kernelspec)
+                                :language)))))
+  ;; the well-known kernels get their conventional name and label
+  (let ((json (json-parse-string (jsonyter--nb-blank-json "python")
+                                 :object-type 'plist)))
+    (should (equal "python3"
+                   (plist-get (plist-get (plist-get json :metadata) :kernelspec)
+                              :name)))
+    (should (equal "Python 3"
+                   (plist-get (plist-get (plist-get json :metadata) :kernelspec)
+                              :display_name)))))
+
+(ert-deftest jsonyter-test-notebook-new-defaults-a-blank-language ()
+  "An empty or whitespace LANGUAGE falls back to python rather than an
+unresolvable empty kernelspec."
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        (buf nil))
+    (delete-file path)
+    (unwind-protect
+        (progn
+          (setq buf (jsonyter-notebook-new path "   "))
+          (with-current-buffer buf
+            (should (equal "python" jsonyter--nb-lang))))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
 ;;;; LaTeX macros cell
 
 (ert-deftest jsonyter-test-latex-macros-source-shape ()
@@ -1565,6 +1608,29 @@ in place; setting the option to nil removes it."
       (jsonyter-notebook-insert-latex-macros)
       (should (= before (length (jsonyter--nb-cells))))
       (should-not (jsonyter--nb-latex-cell)))))
+
+(ert-deftest jsonyter-test-latex-macros-refresh-keeps-undo-history ()
+  "Refreshing the managed macros cell (a top-of-buffer cell with no output)
+does not throw away the buffer's undo history."
+  (jsonyter-tests--with-notebook
+    (buffer-enable-undo)
+    (let ((jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}")))
+      (jsonyter-notebook-insert-latex-macros)
+      (setq buffer-undo-list nil)
+      ;; an ordinary, undoable edit further down the buffer
+      (let ((cell (jsonyter-tests--cell 1)))
+        (goto-char (1- (marker-position (overlay-get cell 'jsonyter-source-end))))
+        (insert "42"))
+      (should (string-match-p "x = 142" (buffer-string)))
+      ;; refresh the macros cell: excises the top cell, re-inserts it
+      (setq jsonyter-notebook-latex-macros '("\\newcommand{\\Z}{\\mathbb{Z}}"))
+      (jsonyter-notebook-insert-latex-macros)
+      ;; the edit further down is still in the history and can be undone
+      (let ((n 0))
+        (while (and (consp buffer-undo-list) (< n 100))
+          (setq buffer-undo-list (primitive-undo 1 buffer-undo-list)
+                n (1+ n))))
+      (should-not (string-match-p "x = 142" (buffer-string))))))
 
 ;;;; Output frame and image width
 

@@ -105,6 +105,7 @@
 (require 'image)
 
 (declare-function shr-render-region "shr" (begin end &optional buffer))
+(declare-function json-encode-string "json" (string))
 
 ;;;; Customization
 
@@ -2632,7 +2633,8 @@ does not have.  Only script cells pass it."
         ;; has no frame of its own to ask.  A failure to measure (no
         ;; usable frame) just means no cap, exactly as before.
         (jsonyter--output-image-max-width
-         (and (natnump jsonyter-notebook-output-width)
+         (and (integerp jsonyter-notebook-output-width)
+              (> jsonyter-notebook-output-width 0)
               (ignore-errors
                 (* jsonyter-notebook-output-width
                    (frame-char-width (jsonyter--display-frame)))))))
@@ -3516,7 +3518,13 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
     ;; block with no cell left to own it — text the buffer would give no
     ;; way to remove again.
     (with-silent-modifications (delete-region src-end end))
-    (jsonyter--forget-undo-after src-end)
+    ;; Only that silent delete needs the history trimmed after it; a cell
+    ;; with no output (src-end = end) had nothing removed silently, so
+    ;; trimming here would throw away undo entries for the whole rest of
+    ;; the buffer for no reason — which `jsonyter-notebook-insert-latex-macros'
+    ;; would hit every time it refreshes the top-of-buffer macros cell.
+    (when (> end src-end)
+      (jsonyter--forget-undo-after src-end))
     (set-marker source-end nil)
     (delete-overlay cell)
     (delete-region start src-end)))
@@ -3778,20 +3786,39 @@ font-lock, so undo and editing still see only the cell source.
                           (random most-positive-fixnum) (emacs-pid)))
              0 12))
 
+(defconst jsonyter--nb-kernelspec-defaults
+  '(("python" "python3" "Python 3")
+    ("r"      "ir"      "R")
+    ("julia"  "julia"   "Julia")
+    ("sas"    "sas"     "SAS"))
+  "(LANGUAGE NAME DISPLAY-NAME) triples for a blank notebook's kernelspec.
+`jsonyter-kernel-names' still overrides NAME; a language not listed here
+falls back to the language string for NAME and its capitalization for
+DISPLAY-NAME.  The value is only a hint for other tools — jsonyter
+resolves the real spec from the server on the first run either way.")
+
 (defun jsonyter--nb-blank-json (language)
   "The JSON text of a blank nbformat 4.5 notebook for LANGUAGE.
-One empty code cell, a `kernelspec' whose name comes from
-`jsonyter-kernel-names' (falling back to LANGUAGE itself), and
-Jupyter's own one-space indentation so an unedited save is a no-op."
-  (let ((name (or (cdr (assoc-string language jsonyter-kernel-names t))
-                  language))
-        (id (jsonyter--nb-new-id)))
+One empty code cell, a `kernelspec' resolved through
+`jsonyter-kernel-names' then `jsonyter--nb-kernelspec-defaults', and
+Jupyter's own one-space indentation so an unedited save is a no-op.
+Every interpolated string is JSON-encoded, so an odd LANGUAGE cannot
+produce a file that will not parse."
+  (require 'json)
+  (let* ((known (assoc-string language jsonyter--nb-kernelspec-defaults t))
+         (name (json-encode-string
+                (or (cdr (assoc-string language jsonyter-kernel-names t))
+                    (nth 1 known)
+                    language)))
+         (display (json-encode-string (or (nth 2 known) (capitalize language))))
+         (lang (json-encode-string language))
+         (id (json-encode-string (jsonyter--nb-new-id))))
     (format "{
  \"cells\": [
   {
    \"cell_type\": \"code\",
    \"execution_count\": null,
-   \"id\": %S,
+   \"id\": %s,
    \"metadata\": {},
    \"outputs\": [],
    \"source\": []
@@ -3799,19 +3826,19 @@ Jupyter's own one-space indentation so an unedited save is a no-op."
  ],
  \"metadata\": {
   \"kernelspec\": {
-   \"display_name\": %S,
-   \"language\": %S,
-   \"name\": %S
+   \"display_name\": %s,
+   \"language\": %s,
+   \"name\": %s
   },
   \"language_info\": {
-   \"name\": %S
+   \"name\": %s
   }
  },
  \"nbformat\": 4,
  \"nbformat_minor\": 5
 }
 "
-            id (capitalize language) language name language)))
+            id display lang name lang)))
 
 ;;;###autoload
 (defun jsonyter-notebook-new (path &optional language)
@@ -3829,11 +3856,15 @@ Interactively, prompts for the language and the file name."
      (list (read-file-name "New notebook: " nil nil nil "untitled.ipynb")
            language)))
   (let ((file (expand-file-name path))
-        (language (or language "python")))
+        (language (if (or (null language) (string-blank-p language))
+                      "python"
+                    (string-trim language))))
     (unless (string-suffix-p ".ipynb" file)
       (setq file (concat file ".ipynb")))
     (when (file-exists-p file)
       (user-error "jsonyter: %s already exists" file))
+    (unless (file-directory-p (file-name-directory file))
+      (user-error "jsonyter: no such directory: %s" (file-name-directory file)))
     (with-temp-file file
       (insert (jsonyter--nb-blank-json language)))
     (find-file file)
