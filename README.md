@@ -26,7 +26,7 @@ also runs through standard Org Babel: `C-c C-c`, export and
 - Emacs 27.1+ (images need a graphical Emacs built with image support)
 - Org 9.4+ (bundled with Emacs 27.1+); only loaded when `jsonyter-org-mode` is used, or Org Babel itself is
 - The [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python
-  package, 1.0.0 or newer:
+  package, 2.0.0 or newer:
   ```bash
   pip install jsonyter
   ```
@@ -37,10 +37,6 @@ also runs through standard Org Babel: `C-c C-c`, export and
 
 ### Install from a release (recommended)
 
-**Current stable release: `v1.3.0`.** The `v2.x` tags are published as
-GitHub *pre-releases* — the 2.x line isn't fully operational yet — so pin
-to `v1.3.0` unless you're specifically helping test 2.x.
-
 Each release is a Git tag `vX.Y.Z`. Pinning to one keeps an upstream
 change from breaking your setup between updates.
 
@@ -48,7 +44,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v1.3.0/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.1.5/jsonyter.el
 ```
 
 ```elisp
@@ -56,14 +52,11 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v1.3.0/js
 (require 'jsonyter)  ; or autoload the jsonyter-start-* commands
 ```
 
-Releases from `v2.x` onward also attach `jsonyter.el` directly on the
-[Releases page](https://github.com/EGuthrieWasTaken/jsonyter.el/releases).
-
 **`package-vc-install`** (built into Emacs 29+, no third-party manager):
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v1.3.0"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.1.5"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -71,7 +64,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v1.3.0"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.1.5"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
