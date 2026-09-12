@@ -2774,6 +2774,18 @@ The block is made `read-only', front-sticky so nothing can be typed into
 it and rear-nonsticky so the next cell's source can still begin directly
 after it.  Selecting and copying it are unaffected.
 
+Point gets the same treatment as the adjacent cell overlays just below:
+a plain `save-excursion' saves point as an insertion-type-nil marker,
+which `delete-region' collapses to SRC-END and which then sits in
+*front* of the freshly inserted output — exactly the corruption this
+function already routes around for `adjacent'.  An insertion-type-t
+marker collapses to SRC-END the same way but rides back out to the end
+of the inserted text, so point ends up where the adjacent overlays end
+up: past the new output, at the start of whatever comes next.  A point
+that was strictly before SRC-END (still in the cell's source) or
+strictly after the old OUT-END (past this cell entirely) is untouched
+by the edit either way.
+
 `with-silent-modifications' keeps the rewrite out of the undo history
 and out of the buffer's modified flag — output is a result, not part of
 the document, exactly as it was when it lived in an overlay string — and
@@ -2793,27 +2805,29 @@ stands `after-change-functions' down for the same reason
                                  (and (overlay-get o 'jsonyter-cell)
                                       (= (overlay-start o) out-end)))
                                (overlays-at out-end)))
+         (point-marker (copy-marker (point) t))
          (new-end
           (let ((jsonyter--nb-cell-surgery t))
             (with-silent-modifications
-              (save-excursion
-                (delete-region src-end out-end)
-                (goto-char src-end)
-                (unless (string-empty-p body)
-                  ;; Output must begin on a line of its own.  A notebook
-                  ;; cell owns its trailing newline, so this only fires
-                  ;; for a cell whose own has been edited away; the
-                  ;; newline stays outside the read-only span so that
-                  ;; typing at the end of that line still works.
-                  (unless (bolp) (insert "\n"))
-                  (let ((start (point)))
-                    (insert body)
-                    (add-text-properties
-                     start (point)
-                     '(read-only t front-sticky (read-only) rear-nonsticky t))))
-                (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
-                (move-overlay cell (overlay-start cell) (point))
-                (point))))))
+              (delete-region src-end out-end)
+              (goto-char src-end)
+              (unless (string-empty-p body)
+                ;; Output must begin on a line of its own.  A notebook
+                ;; cell owns its trailing newline, so this only fires
+                ;; for a cell whose own has been edited away; the
+                ;; newline stays outside the read-only span so that
+                ;; typing at the end of that line still works.
+                (unless (bolp) (insert "\n"))
+                (let ((start (point)))
+                  (insert body)
+                  (add-text-properties
+                   start (point)
+                   '(read-only t front-sticky (read-only) rear-nonsticky t))))
+              (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
+              (move-overlay cell (overlay-start cell) (point))
+              (point)))))
+    (goto-char point-marker)
+    (set-marker point-marker nil)
     (unless (= new-end out-end)
       (jsonyter--forget-undo-after src-end))))
 

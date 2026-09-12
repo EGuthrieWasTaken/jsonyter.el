@@ -214,6 +214,99 @@ is really in the buffer."
       (should (= (overlay-end first) (overlay-start second)))
       (should (equal (jsonyter--nb-cell-source second) "print(x)")))))
 
+;;;; Run-and-advance leaves point at the next cell, not dragged into output
+;;;; (regression: `jsonyter--nb-show-output-as-text' used to restore point
+;;;; via an insertion-type-nil marker, which `delete-region' collapsed to
+;;;; the front of the freshly written output instead of past it.)
+
+(ert-deftest jsonyter-test-run-and-advance-lands-on-next-cell ()
+  "The sequence `jsonyter-notebook-run-cell-and-advance' performs: advance
+to the next cell immediately, then let the output arrive afterwards.
+Point must stay at the next cell, not get dragged back by the rewrite."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (jsonyter--nb-append-output cell0 (jsonyter-tests--stream "x is 1\n"))
+      (let ((cell1 (jsonyter-tests--cell 1)))
+        (should (= (point) (overlay-start cell1)))
+        (should (eq (jsonyter--nb-cell-at) cell1))))))
+
+(ert-deftest jsonyter-test-run-and-advance-survives-streaming-output ()
+  "The same, with several chunks — the per-chunk refresh path."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (dolist (chunk '("first\n" "second\n" "third\n"))
+        (jsonyter--nb-append-output cell0 (jsonyter-tests--stream chunk)))
+      (let ((cell1 (jsonyter-tests--cell 1)))
+        (should (= (point) (overlay-start cell1)))
+        (should (eq (jsonyter--nb-cell-at) cell1))))))
+
+(ert-deftest jsonyter-test-run-and-advance-second-run-targets-next-cell ()
+  "Pins the user-visible bug: a second S-RET after advancing must run the
+next cell, not silently re-run the one that just finished."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (jsonyter--nb-append-output cell0 (jsonyter-tests--stream "x is 1\n"))
+      (should (equal (jsonyter--nb-cell-source (jsonyter--nb-cell-at))
+                      (jsonyter--nb-cell-source (jsonyter-tests--cell 1)))))))
+
+(ert-deftest jsonyter-test-run-and-advance-off-last-cell-does-not-land-in-output ()
+  "Output arriving for the last cell in the buffer must not error and must
+leave point past the output, not at its front."
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 2)))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (jsonyter-delete-cell))
+    (let ((cell1 (jsonyter-tests--cell 1)))
+      (should (= (overlay-end cell1) (point-max)))
+      (goto-char (overlay-start cell1))
+      (jsonyter--nb-set-output cell1 "" nil t)
+      (goto-char (overlay-end cell1))
+      (jsonyter--nb-append-output cell1 (jsonyter-tests--stream "final\n"))
+      (should (= (point) (point-max)))
+      (should (= (point) (overlay-end cell1))))))
+
+(ert-deftest jsonyter-test-script-output-does-not-move-point ()
+  "Guard rail: a `# %%' script cell's output lives in an overlay
+`after-string', so point is never dragged by a refresh — must keep
+holding after the notebook fix lands."
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (insert "# %%\nprint(1)\n# %%\nprint(2)\n")
+    (goto-char (point-min))
+    (jsonyter-script-next-cell)
+    (let* ((pos (point))
+           (bounds (jsonyter--script-cell-bounds))
+           (ov (jsonyter--script-output-overlay (car bounds) (cdr bounds))))
+      (jsonyter--nb-set-output ov "2\n" nil t)
+      (should (= (point) pos)))))
+
+(ert-deftest jsonyter-test-org-output-does-not-move-point ()
+  "Guard rail: an Org src block's output is likewise an overlay
+`after-string' — must keep holding after the notebook fix lands."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+begin_src jy:R\nq1dat <- 1\n#+end_src\n\nafter\n")
+    (goto-char (point-max))
+    (let* ((pos (point))
+           (anchor (save-excursion
+                     (goto-char (point-min))
+                     (search-forward "#+end_src")
+                     (forward-line 1)
+                     (point)))
+           (ov (jsonyter--org-cell-overlay anchor t)))
+      (jsonyter--nb-set-output ov "1\n" nil t)
+      (should (= (point) pos)))))
+
 ;;;; Image slicing now reaches notebook cells
 
 (ert-deftest jsonyter-test-notebook-image-is-sliced ()
