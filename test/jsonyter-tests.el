@@ -1764,19 +1764,34 @@ whatever markdown span it falls in, same as any other text there."
 
 ;;;; Notebook document export (§4.1-4.9)
 
-(ert-deftest jsonyter-test-build-command-includes-export-timeout ()
-  "`jsonyter-export-timeout' is passed through as `--export-timeout'."
+(ert-deftest jsonyter-test-build-command-omits-export-timeout-flag ()
+  "`jsonyter-export-timeout' is never a bridge command-line flag.
+`--export-timeout' only exists on jsonyter >= 2.0.0; passing it
+unconditionally at startup would refuse to launch any older bridge
+outright (confirmed against the bridge's own argument parser: an old
+bridge exits with \"unrecognized arguments: --export-timeout\"),
+breaking every command, not only export.  The timeout is sent as the
+`export_notebook' request's own `timeout' param instead -- see
+`jsonyter-notebook-export'."
   (let ((jsonyter-export-timeout 45)
         (jsonyter-command '("jsonyter"))
         (jsonyter-exec-timeout nil)
         (jsonyter-insecure-tls nil))
-    (should (member "--export-timeout" (jsonyter--build-command nil)))
-    (should (equal "45" (nth (1+ (cl-position "--export-timeout"
-                                              (jsonyter--build-command nil)
-                                              :test #'equal))
-                             (jsonyter--build-command nil)))))
-  (let ((jsonyter-export-timeout nil) (jsonyter-command '("jsonyter")))
     (should-not (member "--export-timeout" (jsonyter--build-command nil)))))
+
+(ert-deftest jsonyter-test-notebook-export-defaults-timeout-param ()
+  "`jsonyter-notebook-export' sends `jsonyter-export-timeout' as the
+request's own `timeout' param when the caller does not override it, and
+the override when it does."
+  (jsonyter-tests--with-notebook
+    (let ((jsonyter-export-timeout 45) sent)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (jsonyter-notebook-export "html" "/tmp/does-not-matter.html")
+        (should (equal 45 (plist-get sent :timeout)))
+        (jsonyter-notebook-export "html" "/tmp/does-not-matter.html" 600)
+        (should (equal 600 (plist-get sent :timeout)))))))
 
 (ert-deftest jsonyter-test-export-format-names-extracts-keys ()
   "`jsonyter--export-format-names' reads the plist `list_export_formats'

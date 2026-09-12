@@ -196,12 +196,15 @@ default for a REPL and for slow-to-warm-up kernels such as SAS."
   :type 'number)
 
 (defcustom jsonyter-export-timeout 120
-  "Seconds the bridge waits for `nbconvert' before giving up on an export.
-Matches the bridge's own `--export-timeout' default: a PDF or webpdf
-render is seconds-to-minutes, not the interactive latency the other
-timeouts bound.  Passed to the bridge process at startup as
-`--export-timeout'; a one-off longer render can still pass its own
-`timeout' param to `jsonyter-notebook-export' without changing this."
+  "Default seconds `export_notebook' is allowed before giving up.
+Matches the bridge's own built-in default: a PDF or webpdf render is
+seconds-to-minutes, not the interactive latency the other timeouts
+bound.  Sent as the request's own `timeout' param -- deliberately *not*
+a bridge command-line flag: `--export-timeout' only exists on jsonyter
+>= 2.0.0, and passing it unconditionally at startup would refuse to
+launch any older bridge outright, breaking every command, not only
+export.  `jsonyter-notebook-export' and `jsonyter-remote-dired-export'
+both accept their own one-off TIMEOUT to override this per call."
   :type 'number)
 
 (defcustom jsonyter-kernel-names nil
@@ -626,9 +629,6 @@ EasyPG transparently."
           (and jsonyter-exec-timeout
                (list "--exec-timeout"
                      (number-to-string jsonyter-exec-timeout)))
-          (and jsonyter-export-timeout
-               (list "--export-timeout"
-                     (number-to-string jsonyter-export-timeout)))
           (and jsonyter-insecure-tls '("--insecure"))))
 
 (defun jsonyter--start-bridge ()
@@ -4886,7 +4886,8 @@ FORMAT."
       (jsonyter--ensure-bridge)
       (jsonyter--export-run
        session
-       (list :format format :server_path remote :to_path (expand-file-name to-path))
+       (list :format format :server_path remote :to_path (expand-file-name to-path)
+             :timeout jsonyter-export-timeout)
        (lambda (result)
          (message "jsonyter: exported %s to %s (%s)"
                   (plist-get result :format)
@@ -7008,9 +7009,8 @@ extension for FORMAT; see `jsonyter--export-format-guess-extension'."
          (path (expand-file-name to-path)))
     (jsonyter--export-run
      session
-     (append (list :format format :cells (vconcat cells)
-                   :to_path path :include_outputs t)
-             (and timeout (list :timeout timeout)))
+     (list :format format :cells (vconcat cells) :to_path path
+           :include_outputs t :timeout (or timeout jsonyter-export-timeout))
      (lambda (result)
        (message "jsonyter: exported %s to %s (%s)%s"
                 (plist-get result :format)
