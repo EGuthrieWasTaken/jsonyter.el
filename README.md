@@ -643,6 +643,19 @@ when you want it, committed to a `#+RESULTS:` drawer.
 Org files that don't mention jsonyter are unaffected. `org` itself is
 loaded lazily the first time the mode is enabled.
 
+Running blocks survives a major-mode restart — `M-x org-mode-restart`
+(which is also what `C-c C-c` on a `#+PROPERTY:` line runs, to make it
+take effect), `revert-buffer` and `normal-mode` all re-run `org-mode`,
+which would otherwise wipe the buffer's kernel session table and orphan
+any kernel already running. It does not: the session table, callback
+table and bridge process are marked `permanent-local` and survive the
+restart intact, so a block right after one still reuses the same kernel
+with all of its state, and the kernel is not leaked on the server. With
+`jsonyter-org-mode-maybe` on `org-mode-hook` as above, `jsonyter-org-mode`
+itself also turns back on automatically; even without that hook, running
+a block still works — it bootstraps the same way the `org-babel` back
+door (`C-c C-c`) always has.
+
 ### Opting in: `:session jy:`
 
 A block routes to jsonyter when its `:session` header argument starts

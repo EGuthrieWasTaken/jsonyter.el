@@ -1003,6 +1003,26 @@ source, or the next cell is rendered inside the previous one's results."
         (jsonyter--cleanup))
       (should (equal (sort shutdowns #'string<) '("own-py" "own-r"))))))
 
+(ert-deftest jsonyter-test-session-table-survives-major-mode-restart ()
+  "The session table, callback table, process and session key are
+`permanent-local', so `kill-all-local-variables' -- what
+`org-mode-restart' (and so `C-c C-c' on a `#+PROPERTY:' line),
+`revert-buffer' and `normal-mode' all run -- does not orphan a running
+kernel or make the next block start a needless second one."
+  (jsonyter-tests--with-sessions
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (setq-local jsonyter--process 'fake-process)
+    (setq-local jsonyter--session-key '("python" . "main"))
+    (let ((session (jsonyter-tests--bind-session '("python" . "main") "kid" t)))
+      (kill-all-local-variables)
+      (should (eq jsonyter--process 'fake-process))
+      (should (hash-table-p jsonyter--callbacks))
+      (should (equal jsonyter--session-key '("python" . "main")))
+      (should (eq (jsonyter--session-put '("python" . "main")) session))
+      (should (equal (jsonyter--session-kernel-id
+                       (jsonyter--session-put '("python" . "main")))
+                      "kid")))))
+
 (ert-deftest jsonyter-test-legacy-kernel-vars-are-obsolete ()
   "The pre-2.0 scalars carry an obsolescence notice pointing at the accessors."
   (should (get 'jsonyter--kernel-id 'byte-obsolete-variable))
@@ -1200,6 +1220,33 @@ source, or the next cell is rendered inside the previous one's results."
     (fundamental-mode)
     (should-error (jsonyter-org-mode 1))
     (should-not (bound-and-true-p jsonyter-org-mode))))
+
+(ert-deftest jsonyter-test-check-jsonyter-buffer-bootstraps-org ()
+  "The buffer-kind gate no longer just refuses a plain Org buffer: it
+bootstraps the same plumbing the org-babel back door already installs
+itself (`jsonyter--org-babel-ensure-plumbing'), so `C-RET' / `S-RET' /
+`jsonyter-org-run-block' work without `jsonyter-org-mode' ever having
+been turned on -- the bug behind report #5a."
+  (with-temp-buffer
+    (org-mode)
+    (should-not (bound-and-true-p jsonyter-mode))
+    (jsonyter--check-jsonyter-buffer)
+    (should (bound-and-true-p jsonyter-mode))
+    (should (hash-table-p jsonyter--callbacks))))
+
+(ert-deftest jsonyter-test-check-jsonyter-buffer-still-refuses-other-buffers ()
+  "A buffer that is neither a jsonyter buffer nor an Org buffer is still refused."
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-error (jsonyter--check-jsonyter-buffer) :type 'user-error)))
+
+(ert-deftest jsonyter-test-org-run-cell-aliases-run-block ()
+  "`jsonyter-org-run-cell(-and-advance)' alias the block-vocabulary
+commands, for anyone reaching for the notebook/script naming by analogy."
+  (should (eq (indirect-function 'jsonyter-org-run-cell)
+              (indirect-function 'jsonyter-org-run-block)))
+  (should (eq (indirect-function 'jsonyter-org-run-cell-and-advance)
+              (indirect-function 'jsonyter-org-run-block-and-advance))))
 
 (ert-deftest jsonyter-test-org-folding-hides-overlay-output ()
   "An output after-string anchored inside a folded subtree is not displayed.

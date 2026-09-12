@@ -385,6 +385,19 @@ bridge handles requests concurrently and gives each kernel its own
 worker, so control messages such as `interrupt_kernel' are serviced on
 this same process while an execute is still running, and a Python and an
 R kernel in one Org buffer run without blocking each other.")
+;; `M-x org-mode-restart' (which is also what `C-c C-c' on a
+;; `#+PROPERTY:' line runs), `revert-buffer' and `normal-mode' all call
+;; `kill-all-local-variables', which would otherwise wipe this process,
+;; the callback table routing its replies, and the whole session table
+;; out from under a live kernel: the kernel keeps running on the server,
+;; orphaned, while the very next block resolves its session key against
+;; an empty table and silently starts a brand-new one with none of the
+;; previous blocks' state.  `permanent-local' is what `kill-all-local-variables'
+;; itself already honors to keep exactly this from happening.
+(put 'jsonyter--process 'permanent-local t)
+(put 'jsonyter--callbacks 'permanent-local t)
+(put 'jsonyter--sessions 'permanent-local t)
+(put 'jsonyter--session-key 'permanent-local t)
 (defvar-local jsonyter--command nil
   "The exact bridge command this buffer was started with.")
 (defvar-local jsonyter--url nil
@@ -966,12 +979,15 @@ default."
   "Marker mode, on in every jsonyter buffer regardless of its kind.
 
 `jsonyter-repl-mode' (a REPL), `jsonyter-notebook-mode' (a rendered
-.ipynb) and `jsonyter-script-mode' (\"# %%\" cells in a script) all turn
-this on and never off — killing the buffer is what ends it.  It carries
-no keymap or behavior of its own; it exists purely so other code can
-ask \"is this any kind of jsonyter buffer\" with one check —
-`(bound-and-true-p jsonyter-mode)' — without caring which of the three
-it is or repeating that three-way test itself.
+.ipynb), `jsonyter-script-mode' (\"# %%\" cells in a script) and
+`jsonyter-org-mode' (`:session jy:...' blocks in Org) all turn this on
+and never off — killing the buffer is what ends it.  An Org buffer using
+only the `org-babel' back door (`C-c C-c', export, tangle) turns it on
+lazily instead, via `jsonyter--org-babel-ensure-plumbing', without
+`jsonyter-org-mode' ever having run.  It carries no keymap or behavior of
+its own; it exists purely so other code can ask \"is this any kind of
+jsonyter buffer\" with one check — `(bound-and-true-p jsonyter-mode)' —
+without caring which kind it is or repeating that test itself.
 
 `jsonyter-save-buffer' is built on exactly this and is the pattern to
 copy: dispatch on the specific mode only where the specific mode's
@@ -1924,9 +1940,20 @@ its own terms."
         (t kernel-id)))
 
 (defun jsonyter--check-jsonyter-buffer ()
-  "Signal unless the current buffer is some kind of jsonyter buffer."
+  "Signal unless the current buffer is some kind of jsonyter buffer.
+
+An Org buffer bootstraps itself here rather than being turned away:
+`jsonyter-mode' being off in Org only ever means `jsonyter-org-mode'
+(or `jsonyter-org-mode-maybe') has not run yet, never that the buffer
+cannot talk to a kernel — the org-babel back door
+\(`jsonyter--org-babel-ensure-plumbing') already proves that by working
+with the minor mode off, so the cell layer (`C-RET' / `S-RET' /
+`jsonyter-org-run-block', `jsonyter-kernel-connect', ...) gets the same
+treatment instead of a gate that serves no purpose on this path."
   (unless (bound-and-true-p jsonyter-mode)
-    (user-error "jsonyter: not a jsonyter buffer — needs a REPL, a rendered .ipynb, or `jsonyter-script-mode'")))
+    (if (derived-mode-p 'org-mode)
+        (jsonyter--org-babel-ensure-plumbing)
+      (user-error "jsonyter: not a jsonyter buffer — needs a REPL, a rendered .ipynb, `jsonyter-script-mode', or an Org buffer (see `jsonyter-org-mode-maybe')"))))
 
 (defun jsonyter--ensure-live-bridge ()
   "Make sure this jsonyter buffer has a live bridge process.
@@ -5287,6 +5314,23 @@ jy: block afterwards.  Starts the block's session on first use."
   "Run the jy: block at point, then move to the next one."
   (interactive)
   (jsonyter-org-run-block t))
+
+;; Org's own vocabulary for a `#+begin_src' unit is "block", not "cell",
+;; so the primary names above say "block" -- but a user coming from the
+;; notebook or script surface, where the vocabulary is "cell", reaches
+;; for `jsonyter-org-run-cell(-and-advance)' by analogy and finds nothing.
+;; These cost nothing and remove that papercut.
+;;;###autoload
+(defalias 'jsonyter-org-run-cell #'jsonyter-org-run-block
+  "Run the jy: src block at point against its kernel, output inline.
+An alias for `jsonyter-org-run-block', named for anyone reaching for it
+by analogy with `jsonyter-notebook-run-cell' / `jsonyter-script-run-cell'.
+Org's own vocabulary for a `#+begin_src' unit is \"block\", which is why
+that stays the primary name.")
+;;;###autoload
+(defalias 'jsonyter-org-run-cell-and-advance #'jsonyter-org-run-block-and-advance
+  "Run the jy: block at point, then move to the next one.
+An alias for `jsonyter-org-run-block-and-advance'; see `jsonyter-org-run-cell'.")
 
 (defun jsonyter-org-run-buffer ()
   "Run every jy: src block in the buffer, in order, waiting for each."
