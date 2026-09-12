@@ -804,15 +804,29 @@ ready for `jsonyter-script-mode`.
 
 ### Async: `:async yes`
 
-The cell layer (`C-RET`) is always async — this only affects the Babel
-path. Add `:async yes` and `C-c C-c` returns immediately with a
-placeholder result; when the kernel answers, jsonyter finds the
-placeholder by its opaque token and replaces it in place. A second
-`C-c C-c` on a session already busy is refused, not queued or made to
-interrupt the first. Exporting always runs synchronously regardless of
-`:async`, since `ox` collects the whole buffer in one pass and has
-nowhere for an async result to land; the wait is bounded by
-`jsonyter-exec-timeout`.
+The cell layer (`C-RET`) is always async and ignores this header
+entirely — `:async` only ever affects the Babel path (`C-c C-c`), so it
+does nothing useful in a `#+PROPERTY:` line that exists only to set up
+`C-RET` sessions and can simply be dropped there. Add `:async yes` and
+`C-c C-c` returns immediately with a placeholder result; when the kernel
+answers, jsonyter finds the placeholder by its opaque token and replaces
+it in place. A second `C-c C-c` on a session already busy is refused,
+not queued or made to interrupt the first. Exporting always runs
+synchronously regardless of `:async`, since `ox` collects the whole
+buffer in one pass and has nowhere for an async result to land; the wait
+is bounded by `jsonyter-exec-timeout`.
+
+**Do not load `ob-async` in a buffer that uses jsonyter's `:async yes`.**
+`ob-async` claims the same header argument for itself and implements it
+by running each block in a *separate Emacs subprocess*; if it is loaded,
+its advice on `org-babel-execute-src-block` intercepts before jsonyter's
+own dispatch ever runs. Every block then gets a fresh Emacs, a fresh
+session table, and its own kernel — symptoms identical to a kernel
+started fresh per cell, for a reason that has nothing to do with
+jsonyter's session handling. jsonyter implements its own async path
+precisely so `ob-async` is unnecessary for `jy:` blocks; if other blocks
+in the same Org install still need it, keep `:async` off any `jy:`
+block's header args.
 
 ### `:var`
 
