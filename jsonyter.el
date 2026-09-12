@@ -91,7 +91,13 @@
 ;;
 ;; Requires jsonyter >= 0.2 (concurrent bridge, "stream", "subscribe",
 ;; JUPYTER_TOKEN).  Against an older bridge the REPL still works, minus
-;; live streaming and kernel-state reporting.
+;; live streaming and kernel-state reporting.  Document export
+;; (`jsonyter-notebook-export' and friends) needs jsonyter >= 2.0.0,
+;; which ships "list_export_formats"/"export_notebook"; against an
+;; older bridge those commands say so plainly rather than raising a raw
+;; protocol error -- see `jsonyter--list-export-formats'.  Script export
+;; (`jsonyter-notebook-export-script', `jsonyter-org-export-script')
+;; needs no bridge at all.
 
 ;;; Code:
 
@@ -187,6 +193,15 @@ default for a REPL and for slow-to-warm-up kernels such as SAS."
 
 (defcustom jsonyter-startup-timeout 120
   "Seconds to wait for kernel startup and other slow control requests."
+  :type 'number)
+
+(defcustom jsonyter-export-timeout 120
+  "Seconds the bridge waits for `nbconvert' before giving up on an export.
+Matches the bridge's own `--export-timeout' default: a PDF or webpdf
+render is seconds-to-minutes, not the interactive latency the other
+timeouts bound.  Passed to the bridge process at startup as
+`--export-timeout'; a one-off longer render can still pass its own
+`timeout' param to `jsonyter-notebook-export' without changing this."
   :type 'number)
 
 (defcustom jsonyter-kernel-names nil
@@ -611,6 +626,9 @@ EasyPG transparently."
           (and jsonyter-exec-timeout
                (list "--exec-timeout"
                      (number-to-string jsonyter-exec-timeout)))
+          (and jsonyter-export-timeout
+               (list "--export-timeout"
+                     (number-to-string jsonyter-export-timeout)))
           (and jsonyter-insecure-tls '("--insecure"))))
 
 (defun jsonyter--start-bridge ()
@@ -829,11 +847,21 @@ The same shape covers the structured errors a file transfer raises: a
 `reason' key (a `TransferConflict') drives the recovery hint, and a
 `cf_ray' key on a body-size failure names `jsonyter-upload-chunk-size'
 rather than the bridge's own `--chunk-size', since a bare \"Request
-Entity Too Large\" says nothing about which knob fixes it."
+Entity Too Large\" says nothing about which knob fixes it.
+
+It also covers `ExportError' (a failed `export_notebook'): `hint' is an
+actionable toolchain fix when the bridge knows one -- `pdf' failing with
+a bare \"Pandoc wasn't found\" is the single most likely first-run
+failure, and the hint says exactly what to install *on the Jupyter
+server*, a distinction users reliably get wrong since nbconvert runs
+there, not in the bridge or in Emacs.  `available_formats' is populated
+only for \"unknown export format\"."
   (let ((message (or (plist-get err :message) (format "%s" err)))
         (status (plist-get err :status))
         (reason (plist-get err :reason))
-        (cf-ray (plist-get err :cf_ray)))
+        (cf-ray (plist-get err :cf_ray))
+        (hint (plist-get err :hint))
+        (available (plist-get err :available_formats)))
     (cond
      ((memq status '(401 403))
       (format "%s (set `jsonyter-server-token' or `jsonyter-server-token-file' if %s requires a token)"
@@ -863,6 +891,12 @@ Entity Too Large\" says nothing about which knob fixes it."
                   ""))))
      ((equal reason "corrupt")
       (format "%s [retry, or M-x jsonyter-resume-upload / M-x jsonyter-resume-download]" message))
+     ((or hint available)
+      (concat message
+              (and hint (format " [%s]" hint))
+              (and available
+                   (format " (available: %s)"
+                           (mapconcat #'identity (append available nil) ", ")))))
      (t message))))
 
 (defun jsonyter--stderr-tail (proc &optional max-lines)
@@ -1169,9 +1203,13 @@ gets it for free."
          (kernel-id (jsonyter--session-kernel-id session))
          (tag
           (cond
-           ;; A transfer runs on the REST pool, so it can be in flight while
-           ;; the kernel is idle or even busy; when there is one, its
-           ;; progress is what the user is watching for.
+           ;; A transfer (or export -- same slot, see `jsonyter--export-run')
+           ;; runs on the REST pool, so it can be in flight while the kernel
+           ;; is idle or even busy; when there is one, its progress is what
+           ;; the user is watching for.  Export carries no percentage --
+           ;; there are no `progress' events for it -- so it gets a bare
+           ;; tag instead of a fake `0%'.
+           ((and transfer (equal (plist-get transfer :phase) "export")) ":export")
            (transfer (format ":%s %d%%"
                              (if (equal (plist-get transfer :phase) "download")
                                  "down" "up")
@@ -3850,6 +3888,7 @@ position the rearranged text starts at, for `jsonyter--forget-undo-after'."
     (define-key map (kbd "C-c <down>") #'jsonyter-move-cell-down)
     (define-key map (kbd "C-x C-s") #'jsonyter-notebook-save-buffer)
     (define-key map (kbd "C-c C-s") #'jsonyter-notebook-save-with-outputs)
+    (define-key map (kbd "C-c C-x") #'jsonyter-notebook-export)
     map)
   "Keymap for `jsonyter-notebook-mode'.")
 
@@ -6711,6 +6750,269 @@ ORG-FILE's own name with the extension swapped."
              :include_outputs t)
        jsonyter-startup-timeout))
     (message "jsonyter: wrote %s" ipynb-file)))
+
+;;;; Notebook document export (HTML, PDF, LaTeX, ... via the bridge)
+
+;; Two bridge verbs new in jsonyter 2.0.0, both dispatched on the REST
+;; pool, never a kernel worker -- so a multi-minute PDF render cannot
+;; queue behind a running `execute', and export is safe to fire while a
+;; cell is running.  It is deliberately NOT gated by `jsonyter--busy-p'.
+;;
+;; POST, not GET: a notebook buffer's `.ipynb' is a local file (see
+;; `jsonyter--nb-do-save'), so `server_path' -- a path in the Jupyter
+;; server's own Contents API namespace -- is the wrong mode for the
+;; ordinary case, where there is no such server path at all.  Every
+;; command here builds its notebook from the buffer's own cells (the
+;; `cells' param, POST) instead, which also exports what the user is
+;; looking at right now -- unsaved edits and this session's outputs
+;; included -- rather than whatever is last saved to disk.  `server_path'
+;; is reserved for `jsonyter-remote-dired-export', which genuinely has a
+;; real server path in hand.
+
+(defvar-local jsonyter--export-formats-cache nil
+  "Cons (PROCESS . REPLY) memoizing the last `list_export_formats' call.
+The probe result cannot change under a running server, so there is
+nothing to invalidate beyond a changed bridge process; see
+`jsonyter--list-export-formats'.")
+
+(defun jsonyter--list-export-formats (&optional refresh)
+  "This buffer's bridge's export capability.
+A (:available :formats :reason) plist -- never errors for an
+unavailable endpoint, since the bridge itself guarantees that, so this
+is always safe to call.  Cached per bridge process; pass REFRESH to
+force a fresh probe.
+
+Degrades an old bridge that predates this verb entirely to a clear
+message rather than a raw protocol error: export needs jsonyter
+>= 2.0.0, and the commentary header's own version note has been bumped
+to say so."
+  (jsonyter--ensure-bridge)
+  (if (and (not refresh)
+           jsonyter--export-formats-cache
+           (eq (car jsonyter--export-formats-cache) jsonyter--process))
+      (cdr jsonyter--export-formats-cache)
+    (let ((reply
+           (condition-case err
+               (jsonyter--request-sync "list_export_formats" nil jsonyter-startup-timeout)
+             (error
+              (if (string-match-p
+                   "unknown method\\|no such method\\|not supported\\|unrecognized"
+                   (error-message-string err))
+                  (user-error
+                   "jsonyter: this bridge does not support export (needs jsonyter >= 2.0.0; upgrade with `pip install -U jsonyter')")
+                (signal (car err) (cdr err)))))))
+      (setq jsonyter--export-formats-cache (cons jsonyter--process reply))
+      reply)))
+
+(defun jsonyter--export-format-names (formats)
+  "Format-name strings from FORMATS, `list_export_formats''s own plist."
+  (let (names)
+    (cl-loop for (key _val) on formats by #'cddr
+             do (push (substring (symbol-name key) 1) names))
+    (nreverse names)))
+
+;;;###autoload
+(defun jsonyter-notebook-export-formats ()
+  "Show the export formats this notebook's Jupyter server offers.
+The first thing to reach for when debugging why an export command
+refuses to run, or before waiting on a slow one that will only fail."
+  (interactive)
+  (unless (bound-and-true-p jsonyter-notebook-mode)
+    (user-error "jsonyter: not a notebook buffer"))
+  (let ((probe (jsonyter--list-export-formats 'refresh)))
+    (if (plist-get probe :available)
+        (message "jsonyter: export formats on %s: %s"
+                 jsonyter-server-url
+                 (mapconcat #'identity
+                            (jsonyter--export-format-names (plist-get probe :formats))
+                            ", "))
+      (message "jsonyter: export not available on %s -- %s"
+               jsonyter-server-url
+               (or (plist-get probe :reason) "unknown reason")))))
+
+(defconst jsonyter--export-format-extensions
+  '(("html" . ".html") ("markdown" . ".md") ("pdf" . ".pdf")
+    ("latex" . ".tex") ("webpdf" . ".pdf") ("qtpdf" . ".pdf")
+    ("qtpng" . ".png") ("slides" . ".slides.html") ("script" . ".txt")
+    ("asciidoc" . ".adoc") ("rst" . ".rst") ("notebook" . ".ipynb"))
+  "Best-guess extension per nbconvert format name, for defaulting a
+`read-file-name' prompt before the export has actually run -- the
+server's own, canonical `extension' is only known from the export
+result itself (see the design notes' §4.4), which does not exist yet at
+prompt time.  Whatever TO-PATH the user confirms is what
+`jsonyter-notebook-export' actually writes to, this guess or not.")
+
+(defun jsonyter--export-format-guess-extension (format)
+  "A reasonable default extension for FORMAT, for prompting only."
+  (or (cdr (assoc format jsonyter--export-format-extensions))
+      (concat "." format)))
+
+(defun jsonyter--export-run (session params on-success)
+  "Run `export_notebook' with PARAMS through this buffer's bridge, async.
+
+There are no `progress' events for export (unlike a file transfer), so
+this shows a plain \"exporting...\" message plus an `:export' mode-line
+tag rather than a percentage.  Reuses `jsonyter--session-transfer' --
+the established pattern (`jsonyter--transfer-run') for a REST-pool
+operation that wants to show itself in the mode line -- rather than
+inventing a parallel slot; `jsonyter--session-status-tag' renders the
+`export' phase specially, with no percentage.
+
+SESSION may be nil (a notebook that has never had a kernel); the
+mode-line tag is then simply not shown, harmlessly.  ON-SUCCESS is
+called with the result plist on success; a failure is reported in the
+echo area via `jsonyter--error-message', which renders `ExportError''s
+own `hint' and `available_formats'."
+  (let ((format (plist-get params :format)))
+    (when session
+      (setf (jsonyter--session-transfer session) (list :phase "export"))
+      (force-mode-line-update t))
+    (message "jsonyter: exporting to %s..." format)
+    (condition-case err
+        (jsonyter--send
+         "export_notebook" params
+         (list
+          :result
+          (lambda (msg)
+            (when session
+              (setf (jsonyter--session-transfer session) nil)
+              (force-mode-line-update t))
+            (let ((rerr (plist-get msg :error))
+                  (result (plist-get msg :result)))
+              (cond
+               (rerr (message "jsonyter: export to %s failed — %s"
+                              format (jsonyter--error-message rerr)))
+               (result (funcall on-success result)))))))
+      (error
+       ;; `jsonyter--send' signalled synchronously (a dead bridge): no
+       ;; reply is coming, so clear the tag it just set.
+       (when session
+         (setf (jsonyter--session-transfer session) nil)
+         (force-mode-line-update t))
+       (signal (car err) (cdr err))))))
+
+;;;###autoload
+(defun jsonyter-notebook-export (format to-path &optional timeout)
+  "Export this notebook to FORMAT, writing the result to TO-PATH.
+
+Always includes this session's outputs and every cell's stored results
+\(see `jsonyter--nb-collect-cells''s ALL-OUTPUTS parameter\), so the
+export reflects the buffer as it stands right now -- unsaved edits
+included -- not merely what was last saved to disk.
+
+Runs on the bridge's REST pool, not a kernel worker: safe to run while a
+cell is executing, and not gated by a busy kernel the way running a cell
+is.  Asynchronous, since a PDF or webpdf render is seconds-to-minutes
+\(bounded by TIMEOUT, default `jsonyter-export-timeout'\), and blocking
+Emacs for that long is not acceptable.
+
+Interactively, FORMAT is read via `completing-read' over what this
+server's `list_export_formats' actually offers -- never a hardcoded
+list, so a third-party exporter the server registers shows up for free
+-- refusing early, before any request that would take two minutes to
+fail, when the server offers none at all.  TO-PATH is read via
+`read-file-name', defaulting to the buffer's own name with a best-guess
+extension for FORMAT; see `jsonyter--export-format-guess-extension'."
+  (interactive
+   (progn
+     (unless (bound-and-true-p jsonyter-notebook-mode)
+       (user-error "jsonyter: not a notebook buffer"))
+     (let* ((probe (jsonyter--list-export-formats))
+            (formats (and (plist-get probe :available)
+                         (jsonyter--export-format-names (plist-get probe :formats)))))
+       (unless formats
+         (user-error "jsonyter: export not available on %s -- %s"
+                     jsonyter-server-url
+                     (or (plist-get probe :reason) "unknown reason")))
+       (let* ((format (completing-read "Export format: " formats nil t))
+              (default (concat (file-name-sans-extension
+                                (or buffer-file-name "untitled"))
+                               (jsonyter--export-format-guess-extension format))))
+         (list format
+               (read-file-name "Export to: " nil default nil
+                               (file-name-nondirectory default)))))))
+  (unless (bound-and-true-p jsonyter-notebook-mode)
+    (user-error "jsonyter: not a notebook buffer"))
+  (jsonyter--ensure-bridge)
+  (let* ((cells (jsonyter--nb-collect-cells t t))
+         (session (jsonyter--session-put jsonyter--session-key))
+         (path (expand-file-name to-path)))
+    (jsonyter--export-run
+     session
+     (append (list :format format :cells (vconcat cells)
+                   :to_path path :include_outputs t)
+             (and timeout (list :timeout timeout)))
+     (lambda (result)
+       (message "jsonyter: exported %s to %s (%s)%s"
+                (plist-get result :format)
+                (plist-get result :path)
+                (file-size-human-readable (or (plist-get result :bytes) 0)
+                                          nil " " "B")
+                (let ((n (length (plist-get result :resources))))
+                  (if (> n 0) (format ", %d resource%s" n (if (= n 1) "" "s")) "")))))))
+
+;; Thin wrappers for the formats worth a name of their own.  Each reads
+;; TO-PATH the same way `jsonyter-notebook-export' itself does, with
+;; FORMAT already fixed, and calls straight into it -- so a missing
+;; exporter is still caught by that command's own probe check before any
+;; request that would take two minutes to fail.
+
+(defun jsonyter--export-read-to-path (format)
+  "Read a TO-PATH for FORMAT the way `jsonyter-notebook-export' does."
+  (let ((default (concat (file-name-sans-extension (or buffer-file-name "untitled"))
+                         (jsonyter--export-format-guess-extension format))))
+    (read-file-name "Export to: " nil default nil (file-name-nondirectory default))))
+
+;;;###autoload
+(defun jsonyter-notebook-export-html (to-path)
+  "Export this notebook to HTML, writing the result to TO-PATH.
+A thin wrapper around `jsonyter-notebook-export' with FORMAT fixed to
+\"html\"; see its docstring for what this does."
+  (interactive (list (jsonyter--export-read-to-path "html")))
+  (jsonyter-notebook-export "html" to-path))
+
+;;;###autoload
+(defun jsonyter-notebook-export-markdown (to-path)
+  "Export this notebook to Markdown, writing the result to TO-PATH.
+A thin wrapper around `jsonyter-notebook-export' with FORMAT fixed to
+\"markdown\"; see its docstring for what this does."
+  (interactive (list (jsonyter--export-read-to-path "markdown")))
+  (jsonyter-notebook-export "markdown" to-path))
+
+;;;###autoload
+(defun jsonyter-notebook-export-pdf (to-path)
+  "Export this notebook to PDF, writing the result to TO-PATH.
+A thin wrapper around `jsonyter-notebook-export' with FORMAT fixed to
+\"pdf\"; see its docstring for what this does.  Needs pandoc and a LaTeX
+engine on the Jupyter server -- see the README's \"Exporting\" section."
+  (interactive (list (jsonyter--export-read-to-path "pdf")))
+  (jsonyter-notebook-export "pdf" to-path))
+
+;;;###autoload
+(defun jsonyter-notebook-export-latex (to-path)
+  "Export this notebook to LaTeX, writing the result to TO-PATH.
+A thin wrapper around `jsonyter-notebook-export' with FORMAT fixed to
+\"latex\"; see its docstring for what this does."
+  (interactive (list (jsonyter--export-read-to-path "latex")))
+  (jsonyter-notebook-export "latex" to-path))
+
+;;;###autoload
+(defun jsonyter-notebook-export-webpdf (to-path)
+  "Export this notebook to PDF via a headless browser, writing the
+result to TO-PATH.  A thin wrapper around `jsonyter-notebook-export'
+with FORMAT fixed to \"webpdf\"; see its docstring for what this does.
+Needs playwright and chromium on the Jupyter server -- see the README's
+\"Exporting\" section."
+  (interactive (list (jsonyter--export-read-to-path "webpdf")))
+  (jsonyter-notebook-export "webpdf" to-path))
+
+;;;###autoload
+(defun jsonyter-notebook-export-slides (to-path)
+  "Export this notebook to reveal.js slides, writing the result to TO-PATH.
+A thin wrapper around `jsonyter-notebook-export' with FORMAT fixed to
+\"slides\"; see its docstring for what this does."
+  (interactive (list (jsonyter--export-read-to-path "slides")))
+  (jsonyter-notebook-export "slides" to-path))
 
 ;;;; Script export (`# %%' dividers, for people who do not use notebooks)
 

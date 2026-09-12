@@ -1762,6 +1762,166 @@ whatever markdown span it falls in, same as any other text there."
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
 
+;;;; Notebook document export (§4.1-4.9)
+
+(ert-deftest jsonyter-test-build-command-includes-export-timeout ()
+  "`jsonyter-export-timeout' is passed through as `--export-timeout'."
+  (let ((jsonyter-export-timeout 45)
+        (jsonyter-command '("jsonyter"))
+        (jsonyter-exec-timeout nil)
+        (jsonyter-insecure-tls nil))
+    (should (member "--export-timeout" (jsonyter--build-command nil)))
+    (should (equal "45" (nth (1+ (cl-position "--export-timeout"
+                                              (jsonyter--build-command nil)
+                                              :test #'equal))
+                             (jsonyter--build-command nil)))))
+  (let ((jsonyter-export-timeout nil) (jsonyter-command '("jsonyter")))
+    (should-not (member "--export-timeout" (jsonyter--build-command nil)))))
+
+(ert-deftest jsonyter-test-export-format-names-extracts-keys ()
+  "`jsonyter--export-format-names' reads the plist `list_export_formats'
+itself returns, not a hardcoded list."
+  (should (equal '("html" "markdown" "pdf")
+                 (jsonyter--export-format-names
+                  '(:html (:output_mimetype "text/html")
+                    :markdown (:output_mimetype "text/markdown")
+                    :pdf (:output_mimetype "application/pdf"))))))
+
+(ert-deftest jsonyter-test-export-format-guess-extension ()
+  "Known formats get their conventional extension; an unknown one falls
+back to `.FORMAT'."
+  (should (equal ".html" (jsonyter--export-format-guess-extension "html")))
+  (should (equal ".md" (jsonyter--export-format-guess-extension "markdown")))
+  (should (equal ".pdf" (jsonyter--export-format-guess-extension "pdf")))
+  (should (equal ".pdf" (jsonyter--export-format-guess-extension "webpdf")))
+  (should (equal ".slides.html" (jsonyter--export-format-guess-extension "slides")))
+  (should (equal ".docx" (jsonyter--export-format-guess-extension "docx"))))
+
+(ert-deftest jsonyter-test-status-tag-export-has-no-percentage ()
+  "The `:export' mode-line tag carries no fake percentage -- there are no
+`progress' events for export, unlike a file transfer."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-transfer s) (list :phase "export"))
+      (should (equal ":export[kid]" (jsonyter--session-status-tag s)))
+      ;; An ordinary transfer is unaffected by the new branch.
+      (setf (jsonyter--session-transfer s) (list :phase "upload" :pct 42))
+      (should (equal ":up 42%[kid]" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-list-export-formats-is-cached-per-process ()
+  "`jsonyter--list-export-formats' hits the bridge once per process and
+reuses the reply after that, since the probe cannot change under a
+running server."
+  (jsonyter-tests--with-notebook
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   (list :available t :formats '(:html (:output_mimetype "text/html"))
+                         :reason nil))))
+        (jsonyter--list-export-formats)
+        (jsonyter--list-export-formats)
+        (should (= 1 calls))
+        (jsonyter--list-export-formats 'refresh)
+        (should (= 2 calls))))))
+
+(ert-deftest jsonyter-test-list-export-formats-old-bridge-message ()
+  "An unknown-method failure against an old bridge is rewritten as a
+plain version-upgrade message, not a raw protocol error."
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _) (error "jsonyter: unknown method \"list_export_formats\""))))
+      (should-error (jsonyter--list-export-formats) :type 'user-error)
+      (condition-case err
+          (jsonyter--list-export-formats)
+        (user-error
+         (should (string-match-p ">= 2.0.0" (error-message-string err))))))))
+
+(ert-deftest jsonyter-test-notebook-export-formats-reports-unavailable ()
+  "`jsonyter-notebook-export-formats' surfaces the server's own `reason'
+when export is not available, rather than an empty list."
+  (jsonyter-tests--with-notebook
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (&rest _)
+                   (list :available nil :formats nil
+                         :reason "this server does not serve the nbconvert endpoints")))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export-formats))
+      (should (string-match-p "not available" reported))
+      (should (string-match-p "nbconvert endpoints" reported)))))
+
+(ert-deftest jsonyter-test-notebook-export-refuses-when-formats-unavailable ()
+  "`jsonyter-notebook-export' called interactively refuses immediately
+when the probe reports no formats, rather than firing a request that
+would take two minutes to fail."
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _) (list :available nil :formats nil :reason "no nbconvert"))))
+      (should-error
+       (call-interactively #'jsonyter-notebook-export)
+       :type 'user-error))))
+
+(ert-deftest jsonyter-test-notebook-export-sends-all-outputs-cells ()
+  "`jsonyter-notebook-export' collects cells with ALL-OUTPUTS, so a
+freshly opened notebook full of saved results exports its stored output,
+not a blank cell."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let (sent)
+              (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                        ((symbol-function 'jsonyter--export-run)
+                         (lambda (_session params _on-success) (setq sent params))))
+                (jsonyter-notebook-export "html" "/tmp/does-not-matter.html")
+                (let ((cells (append (plist-get sent :cells) nil)))
+                  (should (= 2 (length cells)))
+                  (should (plist-member (nth 0 cells) :outputs))
+                  (should (plist-member (nth 1 cells) :outputs)))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
+  "Exporting the fixture notebook to html via `to_path' produces a
+non-empty file mentioning a cell's source.  Needs both the bridge and a
+reachable Jupyter server; skips like the other bridge-dependent tests in
+this file when either is missing -- which, absent a way to probe server
+reachability up front, is treated the same as any other failure here."
+  (skip-unless (jsonyter-tests--bridge-available-p))
+  (jsonyter-tests--with-notebook
+    (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
+           (out (make-temp-file "jsonyter-export-test-" nil ".html")))
+      (delete-file out)
+      (unwind-protect
+          (condition-case err
+              (progn
+                (jsonyter--ensure-bridge)
+                (let ((cells (jsonyter--nb-collect-cells t t)))
+                  (jsonyter--request-sync
+                   "export_notebook"
+                   (list :format "html" :cells (vconcat cells) :to_path out)
+                   jsonyter-export-timeout))
+                (should (file-exists-p out))
+                (should (> (file-attribute-size (file-attributes out)) 0))
+                (should (string-match-p "x = 1"
+                                       (with-temp-buffer
+                                         (insert-file-contents out)
+                                         (buffer-string)))))
+            (error (ert-skip (format "export_notebook unavailable: %s"
+                                     (error-message-string err)))))
+        (when (file-exists-p out) (delete-file out))))))
+
 ;;;; Script export (§4.10)
 
 ;; Entirely local text transformation: no kernel, bridge or server
@@ -2408,6 +2568,21 @@ chunk-size option."
               :status 413 :cf_ray "abc-123"))))
     (should (string-match-p "jsonyter-upload-chunk-size" m))
     (should (string-match-p "jsonyter-resume-upload" m))))
+
+(ert-deftest jsonyter-test-error-message-renders-export-hint ()
+  "An `ExportError''s `hint' and `available_formats' both render, e.g.
+the pdf/pandoc hint text reaching the user."
+  (let ((m (jsonyter--error-message
+            '(:error "ExportError" :message "nbconvert failed for format pdf"
+              :format "pdf"
+              :hint "install pandoc and a LaTeX engine on the Jupyter server"))))
+    (should (string-match-p "install pandoc" m)))
+  (let ((m (jsonyter--error-message
+            '(:error "ExportError" :message "unknown export format \"docx\""
+              :available_formats ["html" "markdown" "pdf"]))))
+    (should (string-match-p "html" m))
+    (should (string-match-p "markdown" m))
+    (should (string-match-p "pdf" m))))
 
 (ert-deftest jsonyter-test-kernel-reset-clears-contents-dir ()
   "A restart drops the stale contents-path mapping so the next transfer re-probes."
