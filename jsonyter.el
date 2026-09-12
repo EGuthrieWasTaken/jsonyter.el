@@ -2931,6 +2931,12 @@ end of its last visible line still lands in the right cell."
     ;; first refresh would sweep the whole rendered block into what the
     ;; cell calls its source, and the next save would write it to disk.
     (overlay-put ov 'jsonyter-source-end (copy-marker end))
+    ;; The file's own outputs, in nbformat shape (`:output_type', not the
+    ;; kernel protocol's `:type') -- kept separate from `jsonyter-raw-outputs'
+    ;; (kernel shape, set only by `jsonyter--nb-set-output' with TOUCHED)
+    ;; so a cell nothing has re-run this session can still contribute its
+    ;; stored results to an export; see `jsonyter--nb-collect-cells'.
+    (overlay-put ov 'jsonyter-file-outputs (plist-get cell :outputs))
     (jsonyter--nb-refresh-prompt ov)
     (let ((rendered (mapconcat (lambda (o)
                                  (jsonyter--nb-render-string
@@ -3145,25 +3151,43 @@ read can still be saved without ever contacting a Jupyter server."
     (setq jsonyter--process (jsonyter--start-bridge)))
   jsonyter--process)
 
-(defun jsonyter--nb-collect-cells (&optional include-outputs)
-  "The buffer's cells as a list of plists for `write_notebook'.
+(defun jsonyter--nb-collect-cells (&optional include-outputs all-outputs)
+  "The buffer's cells as a list of plists for `write_notebook' or export.
 
 With INCLUDE-OUTPUTS, a cell touched this session — run, or explicitly
 cleared, since the notebook was opened — also carries its current
 `outputs'/`execution_count'.  A cell never touched omits the key
 entirely, which is what tells the bridge to leave its stored output on
-disk exactly as it was; see `jsonyter--nb-set-output'."
+disk exactly as it was; see `jsonyter--nb-set-output'.
+
+ALL-OUTPUTS is for `export_notebook' only — `write_notebook' must never
+pass it.  A code cell that has not been touched this session then
+contributes the outputs it was read from the file with
+\(`jsonyter-file-outputs', already in nbformat shape — not the kernel
+shape `jsonyter--nb-output-to-spec' converts from\), rather than omitting
+the key, so an export of a notebook nothing has been re-run in still
+carries its stored results instead of coming out blank.  Has no effect
+unless INCLUDE-OUTPUTS is also set.  Also omits `:id' entirely for a new
+cell instead of sending `:null', since this path hands the notebook
+straight to nbformat rather than through `write_notebook''s own id
+assignment."
   (mapcar
    (lambda (cell)
-     (append
-      (list :id (or (overlay-get cell 'jsonyter-cell-id) :null)
-            :cell_type (overlay-get cell 'jsonyter-cell-type)
-            :source (jsonyter--nb-cell-source cell))
-      (and include-outputs
-           (overlay-get cell 'jsonyter-outputs-touched)
-           (list :outputs (vconcat (mapcar #'jsonyter--nb-output-to-spec
-                                           (overlay-get cell 'jsonyter-raw-outputs)))
-                 :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))))
+     (let ((touched (overlay-get cell 'jsonyter-outputs-touched))
+           (code-p (equal (overlay-get cell 'jsonyter-cell-type) "code"))
+           (id (overlay-get cell 'jsonyter-cell-id)))
+       (append
+        (if (and all-outputs (not id)) nil (list :id (or id :null)))
+        (list :cell_type (overlay-get cell 'jsonyter-cell-type)
+              :source (jsonyter--nb-cell-source cell))
+        (cond
+         ((and include-outputs touched)
+          (list :outputs (vconcat (mapcar #'jsonyter--nb-output-to-spec
+                                          (overlay-get cell 'jsonyter-raw-outputs)))
+                :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))
+         ((and include-outputs all-outputs code-p)
+          (list :outputs (vconcat (overlay-get cell 'jsonyter-file-outputs))
+                :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))))))
    (jsonyter--nb-cells)))
 
 (defun jsonyter--nb-do-save (include-outputs)

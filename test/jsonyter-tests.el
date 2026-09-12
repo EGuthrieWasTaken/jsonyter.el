@@ -859,6 +859,72 @@ source, or the next cell is rendered inside the previous one's results."
         (kill-buffer buffer))
       (delete-file path))))
 
+;;;; Export's all-outputs collector (report #4, §4.3)
+
+(ert-deftest jsonyter-test-collect-cells-all-outputs-carries-stored-results ()
+  "With ALL-OUTPUTS, a cell nothing has re-run this session still
+contributes its file outputs, in nbformat shape -- the trap the triage
+report calls out: without this, exporting a freshly opened notebook full
+of saved results comes out blank."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let ((cells (jsonyter--nb-collect-cells t t)))
+              (should (= 2 (length cells)))
+              (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+              (let ((outputs-0 (append (plist-get (nth 0 cells) :outputs) nil)))
+                (should (= 1 (length outputs-0)))
+                (should (equal "stream" (plist-get (car outputs-0) :output_type)))
+                ;; Read straight from the file, nbformat's list-of-lines
+                ;; shape and all -- this is `jsonyter-file-outputs' passed
+                ;; through untouched, not run through any conversion.
+                (should (equal '("stored one\n" "stored two\n")
+                               (plist-get (car outputs-0) :text))))
+              (should (= 1 (plist-get (nth 0 cells) :execution_count)))
+              (let ((outputs-1 (append (plist-get (nth 1 cells) :outputs) nil)))
+                (should (= 1 (length outputs-1)))
+                (should (equal "stored three\n" (plist-get (car outputs-1) :text)))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-collect-cells-without-all-outputs-still-omits-untouched ()
+  "`write_notebook''s own collector -- ALL-OUTPUTS unset -- is unchanged:
+an untouched cell still omits `:outputs' entirely, which is what tells
+the bridge to leave the stored output on disk alone."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let ((cells (jsonyter--nb-collect-cells t nil)))
+              (should (= 2 (length cells)))
+              (should-not (plist-member (nth 0 cells) :outputs))
+              (should-not (plist-member (nth 1 cells) :outputs)))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-collect-cells-all-outputs-omits-id-for-new-cell ()
+  "ALL-OUTPUTS omits `:id' entirely for a new cell instead of sending
+`:null' -- this path hands the notebook straight to nbformat rather than
+through `write_notebook''s own id assignment."
+  (jsonyter-tests--with-notebook
+    (let ((cells (jsonyter--nb-collect-cells t t)))
+      (should (equal "aaa" (plist-get (nth 0 cells) :id))))
+    (jsonyter-insert-cell-below)
+    (let* ((cells (jsonyter--nb-collect-cells t t))
+           (new-cell (nth 1 cells)))
+      (should-not (plist-member new-cell :id)))))
+
 (ert-deftest jsonyter-test-clear-all-output-leaves-plain-text ()
   "Clearing every output leaves a buffer of nothing but source."
   (jsonyter-tests--with-notebook
