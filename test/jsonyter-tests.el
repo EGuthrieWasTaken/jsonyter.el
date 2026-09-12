@@ -1598,6 +1598,64 @@ own visibility cycling hides committed-free session output for us."
         (should (= 1 (length cells)))
         (should (eq :null (plist-get (car cells) :id)))))))
 
+(ert-deftest jsonyter-test-org-to-notebook-hand-authored-file-splits-on-blocks ()
+  "A hand-authored Org file -- one that never round-tripped through
+`jsonyter-org-from-notebook' and so has no `:JSONYTER_CELL_ID:' drawers
+at all -- must split into one cell per `jy:' block plus the prose
+between them, not collapse to a single markdown cell containing every
+block verbatim.  Pins the bug found while designing script export
+\(TRIAGE-2026-09-12.md §4.10.4\)."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "Some prose between blocks.\n\n"
+                "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 3 (length cells)))
+        (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+        (should (eq :null (plist-get (nth 0 cells) :id)))
+        (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+        (should (equal "Some prose between blocks."
+                       (plist-get (nth 1 cells) :source)))
+        (should (equal "code" (plist-get (nth 2 cells) :cell_type)))
+        (should (equal "x + 1" (plist-get (nth 2 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-hand-authored-file-with-leading-prose ()
+  "The same, but the first block is not the very first thing in the
+buffer -- guards against a narrower version of the same bug where only
+a block sitting at `point-min' was mishandled."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "* Heading\nIntro prose.\n\n"
+                "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "Trailing prose.\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 3 (length cells)))
+        (should (equal "markdown" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "* Heading\nIntro prose." (plist-get (nth 0 cells) :source)))
+        (should (equal "code" (plist-get (nth 1 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 1 cells) :source)))
+        (should (equal "markdown" (plist-get (nth 2 cells) :cell_type)))
+        (should (equal "Trailing prose." (plist-get (nth 2 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-non-jy-block-stays-in-prose ()
+  "A src block with no `jy:' session is not split out as its own cell --
+only `jy:' blocks are \"cells\" for this conversion, so it is left inside
+whatever markdown span it falls in, same as any other text there."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "See this snippet:\n\n"
+                "#+begin_src python\nplain block, no session\n#+end_src\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 2 (length cells)))
+        (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+        (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+        (should (string-match-p "plain block, no session"
+                                (plist-get (nth 1 cells) :source)))))))
+
 (ert-deftest jsonyter-test-org-parse-results-drawer-recovers-stream-text ()
   "A committed text drawer reads back as one combined stream output."
   (jsonyter-tests--with-org-file

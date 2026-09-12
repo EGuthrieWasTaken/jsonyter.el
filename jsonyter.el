@@ -6535,7 +6535,22 @@ is dropped along with genuinely blank ones."
   "This buffer's ((ID-OR-NIL . TEXT) ...), split at cell-id drawers.
 TEXT runs from just after one drawer (or the start of the buffer, for
 content with no id) to just before the next -- see the Commentary above
-this section for why a drawer here carries no heading."
+this section for why a drawer here carries no heading.
+
+A buffer with no `:JSONYTER_CELL_ID:' drawer at all -- any Org file
+`jsonyter-org-from-notebook' did not itself write -- falls back to
+`jsonyter--org-notebook-cell-spans--by-block': without this, the whole
+buffer is one span with a nil id, which `jsonyter--org-notebook-cell-from-span'
+then reads as a single markdown cell containing every `#+begin_src' block
+verbatim, silently, since only the first span's shape is ever consulted
+to tell code from prose."
+  (if (save-excursion (goto-char (point-min))
+                      (re-search-forward jsonyter--org-cell-id-re nil t))
+      (jsonyter--org-notebook-cell-spans--by-drawer)
+    (jsonyter--org-notebook-cell-spans--by-block)))
+
+(defun jsonyter--org-notebook-cell-spans--by-drawer ()
+  "`jsonyter--org-notebook-cell-spans', the original drawer-splitting path."
   (let (spans (id nil) (start (point-min)))
     (save-excursion
       (goto-char (point-min))
@@ -6545,6 +6560,64 @@ this section for why a drawer here carries no heading."
         (setq id (match-string 1) start (point)))
       (let ((text (buffer-substring-no-properties start (point-max))))
         (unless (jsonyter--org-notebook-span-empty-p text) (push (cons id text) spans))))
+    (nreverse spans)))
+
+(defun jsonyter--org-notebook-cell-spans--by-block ()
+  "`jsonyter--org-notebook-cell-spans', the no-drawer fallback.
+Splits at `jy:' `#+begin_src'/`#+end_src' boundaries instead of drawers:
+the prose before the first block, between two blocks, or after the last
+becomes a markdown span; each block's own `#+begin_src' through
+`#+end_src' text becomes a code span -- exactly the two shapes
+`jsonyter--org-notebook-cell-from-span' already knows how to read.  Every
+span's id is nil, so every cell comes out as new; there is no drawer
+here to merge onto.  A non-`jy:' block is left embedded in the
+surrounding prose span, same as any other text -- only `jy:' blocks are
+\"cells\" for this conversion, per `jsonyter-org-to-notebook''s own
+docstring.
+
+Deliberately does not walk blocks via `jsonyter--org-goto-next-jy-block'
+\(built on `org-babel-next-src-block'): that command's \"next\" is
+relative to the *line point is already on*, so when the very first thing
+in the buffer is a block, starting the scan at `point-min' -- sitting
+squarely on that block's own `#+begin_src' line -- makes it skip that
+block entirely and jump to the *second* one, silently folding the whole
+first block into the leading prose span instead of splitting it out.
+Scanning with `org-babel-src-block-regexp' directly has no such
+\"current line\" exclusion."
+  (require 'ob-core)
+  (let (spans (start (point-min)))
+    (save-excursion
+      (goto-char (point-min))
+      (while (re-search-forward org-babel-src-block-regexp nil t)
+        ;; `jsonyter--org-in-jy-block-p' parses the block with org-babel,
+        ;; which does its own regexp searches and clobbers this loop's
+        ;; match data -- capture everything from THIS match before
+        ;; calling it, or `(match-end 0)' below reads someone else's
+        ;; match and point can fail to advance, looping forever.
+        (let ((block-start (match-beginning 0))
+              (after-match (match-end 0)))
+          (goto-char block-start)
+          (if (jsonyter--org-in-jy-block-p)
+              (let* ((el (org-element-at-point))
+                     (raw-end (org-element-property :end el))
+                     (block-end
+                      (save-excursion
+                        (goto-char block-start)
+                        (if (re-search-forward "^[ \t]*#\\+end_src.*\n" raw-end t)
+                            (point)
+                          raw-end))))
+                (let ((prose (buffer-substring-no-properties start block-start)))
+                  (unless (jsonyter--org-notebook-span-empty-p prose)
+                    (push (cons nil prose) spans)))
+                (push (cons nil (buffer-substring-no-properties block-start block-end)) spans)
+                (setq start block-end)
+                (goto-char block-end))
+            ;; Not a jy: block: leave it for the surrounding prose span
+            ;; and resume scanning right after this match.
+            (goto-char after-match))))
+      (let ((prose (buffer-substring-no-properties start (point-max))))
+        (unless (jsonyter--org-notebook-span-empty-p prose)
+          (push (cons nil prose) spans))))
     (nreverse spans)))
 
 (defun jsonyter--org-notebook-cell-from-span (id text base-dir)
@@ -6588,6 +6661,10 @@ span with no id drawer is treated as a new cell.  A block's committed
 `jsonyter--org-parse-results-drawer' for what is necessarily lossy about
 that); a block with none keeps whatever nbformat already has on disk for
 its id.
+
+Works equally on a hand-authored file that has never round-tripped
+through `jsonyter-org-from-notebook' and so has no id drawers at all: see
+`jsonyter--org-notebook-cell-spans' for how the split adapts.
 
 Interactively, prompts for both file names, defaulting IPYNB-FILE to
 ORG-FILE's own name with the extension swapped."
