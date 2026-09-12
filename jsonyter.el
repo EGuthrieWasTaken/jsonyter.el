@@ -5300,6 +5300,7 @@ are mutually exclusive per block, so turn this off where you rely on
 (declare-function org-babel-remove-result "ob-core" (&optional info keep-keyword))
 (declare-function org-babel-next-src-block "ob-core" (&optional arg))
 (declare-function org-babel-previous-src-block "ob-core" (&optional arg))
+(defvar org-babel-src-block-regexp)
 
 (defvar jsonyter-org-mode)              ; the minor-mode flag, defined below
 
