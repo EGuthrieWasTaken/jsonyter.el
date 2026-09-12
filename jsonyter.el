@@ -6712,5 +6712,231 @@ ORG-FILE's own name with the extension swapped."
        jsonyter-startup-timeout))
     (message "jsonyter: wrote %s" ipynb-file)))
 
+;;;; Script export (`# %%' dividers, for people who do not use notebooks)
+
+;; A local text transformation, not an export through the bridge: nbconvert's
+;; `script'/`python' exporters were tried and rejected (see the design notes
+;; in TRIAGE-2026-09-12.md §4.10.1) -- `script' drops markdown and cell
+;; dividers entirely for every language but Python, and `python' writes
+;; `# In[1]:' dividers that `jsonyter-script-cell-regexp' does not match.
+;; So this needs no Jupyter server, kernel or bridge at all, and stays that
+;; way deliberately: it must keep working offline.
+;;
+;; Direction is one-way -- notebook/Org -> script -- by decision, not by
+;; limitation.  For Python, R and Julia the round trip falls out for free
+;; anyway, since `# %%' is exactly what `jsonyter-script-cell-regexp'
+;; matches; nothing here is designed around preserving that, and it is not
+;; required.  SAS does not get it, on purpose -- see `jsonyter-script-export-languages'.
+
+(defcustom jsonyter-script-export-languages
+  '(("python" :extension ".py" :divider "# %%" :comment-line "# ")
+    ("r"      :extension ".R"  :divider "# %%" :comment-line "# ")
+    ("julia"  :extension ".jl" :divider "# %%" :comment-line "# ")
+    ("sas"    :extension ".sas" :divider "* %%;" :comment-block ("/* " . " */")))
+  "How `jsonyter-notebook-export-script' and `jsonyter-org-export-script'
+render one language's cells as a plain script, in Jupytext's \"percent\"
+format.
+
+Keyed by language name, matched case-insensitively against both a
+notebook's own lowercase `language_info.name' and Org's own-cased
+`#+begin_src LANG'.  Each value is a plist:
+
+  :extension     File extension to default to when prompting, dot included.
+  :divider       The `# %%'-style cell-boundary marker, written verbatim
+                 before every cell.
+  :comment-line  A markdown/raw cell's lines are prefixed with this, one
+                 by one, blank lines included.  Mutually exclusive with
+                 :comment-block.
+  :comment-block A markdown/raw cell is wrapped once in (OPEN . CLOSE)
+                 instead of commented line by line.  For a language whose
+                 line-comment syntax is unsafe to split prose across --
+                 SAS's `* text;' comment statement is terminated by the
+                 *first* semicolon, so commenting prose line by line would
+                 let any `;' in it (entirely ordinary prose) leak the rest
+                 of that line into the script as SAS code.  A literal
+                 `*/' inside the prose, which would otherwise close a
+                 `/* ... */' block early, is neutralized the same way.
+
+`* %%;' does not match `jsonyter-script-cell-regexp', so a SAS export
+does not reopen as cells in `jsonyter-script-mode' -- documented, not a
+bug: there is no SAS comment syntax that is simultaneously valid SAS and
+a jsonyter cell marker, and a bare `%%' is a macro reference in SAS, so
+it cannot be used unquoted either.
+
+A language not in this alist falls back to a notebook buffer's own
+`language_info.file_extension' \(Org has no equivalent\), then to a
+generic `# %%' / `# ' shape.  A language THIS alist does know never
+consults that metadata for its extension: some kernels' own
+`file_extension' disagrees with the choice made here on purpose --
+IRkernel declares `.r', not the conventional `.R' -- and letting the
+metadata win would silently undo that."
+  :type '(alist :key-type string
+                :value-type (plist :options
+                                    ((:extension string)
+                                     (:divider string)
+                                     (:comment-line string)
+                                     (:comment-block (cons string string))))))
+
+(defun jsonyter--script-export-spec (language &optional metadata)
+  "The `jsonyter-script-export-languages' entry for LANGUAGE.
+Falls back to METADATA's `language_info.file_extension' \(a notebook's
+own top-level metadata, see `jsonyter--nb-metadata'\) for a language the
+alist does not know, and to a generic `# %%'/`# ' shape after that."
+  (or (cdr (assoc-string language jsonyter-script-export-languages t))
+      (let ((ext (and metadata
+                      (plist-get (plist-get metadata :language_info)
+                                 :file_extension))))
+        (list :extension (or ext ".txt") :divider "# %%" :comment-line "# "))))
+
+(defun jsonyter--script-export-comment (text spec)
+  "Render TEXT -- a markdown or raw cell's source -- as a comment, per SPEC."
+  (let ((block (plist-get spec :comment-block)))
+    (if block
+        ;; Guarding literally against `*/' here, not against the CLOSE
+        ;; string in general: that is the one sequence that can close a
+        ;; `/* ... */'-style comment early, whatever OPEN and CLOSE
+        ;; themselves happen to be spelled as.
+        (concat (car block)
+                (replace-regexp-in-string "\\*/" "* /" text)
+                (cdr block))
+      (mapconcat (lambda (line) (concat (plist-get spec :comment-line) line))
+                 (split-string text "\n" nil)
+                 "\n"))))
+
+(defun jsonyter--cells-to-script (cells spec)
+  "Render CELLS -- a list of (:cell_type :source ...) plists, the same
+vocabulary `write_notebook' and `export_notebook''s `cells' param take --
+as one script string, per SPEC (see `jsonyter-script-export-languages').
+Shared by `jsonyter-notebook-export-script' and `jsonyter-org-export-script',
+and trivially testable on its own: no buffer, bridge or server involved."
+  (mapconcat
+   (lambda (cell)
+     (let* ((type (plist-get cell :cell_type))
+            (source (or (plist-get cell :source) ""))
+            (prose-p (member type '("markdown" "raw")))
+            (marker (cond ((equal type "markdown") " [markdown]")
+                          ((equal type "raw") " [raw]")
+                          (t ""))))
+       (concat (plist-get spec :divider) marker "\n"
+               (if prose-p (jsonyter--script-export-comment source spec) source)
+               "\n")))
+   cells "\n"))
+
+;;;###autoload
+(defun jsonyter-notebook-export-script (file)
+  "Export this notebook's cells to FILE as a plain script.
+
+One-way -- see the Commentary above this section.  Needs no Jupyter
+server, kernel or bridge: unlike every other `jsonyter-notebook-export-*'
+command, this works offline, even against a notebook that has never been
+run.
+
+Interactively, defaults FILE to this buffer's own base name with the
+language's own extension, from `jsonyter-script-export-languages'."
+  (interactive
+   (list (let* ((language (or jsonyter--nb-lang "python"))
+                (spec (jsonyter--script-export-spec language jsonyter--nb-metadata))
+                (default (concat (file-name-sans-extension
+                                  (or buffer-file-name "untitled"))
+                                 (plist-get spec :extension))))
+           (read-file-name "Export script to: " nil default nil
+                            (file-name-nondirectory default)))))
+  (unless (bound-and-true-p jsonyter-notebook-mode)
+    (user-error "jsonyter: not a notebook buffer"))
+  (when (and (file-exists-p file) (not (called-interactively-p 'interactive)))
+    (user-error "jsonyter: %s already exists" file))
+  (when (and (file-exists-p file) (called-interactively-p 'interactive)
+             (not (yes-or-no-p (format "%s already exists; overwrite? " file))))
+    (user-error "jsonyter: aborted"))
+  (let* ((language (or jsonyter--nb-lang "python"))
+         (spec (jsonyter--script-export-spec language jsonyter--nb-metadata))
+         (cells (jsonyter--nb-collect-cells)))
+    (with-temp-file file (insert (jsonyter--cells-to-script cells spec)))
+    (message "jsonyter: exported %d cell%s to %s"
+             (length cells) (if (= (length cells) 1) "" "s")
+             (file-name-nondirectory file))))
+
+;;; Org -> script
+
+(defun jsonyter--org-script-export-cell-from-span (text)
+  "One script-export (:cell_type :source [:language]) plist from TEXT.
+
+Like `jsonyter--org-notebook-cell-from-span', but for script export: no
+output parsing (a script carries no outputs at all -- see
+`jsonyter-org-export-script') and, deliberately, no Markdown conversion.
+The prose is going into a comment verbatim either way, so converting it
+through `jsonyter--org-markdown-convert' buys nothing and costs a hard
+pandoc dependency for nothing -- worse, with no pandoc installed and no
+`jsonyter-org-markdown-converter' set, that function inserts a banner
+into the content itself, which would land in the exported script as if
+it were the user's own prose."
+  (let ((trimmed (string-trim text)))
+    (if (string-match-p "\\`#\\+begin_src" trimmed)
+        (with-temp-buffer
+          (delay-mode-hooks (org-mode))
+          (insert trimmed)
+          (goto-char (point-min))
+          (let ((info (org-babel-get-src-block-info 'light)))
+            (list :cell_type "code" :language (and info (nth 0 info))
+                  :source (string-trim (or (and info (nth 1 info)) "")))))
+      (list :cell_type "markdown" :source trimmed))))
+
+(defun jsonyter--org-to-script-cells ()
+  "This buffer's cells for script export.
+Splits the same way `jsonyter--org-to-notebook-cells' does -- see
+`jsonyter--org-notebook-cell-spans' -- so a hand-authored file with no
+`:JSONYTER_CELL_ID:' drawers works exactly as well as one that
+round-tripped through `jsonyter-org-from-notebook'."
+  (mapcar (lambda (span) (jsonyter--org-script-export-cell-from-span (cdr span)))
+          (jsonyter--org-notebook-cell-spans)))
+
+;;;###autoload
+(defun jsonyter-org-export-script (file)
+  "Export this Org buffer's `jy:' blocks to FILE as a plain script.
+
+The prose between blocks becomes commented markdown -- see the
+Commentary above this section for the whole feature, and
+`jsonyter-script-export-languages' for how a cell's language decides
+comment style and divider.  One-way, and needs no Jupyter server, kernel
+or bridge at all: like `jsonyter-notebook-export-script', this is a
+local text transformation.
+
+The script's language is the first `jy:' code block's own language; a
+buffer whose blocks mix languages is not a coherent single script and is
+not specially handled.  A buffer with no `jy:' blocks at all exports as
+Python.
+
+Interactively, defaults FILE to this buffer's own base name with the
+language's own extension."
+  (interactive
+   (progn
+     (unless (derived-mode-p 'org-mode) (user-error "jsonyter: not an Org buffer"))
+     (require 'ob-core)
+     (let* ((cells (jsonyter--org-to-script-cells))
+            (language (or (seq-some (lambda (c) (plist-get c :language)) cells)
+                         "python"))
+            (spec (jsonyter--script-export-spec language))
+            (default (concat (file-name-sans-extension
+                              (or buffer-file-name "untitled"))
+                             (plist-get spec :extension))))
+       (list (read-file-name "Export script to: " nil default nil
+                             (file-name-nondirectory default))))))
+  (unless (derived-mode-p 'org-mode)
+    (user-error "jsonyter: not an Org buffer"))
+  (require 'ob-core)
+  (let* ((cells (jsonyter--org-to-script-cells))
+         (language (or (seq-some (lambda (c) (plist-get c :language)) cells)
+                       "python"))
+         (spec (jsonyter--script-export-spec language)))
+    (when (and (file-exists-p file) (not (called-interactively-p 'interactive)))
+      (user-error "jsonyter: %s already exists" file))
+    (when (and (file-exists-p file) (called-interactively-p 'interactive)
+               (not (yes-or-no-p (format "%s already exists; overwrite? " file))))
+      (user-error "jsonyter: aborted"))
+    (with-temp-file file (insert (jsonyter--cells-to-script cells spec)))
+    (message "jsonyter: exported %d cell%s to %s"
+             (length cells) (if (= (length cells) 1) "" "s")
+             (file-name-nondirectory file))))
+
 (provide 'jsonyter)
 ;;; jsonyter.el ends here

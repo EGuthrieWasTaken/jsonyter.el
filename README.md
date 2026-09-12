@@ -862,6 +862,52 @@ when it is on `exec-path`, and otherwise inserts the text unchanged with
 a note saying so. Set `jsonyter-org-markdown-converter` to use something
 else.
 
+## Exporting to a script
+
+`jsonyter-notebook-export-script` (from a rendered notebook buffer) and
+`jsonyter-org-export-script` (from an Org buffer's `jy:` blocks) write a
+plain `.py`/`.R`/`.jl`/`.sas` script with `# %%` cell dividers — the
+Jupytext/VS Code/Spyder "percent" format — for people who don't use
+notebooks or Org:
+
+```python
+# %% [markdown]
+# # Analysis
+#
+# Some **bold** prose, wrapped in a comment verbatim.
+
+# %%
+import numpy as np
+np.random.default_rng(0).normal(size=5).mean()
+```
+
+Both are a **local text transformation**: unlike every other
+`jsonyter-notebook-export-*` command, this needs no Jupyter server,
+kernel or bridge at all, and works against a notebook or Org file that
+has never been run. Markdown/raw prose is wrapped verbatim, never
+converted or reformatted — it is there to be *read*, not re-parsed, and
+this keeps the transformation lossless and pandoc-free.
+
+Direction is one-way — notebook/Org → script — by design, not by
+limitation. For Python, R and Julia the `# %%` marker is exactly what
+`jsonyter-script-cell-regexp` matches, so the result reopens in
+`jsonyter-script-mode` with the same cell boundaries at zero extra cost —
+a free bonus, not a requirement, and nothing here is designed around
+preserving it.
+
+**SAS is one-way only, and that's deliberate.** SAS's own comment forms
+(`* text;`, `/* text */`) have no safe form of `# %%`: a bare `%%` is a
+macro reference in SAS, so `* %%;` is what gets written instead, and it
+does not match `jsonyter-script-cell-regexp`. Markdown in a SAS export is
+also wrapped differently — in a single `/* ... */` block, not commented
+line by line — because `* text;` is terminated by the *first* semicolon,
+and prose containing one (entirely ordinary) would otherwise leak into
+the script as SAS code.
+
+Customize `jsonyter-script-export-languages` to add a language jsonyter
+does not ship support for, or to change the extension/divider/comment
+style of one it does.
+
 ## Extending jsonyter.el: `jsonyter-mode`
 
 `jsonyter-mode` is a marker minor mode, on in every jsonyter buffer —

@@ -1762,6 +1762,219 @@ whatever markdown span it falls in, same as any other text there."
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
 
+;;;; Script export (§4.10)
+
+;; Entirely local text transformation: no kernel, bridge or server
+;; involved anywhere in this section.
+
+(defun jsonyter-tests--script-cell (&rest plist)
+  "A (:cell_type ... :source ...) plist from PLIST, for `jsonyter--cells-to-script'."
+  plist)
+
+(ert-deftest jsonyter-test-cells-to-script-output-shape ()
+  "One divider per cell, the right marker per cell type, code reproduced
+verbatim. The primary test: it pins the deliverable itself."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source "# Analysis")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "import numpy as np")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "np.mean([1, 2, 3])")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal (concat
+                    "# %% [markdown]\n# # Analysis\n\n"
+                    "# %%\nimport numpy as np\n\n"
+                    "# %%\nnp.mean([1, 2, 3])\n")
+                   script))))
+
+(ert-deftest jsonyter-test-cells-to-script-raw-cell-marker ()
+  "A raw cell gets its own `[raw]' marker, commented the same as markdown."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "raw" :source "verbatim text")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal "# %% [raw]\n# verbatim text\n" script))))
+
+(ert-deftest jsonyter-test-cells-to-script-markdown-every-line-commented ()
+  "Every line of a markdown cell, blank lines included, comes out
+commented; no line escapes the comment prefix -- the whole risk of
+wrapping prose verbatim."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (source "Heading\n\nSome text.\n\nMore text.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    (dolist (line (split-string
+                   ;; Drop the divider line itself before checking.
+                   (substring script (1+ (string-match "\n" script)))
+                   "\n" t))
+      (should (string-prefix-p "# " line)))))
+
+(ert-deftest jsonyter-test-script-export-spec-per-language ()
+  "Python, R and Julia all use `# ' and `# %%'; `.R' stays uppercase."
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "python") :comment-line)))
+  (should (equal ".py" (plist-get (jsonyter--script-export-spec "python") :extension)))
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "R") :comment-line)))
+  (should (equal ".R" (plist-get (jsonyter--script-export-spec "R") :extension)))
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "julia") :comment-line)))
+  (should (equal ".jl" (plist-get (jsonyter--script-export-spec "julia") :extension)))
+  ;; Matched case-insensitively: a notebook's lowercase `language_info.name'
+  ;; and Org's own-cased `#+begin_src LANG' must resolve to the same entry.
+  (should (equal ".R" (plist-get (jsonyter--script-export-spec "r") :extension))))
+
+(ert-deftest jsonyter-test-script-export-sas-markdown-is-block-commented ()
+  "SAS markdown is wrapped in a single `/* ... */', not commented per
+line with `*' -- and a markdown cell whose prose contains a semicolon
+still produces a fully commented block.  This is the real hazard: a
+per-line `* text;' comment statement is terminated by the first
+semicolon, and prose containing one is entirely ordinary."
+  (let* ((spec (jsonyter--script-export-spec "sas"))
+         (source "Fit the model; then plot it.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal "* %%; [markdown]\n/* Fit the model; then plot it. */\n" script))
+    ;; No stray `*text;' line anywhere -- the whole point of the block form.
+    (should-not (string-match-p "^\\* " (substring script (1+ (string-match "\n" script)))))))
+
+(ert-deftest jsonyter-test-script-export-sas-guards-close-sequence ()
+  "A markdown cell containing `*/' does not close the SAS comment early."
+  (let* ((spec (jsonyter--script-export-spec "sas"))
+         (source "See the pointer syntax x*/y for an example.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    ;; Exactly one `/*' (the opener) and one closing ` */' (the wrapper's
+    ;; own, at the very end) -- the embedded `*/' must have been altered.
+    (should (string-suffix-p " */\n" script))
+    (should-not (string-match-p "x\\*/y" script))
+    (should (string-match-p "x\\* /y" script))))
+
+(ert-deftest jsonyter-test-script-export-sas-extension-and-divider ()
+  "SAS gets its own extension and a `* %%;' divider, not `# %%'."
+  (should (equal ".sas" (plist-get (jsonyter--script-export-spec "sas") :extension)))
+  (should (equal "* %%;" (plist-get (jsonyter--script-export-spec "sas") :divider))))
+
+(ert-deftest jsonyter-test-script-export-round-trip-python ()
+  "For Python, the `# %%' marker is exactly what
+`jsonyter-script-cell-regexp' matches, so splitting the rendered script
+back on it recovers the same cells -- a free bonus, not a requirement."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "code" :source "a = 1")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "b = 2")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (with-temp-buffer
+      (insert script)
+      (goto-char (point-min))
+      (let ((n 0))
+        (while (re-search-forward jsonyter-script-cell-regexp nil t) (cl-incf n))
+        (should (= 2 n))))))
+
+(ert-deftest jsonyter-test-script-export-sas-divider-does-not-match-cell-regexp ()
+  "`* %%;' does NOT match `jsonyter-script-cell-regexp' -- pins the
+one-way claim in the docstring so nobody \"fixes\" it by accident."
+  (should-not (string-match-p jsonyter-script-cell-regexp "* %%;")))
+
+(ert-deftest jsonyter-test-cells-to-script-empty-cell-list ()
+  "A notebook with no code cells still renders (to an empty string)."
+  (should (equal "" (jsonyter--cells-to-script nil (jsonyter--script-export-spec "python")))))
+
+(ert-deftest jsonyter-test-cells-to-script-source-with-no-trailing-newline ()
+  "A cell whose source has no trailing newline still gets exactly one
+newline before the next divider, not zero and not two."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "code" :source "x = 1")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "y = 2"))))
+    (should (equal "# %%\nx = 1\n\n# %%\ny = 2\n"
+                   (jsonyter--cells-to-script cells spec)))))
+
+(ert-deftest jsonyter-test-cells-to-script-markdown-line-looking-like-a-divider ()
+  "A markdown line that already looks like `# %%' must not produce a
+spurious divider -- the one genuine correctness hazard: a stray `# %%'
+mid-prose is confusing even though nothing re-imports the file."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown"
+                                            :source "Use `# %%' to start a cell.")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (with-temp-buffer
+      (insert script)
+      (goto-char (point-min))
+      (let ((n 0))
+        (while (re-search-forward jsonyter-script-cell-regexp nil t) (cl-incf n))
+        ;; Only the one real divider this cell was rendered with.
+        (should (= 1 n))))))
+
+(ert-deftest jsonyter-test-org-to-script-cells-hand-authored-file ()
+  "`jsonyter--org-to-script-cells' on a hand-authored file with two `jy:'
+blocks and prose between them yields three cells, not one -- exercising
+the same fixed splitter as report #4.10.4, through the script-export
+entry point."
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "Some prose between blocks.\n\n"
+              "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+    (let ((cells (jsonyter--org-to-script-cells)))
+      (should (= 3 (length cells)))
+      (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+      (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+      (should (equal "python" (plist-get (nth 0 cells) :language)))
+      (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+      (should (equal "Some prose between blocks."
+                     (plist-get (nth 1 cells) :source)))
+      (should (equal "code" (plist-get (nth 2 cells) :cell_type)))
+      (should (equal "x + 1" (plist-get (nth 2 cells) :source))))))
+
+(ert-deftest jsonyter-test-org-to-script-cells-does-not-convert-markdown ()
+  "Org prose goes into the script verbatim, never through
+`jsonyter--org-markdown-convert' -- no pandoc dependency, and no
+\"no converter\" banner landing in the output as if it were the user's
+own prose."
+  (let ((jsonyter-org-markdown-converter
+         (lambda (&rest _) (error "must not be called for script export"))))
+    (jsonyter-tests--with-org-file
+        "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n*bold* prose\n"
+      (let ((cells (jsonyter--org-to-script-cells)))
+        (should (equal "*bold* prose" (plist-get (nth 1 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-export-script-writes-file ()
+  "`jsonyter-org-export-script' end to end: writes a script file whose
+content matches what `jsonyter--cells-to-script' alone would render."
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out) ; exercise the "doesn't exist yet" path
+            (jsonyter-org-export-script out)
+            (should (file-exists-p out))
+            (should (equal "# %%\nx = 1\n"
+                           (with-temp-buffer
+                             (insert-file-contents out)
+                             (buffer-string)))))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-org-export-script-refuses-to-clobber ()
+  "Matches `jsonyter-org-from-notebook''s own refusal shape when called
+non-interactively (as this test, and any programmatic caller, does)."
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (should-error (jsonyter-org-export-script out) :type 'user-error)
+        (delete-file out)))))
+
+(ert-deftest jsonyter-test-notebook-export-script-writes-file ()
+  "`jsonyter-notebook-export-script' end to end against a rendered
+notebook buffer."
+  (jsonyter-tests--with-notebook
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out)
+            (jsonyter-notebook-export-script out)
+            (should (file-exists-p out))
+            (let ((content (with-temp-buffer
+                             (insert-file-contents out)
+                             (buffer-string))))
+              (should (string-match-p "# %%\nx = 1" content))
+              (should (string-match-p "# %%\nprint(x)" content))
+              (should (string-match-p "# %% \\[markdown\\]\n# # heading" content))))
+        (when (file-exists-p out) (delete-file out))))))
+
 ;;;; Creating a blank notebook
 
 (ert-deftest jsonyter-test-notebook-new-writes-a-valid-blank-notebook ()
