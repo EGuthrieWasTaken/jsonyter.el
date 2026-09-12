@@ -13,7 +13,11 @@ Since 2.0, a single buffer can drive **several kernels at once** — a
 table of sessions keyed by `(language, name)` — which is what makes one
 Org file with Python, R and SAS blocks work. Since 2.1, a `jy:` block
 also runs through standard Org Babel: `C-c C-c`, export and
-`org-babel-tangle` all work on it, on the same kernel `C-RET` uses.
+`org-babel-tangle` all work on it, on the same kernel `C-RET` uses. Since
+2.3, a notebook or Org buffer's `jy:` cells export to HTML/PDF/Markdown/...
+through the bridge (`jsonyter-notebook-export`), or to a plain
+`.py`/`.R`/`.jl`/`.sas` script with no server involved at all
+(`jsonyter-notebook-export-script`, `jsonyter-org-export-script`).
 
 > **A note on how this was built.** The bulk of jsonyter.el was written by
 > Claude Fable 5, an Anthropic AI model, working iteratively with the
@@ -208,14 +212,21 @@ Keys in the REPL buffer:
 | `TAB` | Kernel-backed `completion-at-point` |
 | `M-p` / `M-n` | Input history |
 | `C-c C-c` | Interrupt the kernel |
-| `C-c C-r` | Restart the kernel |
+| `C-c C-r` | Restart the kernel, same id, all state lost (`jsonyter-restart`, aka `jsonyter-kernel-restart`) |
 | `C-c C-q` | Shut the kernel down |
 | `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
 | `C-c C-j` | Attach this buffer to any kernel running on the server |
 | `C-c M-h` | Show the kernel's most recent commands |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |
-| `C-c C-k` | Reset a REPL stuck at "kernel is busy" |
+| `C-c C-k` | Unstick a REPL stuck at "kernel is busy" — Emacs-side only, the kernel keeps running (`jsonyter-unstick`) |
 | `C-c M-o` | Clear output above the prompt |
+
+`C-c C-r` and `C-c C-k` are easy to conflate: `C-c C-r` replaces the
+kernel process outright — same id, but every variable is gone — while
+`C-c C-k` touches nothing on the kernel side at all, only Emacs's own
+"a request is in flight" bookkeeping, for the case where that bookkeeping
+itself got stuck. Reach for `C-c C-k` first if the kernel might still be
+genuinely working; interrupt it with `C-c C-c` if it is not.
 
 Code that calls `input()` prompts in the minibuffer (passwords use
 `read-passwd`).
@@ -325,6 +336,13 @@ event subscription rather than polled:
 A kernel killed out from under the REPL (say, shut down from a notebook UI)
 reports itself as dead in the buffer instead of hanging the next execute.
 
+Each tag also carries the kernel's short id, e.g. `:idle[3f8a9c21]` — the
+first 8 characters, enough to tell kernels apart, and useful for noticing
+that a session silently started a *new* kernel instead of reusing the
+one you expected. Set `jsonyter-mode-line-show-kernel-id` to `nil` to
+turn it off on a narrow frame; the full id is always available from
+`jsonyter-current-kernel-id` regardless.
+
 ## Reconnecting after a dropped connection
 
 Against a remote server, a laptop that sleeps or loses its network leaves
@@ -424,7 +442,7 @@ refresh.
 | `C-c C-b` | Run every code cell in order |
 | `C-c C-n` / `C-c C-p` | Next / previous cell |
 | `C-c C-c` | Interrupt the kernel |
-| `C-c C-r` | Restart the kernel |
+| `C-c C-r` | Restart the kernel, same id, all state lost (`jsonyter-restart`, aka `jsonyter-kernel-restart`) |
 | `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
 | `C-c C-j` | Attach this buffer to any kernel running on the server |
 | `C-c M-h` | Show the kernel's most recent commands |
@@ -436,6 +454,7 @@ refresh.
 | `C-c <up>` / `C-c <down>` | Move the cell up / down |
 | `C-x C-s` | Save cell source |
 | `C-c C-s` | Save cell source and this session's new outputs |
+| `C-c C-x` | Export to HTML, PDF, ... (`jsonyter-notebook-export`) |
 
 The cell-editing commands are autoloaded under stable public names, so you
 can bind them in your own keymap instead of relying on the defaults above:
@@ -643,6 +662,19 @@ when you want it, committed to a `#+RESULTS:` drawer.
 Org files that don't mention jsonyter are unaffected. `org` itself is
 loaded lazily the first time the mode is enabled.
 
+Running blocks survives a major-mode restart — `M-x org-mode-restart`
+(which is also what `C-c C-c` on a `#+PROPERTY:` line runs, to make it
+take effect), `revert-buffer` and `normal-mode` all re-run `org-mode`,
+which would otherwise wipe the buffer's kernel session table and orphan
+any kernel already running. It does not: the session table, callback
+table and bridge process are marked `permanent-local` and survive the
+restart intact, so a block right after one still reuses the same kernel
+with all of its state, and the kernel is not leaked on the server. With
+`jsonyter-org-mode-maybe` on `org-mode-hook` as above, `jsonyter-org-mode`
+itself also turns back on automatically; even without that hook, running
+a block still works — it bootstraps the same way the `org-babel` back
+door (`C-c C-c`) always has.
+
 ### Opting in: `:session jy:`
 
 A block routes to jsonyter when its `:session` header argument starts
@@ -690,12 +722,12 @@ unaffected.
 
 | Key | Action |
 | --- | --- |
-| `C-RET` | Run the block at point |
-| `S-RET` | Run the block and move to the next |
+| `C-RET` | Run the block at point (`jsonyter-org-run-block`, aka `jsonyter-org-run-cell`) |
+| `S-RET` | Run the block and move to the next (aka `jsonyter-org-run-cell-and-advance`) |
 | `C-c C-v C-b` | Run every `jy:` block in the buffer, in order |
 | `C-c C-n` / `C-c C-p` | Next / previous `jy:` block (from anywhere) |
 | `C-c C-c` | Interrupt the session at point |
-| `C-c C-r` | Restart the session at point |
+| `C-c C-r` | Restart the session at point, same id, all state lost |
 | `C-c C-l` / `C-c C-j` | Reconnect / attach this session to a kernel |
 | `C-c M-h` | Kernel history for the session at point |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |
@@ -777,15 +809,29 @@ ready for `jsonyter-script-mode`.
 
 ### Async: `:async yes`
 
-The cell layer (`C-RET`) is always async — this only affects the Babel
-path. Add `:async yes` and `C-c C-c` returns immediately with a
-placeholder result; when the kernel answers, jsonyter finds the
-placeholder by its opaque token and replaces it in place. A second
-`C-c C-c` on a session already busy is refused, not queued or made to
-interrupt the first. Exporting always runs synchronously regardless of
-`:async`, since `ox` collects the whole buffer in one pass and has
-nowhere for an async result to land; the wait is bounded by
-`jsonyter-exec-timeout`.
+The cell layer (`C-RET`) is always async and ignores this header
+entirely — `:async` only ever affects the Babel path (`C-c C-c`), so it
+does nothing useful in a `#+PROPERTY:` line that exists only to set up
+`C-RET` sessions and can simply be dropped there. Add `:async yes` and
+`C-c C-c` returns immediately with a placeholder result; when the kernel
+answers, jsonyter finds the placeholder by its opaque token and replaces
+it in place. A second `C-c C-c` on a session already busy is refused,
+not queued or made to interrupt the first. Exporting always runs
+synchronously regardless of `:async`, since `ox` collects the whole
+buffer in one pass and has nowhere for an async result to land; the wait
+is bounded by `jsonyter-exec-timeout`.
+
+**Do not load `ob-async` in a buffer that uses jsonyter's `:async yes`.**
+`ob-async` claims the same header argument for itself and implements it
+by running each block in a *separate Emacs subprocess*; if it is loaded,
+its advice on `org-babel-execute-src-block` intercepts before jsonyter's
+own dispatch ever runs. Every block then gets a fresh Emacs, a fresh
+session table, and its own kernel — symptoms identical to a kernel
+started fresh per cell, for a reason that has nothing to do with
+jsonyter's session handling. jsonyter implements its own async path
+precisely so `ob-async` is unnecessary for `jy:` blocks; if other blocks
+in the same Org install still need it, keep `:async` off any `jy:`
+block's header args.
 
 ### `:var`
 
@@ -820,6 +866,107 @@ Markdown ↔ Org is the one lossy step: jsonyter shells out to `pandoc`
 when it is on `exec-path`, and otherwise inserts the text unchanged with
 a note saying so. Set `jsonyter-org-markdown-converter` to use something
 else.
+
+## Exporting notebooks
+
+`jsonyter-notebook-export` renders a notebook to HTML, PDF, LaTeX,
+Markdown, slides or any other format the server's `nbconvert` install
+offers, through the bridge's `export_notebook`/`list_export_formats`
+verbs (jsonyter **>= 2.0.0**). Bound to `C-c C-x` in a notebook buffer:
+
+```elisp
+(jsonyter-notebook-export "html" "~/reports/analysis.html")
+```
+
+Interactively, `C-c C-x` (or `M-x jsonyter-notebook-export`) prompts for
+the format via `completing-read` over what the server actually
+advertises — never a hardcoded list, so a third-party exporter the
+server registers shows up automatically — and for the destination file.
+Six formats worth a name of their own also get a dedicated command:
+`jsonyter-notebook-export-html`, `-markdown`, `-pdf`, `-latex`,
+`-webpdf`, `-slides`. `M-x jsonyter-notebook-export-formats` shows what
+the current server offers, without exporting anything — the first thing
+to check before waiting on a render that is only going to fail.
+
+The export always reflects the buffer as it stands right now — unsaved
+edits and this session's outputs included, plus every cell's outputs
+already stored on disk for one nothing has been re-run — not merely what
+was last saved to a file. It runs on the bridge's REST pool rather than
+a kernel, so it is safe to start while a cell is executing, and
+asynchronously: a PDF or `webpdf` render can take minutes
+(`jsonyter-export-timeout`, default 120s, matching the bridge's own),
+and the mode line shows a plain `:export` tag while one is in flight.
+
+**`html` and `markdown` work essentially everywhere; `pdf` and `webpdf`
+frequently do not**, because both need extra software installed **on the
+Jupyter server itself** — a distinction worth knowing before filing a bug
+against the wrong repository:
+
+| Format | Needs on the Jupyter server |
+| --- | --- |
+| `pdf` / `latex` | pandoc + a LaTeX engine (e.g. `xelatex`) |
+| `webpdf` | playwright + chromium; in a root container, also `c.WebPDFExporter.disable_sandbox = True` |
+
+A failed export's message includes the bridge's own `hint` when it has
+one — `pdf` failing with a bare "Pandoc wasn't found" is the single most
+likely first-run failure, and the hint names exactly what to install,
+where. `M-x jsonyter-notebook-export-formats` catches a missing exporter
+up front instead.
+
+From `jsonyter-remote-dired` (`E` on a `.ipynb` entry), the same command
+exports a notebook that only exists on the server, via its real
+Contents-API path rather than a local buffer's cells.
+
+Document export from an Org buffer is not built as a separate stack:
+`jsonyter-org-to-notebook` plus `jsonyter-notebook-export` already
+compose into that two-step path, and Org's own `ox` covers HTML/PDF/...
+export natively besides.
+
+## Exporting to a script
+
+`jsonyter-notebook-export-script` (from a rendered notebook buffer) and
+`jsonyter-org-export-script` (from an Org buffer's `jy:` blocks) write a
+plain `.py`/`.R`/`.jl`/`.sas` script with `# %%` cell dividers — the
+Jupytext/VS Code/Spyder "percent" format — for people who don't use
+notebooks or Org:
+
+```python
+# %% [markdown]
+# # Analysis
+#
+# Some **bold** prose, wrapped in a comment verbatim.
+
+# %%
+import numpy as np
+np.random.default_rng(0).normal(size=5).mean()
+```
+
+Both are a **local text transformation**: unlike every other
+`jsonyter-notebook-export-*` command, this needs no Jupyter server,
+kernel or bridge at all, and works against a notebook or Org file that
+has never been run. Markdown/raw prose is wrapped verbatim, never
+converted or reformatted — it is there to be *read*, not re-parsed, and
+this keeps the transformation lossless and pandoc-free.
+
+Direction is one-way — notebook/Org → script — by design, not by
+limitation. For Python, R and Julia the `# %%` marker is exactly what
+`jsonyter-script-cell-regexp` matches, so the result reopens in
+`jsonyter-script-mode` with the same cell boundaries at zero extra cost —
+a free bonus, not a requirement, and nothing here is designed around
+preserving it.
+
+**SAS is one-way only, and that's deliberate.** SAS's own comment forms
+(`* text;`, `/* text */`) have no safe form of `# %%`: a bare `%%` is a
+macro reference in SAS, so `* %%;` is what gets written instead, and it
+does not match `jsonyter-script-cell-regexp`. Markdown in a SAS export is
+also wrapped differently — in a single `/* ... */` block, not commented
+line by line — because `* text;` is terminated by the *first* semicolon,
+and prose containing one (entirely ordinary) would otherwise leak into
+the script as SAS code.
+
+Customize `jsonyter-script-export-languages` to add a language jsonyter
+does not ship support for, or to change the extension/divider/comment
+style of one it does.
 
 ## Extending jsonyter.el: `jsonyter-mode`
 

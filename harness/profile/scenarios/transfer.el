@@ -41,7 +41,7 @@
     ;; The completion line: source, destination, size, guarantee.
     (eh-expect-messages-match "work/data/fresh\\.csv (192 B, sha256 verified")
     ;; The mode-line transfer tag is cleared once the transfer is done.
-    (eh-expect-equal (jy-harness-state) ":idle")))
+    (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix))))
 
 (eh-scenario jsonyter/upload-conflict-surfaces-the-overwrite-recovery
   :doc "Uploading onto a file that already exists comes back as a

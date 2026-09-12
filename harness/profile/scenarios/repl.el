@@ -17,7 +17,7 @@
   ;; server default; resolving by declared language is the thing under
   ;; test, so assert on which one came back.
   (eh-expect-match "kernel python3" (buffer-string))
-  (eh-expect-equal (jy-harness-state) ":idle"))
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix)))
 
 (eh-scenario jsonyter/repl-sends-input-and-renders-stdout
   :doc "RET sends the current input and the kernel's stdout is rendered
@@ -32,7 +32,7 @@
   (jy-wait-idle)
 
   (eh-expect-match "first cell" (buffer-string))
-  (eh-expect-equal (jy-harness-state) ":idle")
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix))
   ;; The sent input is frozen; the fresh input area is not.  Both halves
   ;; matter: a REPL that froze everything would pass the first assertion
   ;; alone and be unusable.
@@ -72,14 +72,14 @@
   (eh-send-keys "RET")
 
   (eh-wait (lambda () (string-match-p "step 1" (buffer-string))) 20)
-  (eh-expect-equal (jy-harness-state) ":run"
+  (eh-expect-equal (jy-harness-state) (concat ":run" jy-harness-kernel-id-suffix)
                    "the first chunk must be on screen before the cell finishes")
   (eh-expect (not (string-match-p "step 3" (buffer-string)))
              "the last chunk cannot have arrived yet -- this scenario is not testing anything if it has")
 
   (eh-wait (lambda () (string-match-p "step 3" (buffer-string))) 20)
   (jy-wait-idle)
-  (eh-expect-equal (jy-harness-state) ":idle")
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix))
   ;; Order, not just presence: chunks rendered out of order would still
   ;; contain all three strings.
   (let ((text (buffer-string)))
@@ -163,7 +163,7 @@
   ;; Nothing was sent: no output, and the kernel is still idle.
   (eh-expect (not (string-match-p "first cell" (buffer-string)))
              "incomplete input must not have been executed")
-  (eh-expect-equal (jy-harness-state) ":idle")
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix))
   (eh-expect-match "if True:" (jsonyter--current-input))
   (eh-expect-match "\n" (jsonyter--current-input)
                    "RET on incomplete input must have opened a continuation line"))
@@ -240,5 +240,5 @@
   (eh-expect-equal jsonyter--execution-count 0
                    "a restart must reset the execution count")
   (eh-expect-match "restarted" (buffer-string))
-  (eh-expect-equal (jy-harness-state) ":idle"
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix)
                    "a restarted kernel must re-subscribe, or the mode line goes quiet"))

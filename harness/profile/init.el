@@ -121,6 +121,17 @@ call this must be gated on `:needs (:executable \"jsonyter\")\'."
      (when (buffer-live-p buffer)
        (with-current-buffer buffer ,@body))))
 
+(defconst jy-harness-kernel-id-suffix "[kernel-p]"
+  "The mode-line kernel-id suffix a live kernel in this profile always
+carries.  `base.jsonl' answers every `start_kernel'/`get_kernel' with id
+`kernel-python-0001'; jsonyter appends the first 8 characters of it
+(`jsonyter--short-id') to every state tag once
+`jsonyter-mode-line-show-kernel-id' is on, which is the default -- so a
+scenario asserting an exact `jy-harness-state' for a session that has a
+kernel must append this, or the assertion fails against the truth of
+what the mode line now shows rather than an internal flag.  A session
+with no kernel at all (`:no-kernel', or before one starts) carries none.")
+
 (defun jy-harness--bridge-live-p ()
   (jy-harness--in-buffer (process-live-p jsonyter--process)))
 

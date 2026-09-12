@@ -214,6 +214,99 @@ is really in the buffer."
       (should (= (overlay-end first) (overlay-start second)))
       (should (equal (jsonyter--nb-cell-source second) "print(x)")))))
 
+;;;; Run-and-advance leaves point at the next cell, not dragged into output
+;;;; (regression: `jsonyter--nb-show-output-as-text' used to restore point
+;;;; via an insertion-type-nil marker, which `delete-region' collapsed to
+;;;; the front of the freshly written output instead of past it.)
+
+(ert-deftest jsonyter-test-run-and-advance-lands-on-next-cell ()
+  "The sequence `jsonyter-notebook-run-cell-and-advance' performs: advance
+to the next cell immediately, then let the output arrive afterwards.
+Point must stay at the next cell, not get dragged back by the rewrite."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (jsonyter--nb-append-output cell0 (jsonyter-tests--stream "x is 1\n"))
+      (let ((cell1 (jsonyter-tests--cell 1)))
+        (should (= (point) (overlay-start cell1)))
+        (should (eq (jsonyter--nb-cell-at) cell1))))))
+
+(ert-deftest jsonyter-test-run-and-advance-survives-streaming-output ()
+  "The same, with several chunks — the per-chunk refresh path."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (dolist (chunk '("first\n" "second\n" "third\n"))
+        (jsonyter--nb-append-output cell0 (jsonyter-tests--stream chunk)))
+      (let ((cell1 (jsonyter-tests--cell 1)))
+        (should (= (point) (overlay-start cell1)))
+        (should (eq (jsonyter--nb-cell-at) cell1))))))
+
+(ert-deftest jsonyter-test-run-and-advance-second-run-targets-next-cell ()
+  "Pins the user-visible bug: a second S-RET after advancing must run the
+next cell, not silently re-run the one that just finished."
+  (jsonyter-tests--with-notebook
+    (let ((cell0 (jsonyter-tests--cell 0)))
+      (goto-char (overlay-start cell0))
+      (jsonyter--nb-set-output cell0 "" nil t)
+      (jsonyter-notebook-next-cell)
+      (jsonyter--nb-append-output cell0 (jsonyter-tests--stream "x is 1\n"))
+      (should (equal (jsonyter--nb-cell-source (jsonyter--nb-cell-at))
+                      (jsonyter--nb-cell-source (jsonyter-tests--cell 1)))))))
+
+(ert-deftest jsonyter-test-run-and-advance-off-last-cell-does-not-land-in-output ()
+  "Output arriving for the last cell in the buffer must not error and must
+leave point past the output, not at its front."
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 2)))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (jsonyter-delete-cell))
+    (let ((cell1 (jsonyter-tests--cell 1)))
+      (should (= (overlay-end cell1) (point-max)))
+      (goto-char (overlay-start cell1))
+      (jsonyter--nb-set-output cell1 "" nil t)
+      (goto-char (overlay-end cell1))
+      (jsonyter--nb-append-output cell1 (jsonyter-tests--stream "final\n"))
+      (should (= (point) (point-max)))
+      (should (= (point) (overlay-end cell1))))))
+
+(ert-deftest jsonyter-test-script-output-does-not-move-point ()
+  "Guard rail: a `# %%' script cell's output lives in an overlay
+`after-string', so point is never dragged by a refresh — must keep
+holding after the notebook fix lands."
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (insert "# %%\nprint(1)\n# %%\nprint(2)\n")
+    (goto-char (point-min))
+    (jsonyter-script-next-cell)
+    (let* ((pos (point))
+           (bounds (jsonyter--script-cell-bounds))
+           (ov (jsonyter--script-output-overlay (car bounds) (cdr bounds))))
+      (jsonyter--nb-set-output ov "2\n" nil t)
+      (should (= (point) pos)))))
+
+(ert-deftest jsonyter-test-org-output-does-not-move-point ()
+  "Guard rail: an Org src block's output is likewise an overlay
+`after-string' — must keep holding after the notebook fix lands."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+begin_src jy:R\nq1dat <- 1\n#+end_src\n\nafter\n")
+    (goto-char (point-max))
+    (let* ((pos (point))
+           (anchor (save-excursion
+                     (goto-char (point-min))
+                     (search-forward "#+end_src")
+                     (forward-line 1)
+                     (point)))
+           (ov (jsonyter--org-cell-overlay anchor t)))
+      (jsonyter--nb-set-output ov "1\n" nil t)
+      (should (= (point) pos)))))
+
 ;;;; Image slicing now reaches notebook cells
 
 (ert-deftest jsonyter-test-notebook-image-is-sliced ()
@@ -766,6 +859,72 @@ source, or the next cell is rendered inside the previous one's results."
         (kill-buffer buffer))
       (delete-file path))))
 
+;;;; Export's all-outputs collector (report #4, §4.3)
+
+(ert-deftest jsonyter-test-collect-cells-all-outputs-carries-stored-results ()
+  "With ALL-OUTPUTS, a cell nothing has re-run this session still
+contributes its file outputs, in nbformat shape -- the trap the triage
+report calls out: without this, exporting a freshly opened notebook full
+of saved results comes out blank."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let ((cells (jsonyter--nb-collect-cells t t)))
+              (should (= 2 (length cells)))
+              (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+              (let ((outputs-0 (append (plist-get (nth 0 cells) :outputs) nil)))
+                (should (= 1 (length outputs-0)))
+                (should (equal "stream" (plist-get (car outputs-0) :output_type)))
+                ;; Read straight from the file, nbformat's list-of-lines
+                ;; shape and all -- this is `jsonyter-file-outputs' passed
+                ;; through untouched, not run through any conversion.
+                (should (equal '("stored one\n" "stored two\n")
+                               (plist-get (car outputs-0) :text))))
+              (should (= 1 (plist-get (nth 0 cells) :execution_count)))
+              (let ((outputs-1 (append (plist-get (nth 1 cells) :outputs) nil)))
+                (should (= 1 (length outputs-1)))
+                (should (equal "stored three\n" (plist-get (car outputs-1) :text)))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-collect-cells-without-all-outputs-still-omits-untouched ()
+  "`write_notebook''s own collector -- ALL-OUTPUTS unset -- is unchanged:
+an untouched cell still omits `:outputs' entirely, which is what tells
+the bridge to leave the stored output on disk alone."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let ((cells (jsonyter--nb-collect-cells t nil)))
+              (should (= 2 (length cells)))
+              (should-not (plist-member (nth 0 cells) :outputs))
+              (should-not (plist-member (nth 1 cells) :outputs)))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-collect-cells-all-outputs-omits-id-for-new-cell ()
+  "ALL-OUTPUTS omits `:id' entirely for a new cell instead of sending
+`:null' -- this path hands the notebook straight to nbformat rather than
+through `write_notebook''s own id assignment."
+  (jsonyter-tests--with-notebook
+    (let ((cells (jsonyter--nb-collect-cells t t)))
+      (should (equal "aaa" (plist-get (nth 0 cells) :id))))
+    (jsonyter-insert-cell-below)
+    (let* ((cells (jsonyter--nb-collect-cells t t))
+           (new-cell (nth 1 cells)))
+      (should-not (plist-member new-cell :id)))))
+
 (ert-deftest jsonyter-test-clear-all-output-leaves-plain-text ()
   "Clearing every output leaves a buffer of nothing but source."
   (jsonyter-tests--with-notebook
@@ -873,16 +1032,38 @@ source, or the next cell is rendered inside the previous one's results."
       (should (equal (jsonyter--session-state r) "idle")))))
 
 (ert-deftest jsonyter-test-mode-line-single-session ()
-  "With one session the mode line reports that session's state."
+  "With one session the mode line reports that session's state and id."
   (jsonyter-tests--with-sessions
     (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
       (setq-local jsonyter--session-key '("python" . ""))
-      (should (equal ":idle" (jsonyter--mode-line-string)))
+      (should (equal ":idle[kid]" (jsonyter--mode-line-string)))
       (setf (jsonyter--session-busy s) t)
-      (should (equal ":run" (jsonyter--mode-line-string)))
+      (should (equal ":run[kid]" (jsonyter--mode-line-string)))
       (setf (jsonyter--session-busy s) nil
             (jsonyter--session-state s) "dead")
-      (should (equal ":dead" (jsonyter--mode-line-string))))))
+      (should (equal ":dead[kid]" (jsonyter--mode-line-string))))))
+
+;;;; Kernel id in the mode line (report #2)
+
+(ert-deftest jsonyter-test-status-tag-shows-kernel-id ()
+  "`jsonyter--session-status-tag' appends the kernel's short id."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session
+              '("python" . "") "0123456789abcdef")))
+      (should (equal ":idle[01234567]" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-status-tag-no-id-when-no-kernel ()
+  "No kernel means no id -- `:no-kernel' already says that."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter--session-put '("python" . ""))))
+      (should (equal ":no-kernel" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-status-tag-id-can-be-turned-off ()
+  "`jsonyter-mode-line-show-kernel-id' set to nil omits the id."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (jsonyter-mode-line-show-kernel-id nil))
+      (should (equal ":idle" (jsonyter--session-status-tag s))))))
 
 (ert-deftest jsonyter-test-mode-line-summarizes-many-sessions ()
   "An Org-style buffer with no current session summarizes the table."
@@ -909,6 +1090,26 @@ source, or the next cell is rendered inside the previous one's results."
                      (push (plist-get params :kernel_id) shutdowns)))))
         (jsonyter--cleanup))
       (should (equal (sort shutdowns #'string<) '("own-py" "own-r"))))))
+
+(ert-deftest jsonyter-test-session-table-survives-major-mode-restart ()
+  "The session table, callback table, process and session key are
+`permanent-local', so `kill-all-local-variables' -- what
+`org-mode-restart' (and so `C-c C-c' on a `#+PROPERTY:' line),
+`revert-buffer' and `normal-mode' all run -- does not orphan a running
+kernel or make the next block start a needless second one."
+  (jsonyter-tests--with-sessions
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (setq-local jsonyter--process 'fake-process)
+    (setq-local jsonyter--session-key '("python" . "main"))
+    (let ((session (jsonyter-tests--bind-session '("python" . "main") "kid" t)))
+      (kill-all-local-variables)
+      (should (eq jsonyter--process 'fake-process))
+      (should (hash-table-p jsonyter--callbacks))
+      (should (equal jsonyter--session-key '("python" . "main")))
+      (should (eq (jsonyter--session-put '("python" . "main")) session))
+      (should (equal (jsonyter--session-kernel-id
+                       (jsonyter--session-put '("python" . "main")))
+                      "kid")))))
 
 (ert-deftest jsonyter-test-legacy-kernel-vars-are-obsolete ()
   "The pre-2.0 scalars carry an obsolescence notice pointing at the accessors."
@@ -1107,6 +1308,33 @@ source, or the next cell is rendered inside the previous one's results."
     (fundamental-mode)
     (should-error (jsonyter-org-mode 1))
     (should-not (bound-and-true-p jsonyter-org-mode))))
+
+(ert-deftest jsonyter-test-check-jsonyter-buffer-bootstraps-org ()
+  "The buffer-kind gate no longer just refuses a plain Org buffer: it
+bootstraps the same plumbing the org-babel back door already installs
+itself (`jsonyter--org-babel-ensure-plumbing'), so `C-RET' / `S-RET' /
+`jsonyter-org-run-block' work without `jsonyter-org-mode' ever having
+been turned on -- the bug behind report #5a."
+  (with-temp-buffer
+    (org-mode)
+    (should-not (bound-and-true-p jsonyter-mode))
+    (jsonyter--check-jsonyter-buffer)
+    (should (bound-and-true-p jsonyter-mode))
+    (should (hash-table-p jsonyter--callbacks))))
+
+(ert-deftest jsonyter-test-check-jsonyter-buffer-still-refuses-other-buffers ()
+  "A buffer that is neither a jsonyter buffer nor an Org buffer is still refused."
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-error (jsonyter--check-jsonyter-buffer) :type 'user-error)))
+
+(ert-deftest jsonyter-test-org-run-cell-aliases-run-block ()
+  "`jsonyter-org-run-cell(-and-advance)' alias the block-vocabulary
+commands, for anyone reaching for the notebook/script naming by analogy."
+  (should (eq (indirect-function 'jsonyter-org-run-cell)
+              (indirect-function 'jsonyter-org-run-block)))
+  (should (eq (indirect-function 'jsonyter-org-run-cell-and-advance)
+              (indirect-function 'jsonyter-org-run-block-and-advance))))
 
 (ert-deftest jsonyter-test-org-folding-hides-overlay-output ()
   "An output after-string anchored inside a folded subtree is not displayed.
@@ -1436,6 +1664,64 @@ own visibility cycling hides committed-free session output for us."
         (should (= 1 (length cells)))
         (should (eq :null (plist-get (car cells) :id)))))))
 
+(ert-deftest jsonyter-test-org-to-notebook-hand-authored-file-splits-on-blocks ()
+  "A hand-authored Org file -- one that never round-tripped through
+`jsonyter-org-from-notebook' and so has no `:JSONYTER_CELL_ID:' drawers
+at all -- must split into one cell per `jy:' block plus the prose
+between them, not collapse to a single markdown cell containing every
+block verbatim.  Pins the bug found while designing script export
+\(TRIAGE-2026-09-12.md §4.10.4\)."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "Some prose between blocks.\n\n"
+                "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 3 (length cells)))
+        (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+        (should (eq :null (plist-get (nth 0 cells) :id)))
+        (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+        (should (equal "Some prose between blocks."
+                       (plist-get (nth 1 cells) :source)))
+        (should (equal "code" (plist-get (nth 2 cells) :cell_type)))
+        (should (equal "x + 1" (plist-get (nth 2 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-hand-authored-file-with-leading-prose ()
+  "The same, but the first block is not the very first thing in the
+buffer -- guards against a narrower version of the same bug where only
+a block sitting at `point-min' was mishandled."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "* Heading\nIntro prose.\n\n"
+                "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "Trailing prose.\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 3 (length cells)))
+        (should (equal "markdown" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "* Heading\nIntro prose." (plist-get (nth 0 cells) :source)))
+        (should (equal "code" (plist-get (nth 1 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 1 cells) :source)))
+        (should (equal "markdown" (plist-get (nth 2 cells) :cell_type)))
+        (should (equal "Trailing prose." (plist-get (nth 2 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-non-jy-block-stays-in-prose ()
+  "A src block with no `jy:' session is not split out as its own cell --
+only `jy:' blocks are \"cells\" for this conversion, so it is left inside
+whatever markdown span it falls in, same as any other text there."
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+                "See this snippet:\n\n"
+                "#+begin_src python\nplain block, no session\n#+end_src\n")
+      (let ((cells (jsonyter--org-to-notebook-cells)))
+        (should (= 2 (length cells)))
+        (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+        (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+        (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+        (should (string-match-p "plain block, no session"
+                                (plist-get (nth 1 cells) :source)))))))
+
 (ert-deftest jsonyter-test-org-parse-results-drawer-recovers-stream-text ()
   "A committed text drawer reads back as one combined stream output."
   (jsonyter-tests--with-org-file
@@ -1475,6 +1761,432 @@ own visibility cycling hides committed-free session output for us."
             (should (equal '("aaa" "bbb" "ccc") ids))))
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+;;;; Notebook document export (§4.1-4.9)
+
+(ert-deftest jsonyter-test-build-command-omits-export-timeout-flag ()
+  "`jsonyter-export-timeout' is never a bridge command-line flag.
+`--export-timeout' only exists on jsonyter >= 2.0.0; passing it
+unconditionally at startup would refuse to launch any older bridge
+outright (confirmed against the bridge's own argument parser: an old
+bridge exits with \"unrecognized arguments: --export-timeout\"),
+breaking every command, not only export.  The timeout is sent as the
+`export_notebook' request's own `timeout' param instead -- see
+`jsonyter-notebook-export'."
+  (let ((jsonyter-export-timeout 45)
+        (jsonyter-command '("jsonyter"))
+        (jsonyter-exec-timeout nil)
+        (jsonyter-insecure-tls nil))
+    (should-not (member "--export-timeout" (jsonyter--build-command nil)))))
+
+(ert-deftest jsonyter-test-notebook-export-defaults-timeout-param ()
+  "`jsonyter-notebook-export' sends `jsonyter-export-timeout' as the
+request's own `timeout' param when the caller does not override it, and
+the override when it does."
+  (jsonyter-tests--with-notebook
+    (let ((jsonyter-export-timeout 45) sent)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (jsonyter-notebook-export "html" "/tmp/does-not-matter.html")
+        (should (equal 45 (plist-get sent :timeout)))
+        (jsonyter-notebook-export "html" "/tmp/does-not-matter.html" 600)
+        (should (equal 600 (plist-get sent :timeout)))))))
+
+(ert-deftest jsonyter-test-export-format-names-extracts-keys ()
+  "`jsonyter--export-format-names' reads the plist `list_export_formats'
+itself returns, not a hardcoded list."
+  (should (equal '("html" "markdown" "pdf")
+                 (jsonyter--export-format-names
+                  '(:html (:output_mimetype "text/html")
+                    :markdown (:output_mimetype "text/markdown")
+                    :pdf (:output_mimetype "application/pdf"))))))
+
+(ert-deftest jsonyter-test-export-format-guess-extension ()
+  "Known formats get their conventional extension; an unknown one falls
+back to `.FORMAT'."
+  (should (equal ".html" (jsonyter--export-format-guess-extension "html")))
+  (should (equal ".md" (jsonyter--export-format-guess-extension "markdown")))
+  (should (equal ".pdf" (jsonyter--export-format-guess-extension "pdf")))
+  (should (equal ".pdf" (jsonyter--export-format-guess-extension "webpdf")))
+  (should (equal ".slides.html" (jsonyter--export-format-guess-extension "slides")))
+  (should (equal ".docx" (jsonyter--export-format-guess-extension "docx"))))
+
+(ert-deftest jsonyter-test-status-tag-export-has-no-percentage ()
+  "The `:export' mode-line tag carries no fake percentage -- there are no
+`progress' events for export, unlike a file transfer."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-transfer s) (list :phase "export"))
+      (should (equal ":export[kid]" (jsonyter--session-status-tag s)))
+      ;; An ordinary transfer is unaffected by the new branch.
+      (setf (jsonyter--session-transfer s) (list :phase "upload" :pct 42))
+      (should (equal ":up 42%[kid]" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-list-export-formats-is-cached-per-process ()
+  "`jsonyter--list-export-formats' hits the bridge once per process and
+reuses the reply after that, since the probe cannot change under a
+running server."
+  (jsonyter-tests--with-notebook
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   (list :available t :formats '(:html (:output_mimetype "text/html"))
+                         :reason nil))))
+        (jsonyter--list-export-formats)
+        (jsonyter--list-export-formats)
+        (should (= 1 calls))
+        (jsonyter--list-export-formats 'refresh)
+        (should (= 2 calls))))))
+
+(ert-deftest jsonyter-test-list-export-formats-old-bridge-message ()
+  "An unknown-method failure against an old bridge is rewritten as a
+plain version-upgrade message, not a raw protocol error."
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _) (error "jsonyter: unknown method \"list_export_formats\""))))
+      (should-error (jsonyter--list-export-formats) :type 'user-error)
+      (condition-case err
+          (jsonyter--list-export-formats)
+        (user-error
+         (should (string-match-p ">= 2.0.0" (error-message-string err))))))))
+
+(ert-deftest jsonyter-test-notebook-export-formats-reports-unavailable ()
+  "`jsonyter-notebook-export-formats' surfaces the server's own `reason'
+when export is not available, rather than an empty list."
+  (jsonyter-tests--with-notebook
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (&rest _)
+                   (list :available nil :formats nil
+                         :reason "this server does not serve the nbconvert endpoints")))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export-formats))
+      (should (string-match-p "not available" reported))
+      (should (string-match-p "nbconvert endpoints" reported)))))
+
+(ert-deftest jsonyter-test-notebook-export-refuses-when-formats-unavailable ()
+  "`jsonyter-notebook-export' called interactively refuses immediately
+when the probe reports no formats, rather than firing a request that
+would take two minutes to fail."
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _) (list :available nil :formats nil :reason "no nbconvert"))))
+      (should-error
+       (call-interactively #'jsonyter-notebook-export)
+       :type 'user-error))))
+
+(ert-deftest jsonyter-test-notebook-export-sends-all-outputs-cells ()
+  "`jsonyter-notebook-export' collects cells with ALL-OUTPUTS, so a
+freshly opened notebook full of saved results exports its stored output,
+not a blank cell."
+  (let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert jsonyter-tests--notebook-with-outputs))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (let (sent)
+              (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                        ((symbol-function 'jsonyter--export-run)
+                         (lambda (_session params _on-success) (setq sent params))))
+                (jsonyter-notebook-export "html" "/tmp/does-not-matter.html")
+                (let ((cells (append (plist-get sent :cells) nil)))
+                  (should (= 2 (length cells)))
+                  (should (plist-member (nth 0 cells) :outputs))
+                  (should (plist-member (nth 1 cells) :outputs)))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-file path))))
+
+(ert-deftest jsonyter-test-notebook-export-reports-path-and-size ()
+  "The success message names the format, the path the bridge actually
+wrote to, the size, and a resource count when the result is a bundle --
+feeding both an unbundled and a bundled `to_path' result plist straight
+to the on-success handler, without a real bridge in the loop."
+  (jsonyter-tests--with-notebook
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session _params on-success)
+                   (funcall on-success
+                            (list :format "html" :mimetype "text/html"
+                                  :path "/tmp/out/analysis.html" :bytes 512
+                                  :bundle nil :resources nil))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export "html" "/tmp/out/analysis.html"))
+      (should (string-match-p "html" reported))
+      (should (string-match-p "/tmp/out/analysis\\.html" reported))
+      (should (string-match-p "512 B" reported))
+      (should-not (string-match-p "resource" reported)))
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session _params on-success)
+                   (funcall on-success
+                            (list :format "markdown" :mimetype "text/markdown"
+                                  :path "/tmp/out/analysis.md" :bytes 51
+                                  :bundle t
+                                  :resources [(:name "output_0_0.png"
+                                               :path "/tmp/out/output_0_0.png"
+                                               :bytes 74)]))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export "markdown" "/tmp/out/analysis.md"))
+      (should (string-match-p "1 resource" reported)))))
+
+(ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
+  "Exporting the fixture notebook to html via `to_path' produces a
+non-empty file mentioning a cell's source.  Needs both the bridge and a
+reachable Jupyter server; skips like the other bridge-dependent tests in
+this file when either is missing -- which, absent a way to probe server
+reachability up front, is treated the same as any other failure here."
+  (skip-unless (jsonyter-tests--bridge-available-p))
+  (jsonyter-tests--with-notebook
+    (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
+           (out (make-temp-file "jsonyter-export-test-" nil ".html")))
+      (delete-file out)
+      (unwind-protect
+          (condition-case err
+              (progn
+                (jsonyter--ensure-bridge)
+                (let ((cells (jsonyter--nb-collect-cells t t)))
+                  (jsonyter--request-sync
+                   "export_notebook"
+                   (list :format "html" :cells (vconcat cells) :to_path out)
+                   jsonyter-export-timeout))
+                (should (file-exists-p out))
+                (should (> (file-attribute-size (file-attributes out)) 0))
+                (should (string-match-p "x = 1"
+                                       (with-temp-buffer
+                                         (insert-file-contents out)
+                                         (buffer-string)))))
+            (error (ert-skip (format "export_notebook unavailable: %s"
+                                     (error-message-string err)))))
+        (when (file-exists-p out) (delete-file out))))))
+
+;;;; Script export (§4.10)
+
+;; Entirely local text transformation: no kernel, bridge or server
+;; involved anywhere in this section.
+
+(defun jsonyter-tests--script-cell (&rest plist)
+  "A (:cell_type ... :source ...) plist from PLIST.
+For `jsonyter--cells-to-script'."
+  plist)
+
+(ert-deftest jsonyter-test-cells-to-script-output-shape ()
+  "One divider per cell, the right marker per cell type, code reproduced
+verbatim. The primary test: it pins the deliverable itself."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source "# Analysis")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "import numpy as np")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "np.mean([1, 2, 3])")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal (concat
+                    "# %% [markdown]\n# # Analysis\n\n"
+                    "# %%\nimport numpy as np\n\n"
+                    "# %%\nnp.mean([1, 2, 3])\n")
+                   script))))
+
+(ert-deftest jsonyter-test-cells-to-script-raw-cell-marker ()
+  "A raw cell gets its own `[raw]' marker, commented the same as markdown."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "raw" :source "verbatim text")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal "# %% [raw]\n# verbatim text\n" script))))
+
+(ert-deftest jsonyter-test-cells-to-script-markdown-every-line-commented ()
+  "Every line of a markdown cell, blank lines included, comes out
+commented; no line escapes the comment prefix -- the whole risk of
+wrapping prose verbatim."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (source "Heading\n\nSome text.\n\nMore text.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    (dolist (line (split-string
+                   ;; Drop the divider line itself before checking.
+                   (substring script (1+ (string-match "\n" script)))
+                   "\n" t))
+      (should (string-prefix-p "# " line)))))
+
+(ert-deftest jsonyter-test-script-export-spec-per-language ()
+  "Python, R and Julia all use `# ' and `# %%'; `.R' stays uppercase."
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "python") :comment-line)))
+  (should (equal ".py" (plist-get (jsonyter--script-export-spec "python") :extension)))
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "R") :comment-line)))
+  (should (equal ".R" (plist-get (jsonyter--script-export-spec "R") :extension)))
+  (should (equal "# " (plist-get (jsonyter--script-export-spec "julia") :comment-line)))
+  (should (equal ".jl" (plist-get (jsonyter--script-export-spec "julia") :extension)))
+  ;; Matched case-insensitively: a notebook's lowercase `language_info.name'
+  ;; and Org's own-cased `#+begin_src LANG' must resolve to the same entry.
+  (should (equal ".R" (plist-get (jsonyter--script-export-spec "r") :extension))))
+
+(ert-deftest jsonyter-test-script-export-sas-markdown-is-block-commented ()
+  "SAS markdown is wrapped in a single `/* ... */', not commented per
+line with `*' -- and a markdown cell whose prose contains a semicolon
+still produces a fully commented block.  This is the real hazard: a
+per-line `* text;' comment statement is terminated by the first
+semicolon, and prose containing one is entirely ordinary."
+  (let* ((spec (jsonyter--script-export-spec "sas"))
+         (source "Fit the model; then plot it.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    (should (equal "* %%; [markdown]\n/* Fit the model; then plot it. */\n" script))
+    ;; No stray `*text;' line anywhere -- the whole point of the block form.
+    (should-not (string-match-p "^\\* " (substring script (1+ (string-match "\n" script)))))))
+
+(ert-deftest jsonyter-test-script-export-sas-guards-close-sequence ()
+  "A markdown cell containing `*/' does not close the SAS comment early."
+  (let* ((spec (jsonyter--script-export-spec "sas"))
+         (source "See the pointer syntax x*/y for an example.")
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown" :source source)))
+         (script (jsonyter--cells-to-script cells spec)))
+    ;; Exactly one `/*' (the opener) and one closing ` */' (the wrapper's
+    ;; own, at the very end) -- the embedded `*/' must have been altered.
+    (should (string-suffix-p " */\n" script))
+    (should-not (string-match-p "x\\*/y" script))
+    (should (string-match-p "x\\* /y" script))))
+
+(ert-deftest jsonyter-test-script-export-sas-extension-and-divider ()
+  "SAS gets its own extension and a `* %%;' divider, not `# %%'."
+  (should (equal ".sas" (plist-get (jsonyter--script-export-spec "sas") :extension)))
+  (should (equal "* %%;" (plist-get (jsonyter--script-export-spec "sas") :divider))))
+
+(ert-deftest jsonyter-test-script-export-round-trip-python ()
+  "For Python, the `# %%' marker is exactly what
+`jsonyter-script-cell-regexp' matches, so splitting the rendered script
+back on it recovers the same cells -- a free bonus, not a requirement."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "code" :source "a = 1")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "b = 2")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (with-temp-buffer
+      (insert script)
+      (goto-char (point-min))
+      (let ((n 0))
+        (while (re-search-forward jsonyter-script-cell-regexp nil t) (cl-incf n))
+        (should (= 2 n))))))
+
+(ert-deftest jsonyter-test-script-export-sas-divider-does-not-match-cell-regexp ()
+  "`* %%;' does NOT match `jsonyter-script-cell-regexp' -- pins the
+one-way claim in the docstring so nobody \"fixes\" it by accident."
+  (should-not (string-match-p jsonyter-script-cell-regexp "* %%;")))
+
+(ert-deftest jsonyter-test-cells-to-script-empty-cell-list ()
+  "A notebook with no code cells still renders (to an empty string)."
+  (should (equal "" (jsonyter--cells-to-script nil (jsonyter--script-export-spec "python")))))
+
+(ert-deftest jsonyter-test-cells-to-script-source-with-no-trailing-newline ()
+  "A cell whose source has no trailing newline still gets exactly one
+newline before the next divider, not zero and not two."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "code" :source "x = 1")
+                      (jsonyter-tests--script-cell :cell_type "code" :source "y = 2"))))
+    (should (equal "# %%\nx = 1\n\n# %%\ny = 2\n"
+                   (jsonyter--cells-to-script cells spec)))))
+
+(ert-deftest jsonyter-test-cells-to-script-markdown-line-looking-like-a-divider ()
+  "A markdown line that already looks like `# %%' must not produce a
+spurious divider -- the one genuine correctness hazard: a stray `# %%'
+mid-prose is confusing even though nothing re-imports the file."
+  (let* ((spec (jsonyter--script-export-spec "python"))
+         (cells (list (jsonyter-tests--script-cell :cell_type "markdown"
+                                            :source "Use `# %%' to start a cell.")))
+         (script (jsonyter--cells-to-script cells spec)))
+    (with-temp-buffer
+      (insert script)
+      (goto-char (point-min))
+      (let ((n 0))
+        (while (re-search-forward jsonyter-script-cell-regexp nil t) (cl-incf n))
+        ;; Only the one real divider this cell was rendered with.
+        (should (= 1 n))))))
+
+(ert-deftest jsonyter-test-org-to-script-cells-hand-authored-file ()
+  "`jsonyter--org-to-script-cells' on a hand-authored file with two `jy:'
+blocks and prose between them yields three cells, not one -- exercising
+the same fixed splitter as report #4.10.4, through the script-export
+entry point."
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "Some prose between blocks.\n\n"
+              "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+    (let ((cells (jsonyter--org-to-script-cells)))
+      (should (= 3 (length cells)))
+      (should (equal "code" (plist-get (nth 0 cells) :cell_type)))
+      (should (equal "x = 1" (plist-get (nth 0 cells) :source)))
+      (should (equal "python" (plist-get (nth 0 cells) :language)))
+      (should (equal "markdown" (plist-get (nth 1 cells) :cell_type)))
+      (should (equal "Some prose between blocks."
+                     (plist-get (nth 1 cells) :source)))
+      (should (equal "code" (plist-get (nth 2 cells) :cell_type)))
+      (should (equal "x + 1" (plist-get (nth 2 cells) :source))))))
+
+(ert-deftest jsonyter-test-org-to-script-cells-does-not-convert-markdown ()
+  "Org prose goes into the script verbatim, never through
+`jsonyter--org-markdown-convert' -- no pandoc dependency, and no
+\"no converter\" banner landing in the output as if it were the user's
+own prose."
+  (let ((jsonyter-org-markdown-converter
+         (lambda (&rest _) (error "must not be called for script export"))))
+    (jsonyter-tests--with-org-file
+        "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n*bold* prose\n"
+      (let ((cells (jsonyter--org-to-script-cells)))
+        (should (equal "*bold* prose" (plist-get (nth 1 cells) :source)))))))
+
+(ert-deftest jsonyter-test-org-export-script-writes-file ()
+  "`jsonyter-org-export-script' end to end: writes a script file whose
+content matches what `jsonyter--cells-to-script' alone would render."
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out) ; exercise the "doesn't exist yet" path
+            (jsonyter-org-export-script out)
+            (should (file-exists-p out))
+            (should (equal "# %%\nx = 1\n"
+                           (with-temp-buffer
+                             (insert-file-contents out)
+                             (buffer-string)))))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-org-export-script-refuses-to-clobber ()
+  "Matches `jsonyter-org-from-notebook''s own refusal shape when called
+non-interactively (as this test, and any programmatic caller, does)."
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (should-error (jsonyter-org-export-script out) :type 'user-error)
+        (delete-file out)))))
+
+(ert-deftest jsonyter-test-notebook-export-script-writes-file ()
+  "`jsonyter-notebook-export-script' end to end against a rendered
+notebook buffer."
+  (jsonyter-tests--with-notebook
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out)
+            (jsonyter-notebook-export-script out)
+            (should (file-exists-p out))
+            (let ((content (with-temp-buffer
+                             (insert-file-contents out)
+                             (buffer-string))))
+              (should (string-match-p "# %%\nx = 1" content))
+              (should (string-match-p "# %%\nprint(x)" content))
+              (should (string-match-p "# %% \\[markdown\\]\n# # heading" content))))
+        (when (file-exists-p out) (delete-file out))))))
 
 ;;;; Creating a blank notebook
 
@@ -1883,6 +2595,67 @@ afresh on descent past a `/'."
         (should (string-match-p "backup/trials-Copy1\\.csv" said))
         (should-not (string-match-p "backup/trials\\.csv\\'" said))))))
 
+(ert-deftest jsonyter-test-remote-dired-export-uses-server-path ()
+  "`jsonyter-remote-dired-export' calls `export_notebook' with the
+entry's own `server_path' -- the one place a real Contents-API path is
+already in hand, unlike a notebook buffer's `jsonyter-notebook-export'
+-- and runs it through the browser's owning buffer."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "analysis.ipynb"
+                      (vector " " "analysis.ipynb" "10 B" "2026-09-07 10:00"))))
+    (puthash "analysis.ipynb"
+             '(:name "analysis.ipynb" :type "file" :path "analysis.ipynb")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (jsonyter-remote-dired-export "html" "/tmp/out.html"))
+      (should (equal "html" (plist-get sent :format)))
+      (should (equal "analysis.ipynb" (plist-get sent :server_path)))
+      (should (equal "/tmp/out.html" (plist-get sent :to_path)))
+      (should-not (plist-member sent :cells)))))
+
+(ert-deftest jsonyter-test-remote-dired-export-refuses-non-notebook ()
+  "Refuses a non-`.ipynb' entry outright, without sending anything."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "data.csv" (vector " " "data.csv" "10 B" "2026-09-07 10:00"))))
+    (puthash "data.csv" '(:name "data.csv" :type "file" :path "data.csv")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--export-run)
+               (lambda (&rest _) (error "must not be called"))))
+      (should-error (jsonyter-remote-dired-export "html" "/tmp/out.html")
+                    :type 'user-error))))
+
+(ert-deftest jsonyter-test-remote-dired-export-refuses-directory ()
+  "Refuses a directory entry outright."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "sub" (vector " " "sub/" "" "2026-09-07 10:00"))))
+    (puthash "sub" '(:name "sub" :type "directory" :path "sub")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--export-run)
+               (lambda (&rest _) (error "must not be called"))))
+      (should-error (jsonyter-remote-dired-export "html" "/tmp/out.html")
+                    :type 'user-error))))
+
 (ert-deftest jsonyter-test-error-message-renders-transfer-recovery ()
   "Each TransferConflict reason gets its recovery hint; a proxy 413 names the
 chunk-size option."
@@ -1910,6 +2683,21 @@ chunk-size option."
     (should (string-match-p "jsonyter-upload-chunk-size" m))
     (should (string-match-p "jsonyter-resume-upload" m))))
 
+(ert-deftest jsonyter-test-error-message-renders-export-hint ()
+  "An `ExportError''s `hint' and `available_formats' both render, e.g.
+the pdf/pandoc hint text reaching the user."
+  (let ((m (jsonyter--error-message
+            '(:error "ExportError" :message "nbconvert failed for format pdf"
+              :format "pdf"
+              :hint "install pandoc and a LaTeX engine on the Jupyter server"))))
+    (should (string-match-p "install pandoc" m)))
+  (let ((m (jsonyter--error-message
+            '(:error "ExportError" :message "unknown export format \"docx\""
+              :available_formats ["html" "markdown" "pdf"]))))
+    (should (string-match-p "html" m))
+    (should (string-match-p "markdown" m))
+    (should (string-match-p "pdf" m))))
+
 (ert-deftest jsonyter-test-kernel-reset-clears-contents-dir ()
   "A restart drops the stale contents-path mapping so the next transfer re-probes."
   (jsonyter-tests--with-sessions
@@ -1921,6 +2709,26 @@ chunk-size option."
       (should (null (jsonyter--session-contents-dir s)))
       (should (null (jsonyter--session-contents-dir-probed s)))
       (should (null (jsonyter--session-remote-directory s))))))
+
+;;;; Kernel restart/unstick naming (report #3)
+
+(ert-deftest jsonyter-test-kernel-restart-aliases-restart ()
+  "`jsonyter-kernel-restart' is `jsonyter-restart' under a name a user
+looking for kernel operations will find by `M-x' completion."
+  (should (eq (indirect-function 'jsonyter-kernel-restart)
+              (indirect-function 'jsonyter-restart))))
+
+(ert-deftest jsonyter-test-reset-is-obsolete-alias-for-unstick ()
+  "`jsonyter-reset' still works, as an obsolete alias for `jsonyter-unstick' --
+the actual command is renamed, not removed, since it never touched the
+kernel and \"reset\" was the misleading part."
+  (should (get 'jsonyter-reset 'byte-obsolete-info))
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setq-local jsonyter--session-key '("python" . ""))
+      (setf (jsonyter--session-busy s) t)
+      (with-no-warnings (jsonyter-reset s))
+      (should-not (jsonyter--session-busy s)))))
 
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

@@ -31,13 +31,17 @@
   ;; Named waiters.  Every one of these is a state a kernel or a
   ;; subprocess reaches asynchronously, which is to say every one of them
   ;; is a place a fixed sleep would eventually fail in CI.
+  ;; State waiters compare against a live kernel's exact mode-line tag,
+  ;; which includes `jy-harness-kernel-id-suffix' once one is running
+  ;; (`jsonyter-mode-line-show-kernel-id' is on by default) -- see its
+  ;; docstring in init.el.
   :waiters ((jsonyter-bridge-live   . (lambda () (jy-harness--bridge-live-p)))
             (jsonyter-kernel-live   . (lambda () (jy-harness--kernel-live-p)))
-            (jsonyter-idle          . (lambda () (jy-harness--state-p ":idle")))
-            (jsonyter-running       . (lambda () (jy-harness--state-p ":run")))
-            (jsonyter-dead          . (lambda () (jy-harness--state-p ":dead")))
-            (jsonyter-offline       . (lambda () (jy-harness--state-p ":offline")))
-            (jsonyter-external-busy . (lambda () (jy-harness--state-p ":run[ext]")))
+            (jsonyter-idle          . (lambda () (jy-harness--state-p (concat ":idle" jy-harness-kernel-id-suffix))))
+            (jsonyter-running       . (lambda () (jy-harness--state-p (concat ":run" jy-harness-kernel-id-suffix))))
+            (jsonyter-dead          . (lambda () (jy-harness--state-p (concat ":dead" jy-harness-kernel-id-suffix))))
+            (jsonyter-offline       . (lambda () (jy-harness--state-p (concat ":offline" jy-harness-kernel-id-suffix))))
+            (jsonyter-external-busy . (lambda () (jy-harness--state-p (concat ":run[ext]" jy-harness-kernel-id-suffix))))
             (jsonyter-settled       . (lambda () (jy-harness--settled-p))))
 
   ;; The bridge's stderr is a hidden buffer on purpose -- jsonyter's
