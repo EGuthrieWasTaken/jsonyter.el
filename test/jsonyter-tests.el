@@ -1892,6 +1892,43 @@ not a blank cell."
         (kill-buffer buffer))
       (delete-file path))))
 
+(ert-deftest jsonyter-test-notebook-export-reports-path-and-size ()
+  "The success message names the format, the path the bridge actually
+wrote to, the size, and a resource count when the result is a bundle --
+feeding both an unbundled and a bundled `to_path' result plist straight
+to the on-success handler, without a real bridge in the loop."
+  (jsonyter-tests--with-notebook
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session _params on-success)
+                   (funcall on-success
+                            (list :format "html" :mimetype "text/html"
+                                  :path "/tmp/out/analysis.html" :bytes 512
+                                  :bundle nil :resources nil))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export "html" "/tmp/out/analysis.html"))
+      (should (string-match-p "html" reported))
+      (should (string-match-p "/tmp/out/analysis\\.html" reported))
+      (should (string-match-p "512 B" reported))
+      (should-not (string-match-p "resource" reported)))
+    (let (reported)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session _params on-success)
+                   (funcall on-success
+                            (list :format "markdown" :mimetype "text/markdown"
+                                  :path "/tmp/out/analysis.md" :bytes 51
+                                  :bundle t
+                                  :resources [(:name "output_0_0.png"
+                                               :path "/tmp/out/output_0_0.png"
+                                               :bytes 74)]))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq reported (apply #'format fmt args)))))
+        (jsonyter-notebook-export "markdown" "/tmp/out/analysis.md"))
+      (should (string-match-p "1 resource" reported)))))
+
 (ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
   "Exporting the fixture notebook to html via `to_path' produces a
 non-empty file mentioning a cell's source.  Needs both the bridge and a

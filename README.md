@@ -13,7 +13,11 @@ Since 2.0, a single buffer can drive **several kernels at once** — a
 table of sessions keyed by `(language, name)` — which is what makes one
 Org file with Python, R and SAS blocks work. Since 2.1, a `jy:` block
 also runs through standard Org Babel: `C-c C-c`, export and
-`org-babel-tangle` all work on it, on the same kernel `C-RET` uses.
+`org-babel-tangle` all work on it, on the same kernel `C-RET` uses. Since
+2.3, a notebook or Org buffer's `jy:` cells export to HTML/PDF/Markdown/...
+through the bridge (`jsonyter-notebook-export`), or to a plain
+`.py`/`.R`/`.jl`/`.sas` script with no server involved at all
+(`jsonyter-notebook-export-script`, `jsonyter-org-export-script`).
 
 > **A note on how this was built.** The bulk of jsonyter.el was written by
 > Claude Fable 5, an Anthropic AI model, working iteratively with the
@@ -450,6 +454,7 @@ refresh.
 | `C-c <up>` / `C-c <down>` | Move the cell up / down |
 | `C-x C-s` | Save cell source |
 | `C-c C-s` | Save cell source and this session's new outputs |
+| `C-c C-x` | Export to HTML, PDF, ... (`jsonyter-notebook-export`) |
 
 The cell-editing commands are autoloaded under stable public names, so you
 can bind them in your own keymap instead of relying on the defaults above:
@@ -861,6 +866,61 @@ Markdown ↔ Org is the one lossy step: jsonyter shells out to `pandoc`
 when it is on `exec-path`, and otherwise inserts the text unchanged with
 a note saying so. Set `jsonyter-org-markdown-converter` to use something
 else.
+
+## Exporting notebooks
+
+`jsonyter-notebook-export` renders a notebook to HTML, PDF, LaTeX,
+Markdown, slides or any other format the server's `nbconvert` install
+offers, through the bridge's `export_notebook`/`list_export_formats`
+verbs (jsonyter **>= 2.0.0**). Bound to `C-c C-x` in a notebook buffer:
+
+```elisp
+(jsonyter-notebook-export "html" "~/reports/analysis.html")
+```
+
+Interactively, `C-c C-x` (or `M-x jsonyter-notebook-export`) prompts for
+the format via `completing-read` over what the server actually
+advertises — never a hardcoded list, so a third-party exporter the
+server registers shows up automatically — and for the destination file.
+Six formats worth a name of their own also get a dedicated command:
+`jsonyter-notebook-export-html`, `-markdown`, `-pdf`, `-latex`,
+`-webpdf`, `-slides`. `M-x jsonyter-notebook-export-formats` shows what
+the current server offers, without exporting anything — the first thing
+to check before waiting on a render that is only going to fail.
+
+The export always reflects the buffer as it stands right now — unsaved
+edits and this session's outputs included, plus every cell's outputs
+already stored on disk for one nothing has been re-run — not merely what
+was last saved to a file. It runs on the bridge's REST pool rather than
+a kernel, so it is safe to start while a cell is executing, and
+asynchronously: a PDF or `webpdf` render can take minutes
+(`jsonyter-export-timeout`, default 120s, matching the bridge's own),
+and the mode line shows a plain `:export` tag while one is in flight.
+
+**`html` and `markdown` work essentially everywhere; `pdf` and `webpdf`
+frequently do not**, because both need extra software installed **on the
+Jupyter server itself** — a distinction worth knowing before filing a bug
+against the wrong repository:
+
+| Format | Needs on the Jupyter server |
+| --- | --- |
+| `pdf` / `latex` | pandoc + a LaTeX engine (e.g. `xelatex`) |
+| `webpdf` | playwright + chromium; in a root container, also `c.WebPDFExporter.disable_sandbox = True` |
+
+A failed export's message includes the bridge's own `hint` when it has
+one — `pdf` failing with a bare "Pandoc wasn't found" is the single most
+likely first-run failure, and the hint names exactly what to install,
+where. `M-x jsonyter-notebook-export-formats` catches a missing exporter
+up front instead.
+
+From `jsonyter-remote-dired` (`E` on a `.ipynb` entry), the same command
+exports a notebook that only exists on the server, via its real
+Contents-API path rather than a local buffer's cells.
+
+Document export from an Org buffer is not built as a separate stack:
+`jsonyter-org-to-notebook` plus `jsonyter-notebook-export` already
+compose into that two-step path, and Org's own `ox` covers HTML/PDF/...
+export natively besides.
 
 ## Exporting to a script
 
