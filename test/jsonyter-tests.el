@@ -966,16 +966,38 @@ source, or the next cell is rendered inside the previous one's results."
       (should (equal (jsonyter--session-state r) "idle")))))
 
 (ert-deftest jsonyter-test-mode-line-single-session ()
-  "With one session the mode line reports that session's state."
+  "With one session the mode line reports that session's state and id."
   (jsonyter-tests--with-sessions
     (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
       (setq-local jsonyter--session-key '("python" . ""))
-      (should (equal ":idle" (jsonyter--mode-line-string)))
+      (should (equal ":idle[kid]" (jsonyter--mode-line-string)))
       (setf (jsonyter--session-busy s) t)
-      (should (equal ":run" (jsonyter--mode-line-string)))
+      (should (equal ":run[kid]" (jsonyter--mode-line-string)))
       (setf (jsonyter--session-busy s) nil
             (jsonyter--session-state s) "dead")
-      (should (equal ":dead" (jsonyter--mode-line-string))))))
+      (should (equal ":dead[kid]" (jsonyter--mode-line-string))))))
+
+;;;; Kernel id in the mode line (report #2)
+
+(ert-deftest jsonyter-test-status-tag-shows-kernel-id ()
+  "`jsonyter--session-status-tag' appends the kernel's short id."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session
+              '("python" . "") "0123456789abcdef")))
+      (should (equal ":idle[01234567]" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-status-tag-no-id-when-no-kernel ()
+  "No kernel means no id -- `:no-kernel' already says that."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter--session-put '("python" . ""))))
+      (should (equal ":no-kernel" (jsonyter--session-status-tag s))))))
+
+(ert-deftest jsonyter-test-status-tag-id-can-be-turned-off ()
+  "`jsonyter-mode-line-show-kernel-id' set to nil omits the id."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (jsonyter-mode-line-show-kernel-id nil))
+      (should (equal ":idle" (jsonyter--session-status-tag s))))))
 
 (ert-deftest jsonyter-test-mode-line-summarizes-many-sessions ()
   "An Org-style buffer with no current session summarizes the table."

@@ -1142,28 +1142,51 @@ buffer had of its own rather than assuming it had none."
     map)
   "Keymap for `jsonyter-repl-mode'.")
 
+(defcustom jsonyter-mode-line-show-kernel-id t
+  "Whether the mode line shows the current kernel's short id.
+
+Shown appended to the state tag, e.g. `:idle[3f8a9c21]' -- the leading 8
+characters of the kernel id, from `jsonyter--short-id'.  Nothing is shown
+when there is no kernel (`:no-kernel' already says that), and the
+multi-session summary (`:2 kernels!') never carries one, since an id
+there would be unreadable.
+
+Set to nil on a narrow frame or if `mode-line-process' is already
+crowded; the id is always available from `jsonyter-current-kernel-id'
+regardless."
+  :type 'boolean)
+
 (defun jsonyter--session-status-tag (session)
-  "The mode-line tag for one SESSION: our request state, else the kernel's."
-  (let ((state (jsonyter--session-state session))
-        (transfer (jsonyter--session-transfer session)))
-    (cond
-     ;; A transfer runs on the REST pool, so it can be in flight while the
-     ;; kernel is idle or even busy; when there is one, its progress is
-     ;; what the user is watching for.
-     (transfer (format ":%s %d%%"
-                       (if (equal (plist-get transfer :phase) "download")
-                           "down" "up")
-                       (or (plist-get transfer :pct) 0)))
-     ((jsonyter--session-busy session) ":run")
-     ((equal state "dead") ":dead")
-     ((equal state "restarting") ":restarting")
-     ((equal state "disconnected") ":offline")
-     ;; Busy without a request of ours in flight: another client is using
-     ;; this kernel.
-     ((equal state "busy") ":run[ext]")
-     ((equal state "starting") ":starting")
-     ((null (jsonyter--session-kernel-id session)) ":no-kernel")
-     (t ":idle"))))
+  "The mode-line tag for one SESSION: our request state, else the kernel's.
+Appends SESSION's short kernel id per `jsonyter-mode-line-show-kernel-id'.
+This is the one place that happens, so every surface built on it -- REPL,
+notebook, script, and Org at point via `jsonyter--mode-line-string' --
+gets it for free."
+  (let* ((state (jsonyter--session-state session))
+         (transfer (jsonyter--session-transfer session))
+         (kernel-id (jsonyter--session-kernel-id session))
+         (tag
+          (cond
+           ;; A transfer runs on the REST pool, so it can be in flight while
+           ;; the kernel is idle or even busy; when there is one, its
+           ;; progress is what the user is watching for.
+           (transfer (format ":%s %d%%"
+                             (if (equal (plist-get transfer :phase) "download")
+                                 "down" "up")
+                             (or (plist-get transfer :pct) 0)))
+           ((jsonyter--session-busy session) ":run")
+           ((equal state "dead") ":dead")
+           ((equal state "restarting") ":restarting")
+           ((equal state "disconnected") ":offline")
+           ;; Busy without a request of ours in flight: another client is
+           ;; using this kernel.
+           ((equal state "busy") ":run[ext]")
+           ((equal state "starting") ":starting")
+           ((null kernel-id) ":no-kernel")
+           (t ":idle"))))
+    (if (and jsonyter-mode-line-show-kernel-id kernel-id)
+        (concat tag "[" (jsonyter--short-id kernel-id) "]")
+      tag)))
 
 (defun jsonyter--mode-line-string ()
   "Mode-line indicator for the session in play.

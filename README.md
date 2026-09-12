@@ -325,6 +325,13 @@ event subscription rather than polled:
 A kernel killed out from under the REPL (say, shut down from a notebook UI)
 reports itself as dead in the buffer instead of hanging the next execute.
 
+Each tag also carries the kernel's short id, e.g. `:idle[3f8a9c21]` — the
+first 8 characters, enough to tell kernels apart, and useful for noticing
+that a session silently started a *new* kernel instead of reusing the
+one you expected. Set `jsonyter-mode-line-show-kernel-id` to `nil` to
+turn it off on a narrow frame; the full id is always available from
+`jsonyter-current-kernel-id` regardless.
+
 ## Reconnecting after a dropped connection
 
 Against a remote server, a laptop that sleeps or loses its network leaves
