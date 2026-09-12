@@ -208,14 +208,21 @@ Keys in the REPL buffer:
 | `TAB` | Kernel-backed `completion-at-point` |
 | `M-p` / `M-n` | Input history |
 | `C-c C-c` | Interrupt the kernel |
-| `C-c C-r` | Restart the kernel |
+| `C-c C-r` | Restart the kernel, same id, all state lost (`jsonyter-restart`, aka `jsonyter-kernel-restart`) |
 | `C-c C-q` | Shut the kernel down |
 | `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
 | `C-c C-j` | Attach this buffer to any kernel running on the server |
 | `C-c M-h` | Show the kernel's most recent commands |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |
-| `C-c C-k` | Reset a REPL stuck at "kernel is busy" |
+| `C-c C-k` | Unstick a REPL stuck at "kernel is busy" — Emacs-side only, the kernel keeps running (`jsonyter-unstick`) |
 | `C-c M-o` | Clear output above the prompt |
+
+`C-c C-r` and `C-c C-k` are easy to conflate: `C-c C-r` replaces the
+kernel process outright — same id, but every variable is gone — while
+`C-c C-k` touches nothing on the kernel side at all, only Emacs's own
+"a request is in flight" bookkeeping, for the case where that bookkeeping
+itself got stuck. Reach for `C-c C-k` first if the kernel might still be
+genuinely working; interrupt it with `C-c C-c` if it is not.
 
 Code that calls `input()` prompts in the minibuffer (passwords use
 `read-passwd`).
@@ -431,7 +438,7 @@ refresh.
 | `C-c C-b` | Run every code cell in order |
 | `C-c C-n` / `C-c C-p` | Next / previous cell |
 | `C-c C-c` | Interrupt the kernel |
-| `C-c C-r` | Restart the kernel |
+| `C-c C-r` | Restart the kernel, same id, all state lost (`jsonyter-restart`, aka `jsonyter-kernel-restart`) |
 | `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
 | `C-c C-j` | Attach this buffer to any kernel running on the server |
 | `C-c M-h` | Show the kernel's most recent commands |
@@ -710,12 +717,12 @@ unaffected.
 
 | Key | Action |
 | --- | --- |
-| `C-RET` | Run the block at point |
-| `S-RET` | Run the block and move to the next |
+| `C-RET` | Run the block at point (`jsonyter-org-run-block`, aka `jsonyter-org-run-cell`) |
+| `S-RET` | Run the block and move to the next (aka `jsonyter-org-run-cell-and-advance`) |
 | `C-c C-v C-b` | Run every `jy:` block in the buffer, in order |
 | `C-c C-n` / `C-c C-p` | Next / previous `jy:` block (from anywhere) |
 | `C-c C-c` | Interrupt the session at point |
-| `C-c C-r` | Restart the session at point |
+| `C-c C-r` | Restart the session at point, same id, all state lost |
 | `C-c C-l` / `C-c C-j` | Reconnect / attach this session to a kernel |
 | `C-c M-h` | Kernel history for the session at point |
 | `C-c C-d` | Documentation for the thing at point (`inspect`) |

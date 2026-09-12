@@ -2084,5 +2084,25 @@ chunk-size option."
       (should (null (jsonyter--session-contents-dir-probed s)))
       (should (null (jsonyter--session-remote-directory s))))))
 
+;;;; Kernel restart/unstick naming (report #3)
+
+(ert-deftest jsonyter-test-kernel-restart-aliases-restart ()
+  "`jsonyter-kernel-restart' is `jsonyter-restart' under a name a user
+looking for kernel operations will find by `M-x' completion."
+  (should (eq (indirect-function 'jsonyter-kernel-restart)
+              (indirect-function 'jsonyter-restart))))
+
+(ert-deftest jsonyter-test-reset-is-obsolete-alias-for-unstick ()
+  "`jsonyter-reset' still works, as an obsolete alias for `jsonyter-unstick' --
+the actual command is renamed, not removed, since it never touched the
+kernel and \"reset\" was the misleading part."
+  (should (get 'jsonyter-reset 'byte-obsolete-info))
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setq-local jsonyter--session-key '("python" . ""))
+      (setf (jsonyter--session-busy s) t)
+      (with-no-warnings (jsonyter-reset s))
+      (should-not (jsonyter--session-busy s)))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

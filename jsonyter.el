@@ -64,10 +64,12 @@
 ;;   TAB        complete at point (kernel-backed)
 ;;   M-p / M-n  cycle input history
 ;;   C-c C-c    interrupt the kernel
-;;   C-c C-r    restart the kernel
+;;   C-c C-r    restart the kernel, same id, all state lost (`jsonyter-restart',
+;;              aka `jsonyter-kernel-restart')
 ;;   C-c C-q    shut the kernel down
 ;;   C-c C-d    show documentation for the thing at point
-;;   C-c C-k    reset a REPL stuck at "kernel is busy"
+;;   C-c C-k    unstick a REPL stuck at "kernel is busy" -- Emacs-side only,
+;;              the kernel itself is left running (`jsonyter-unstick')
 ;;   C-c M-o    clear previous output from the buffer
 ;;
 ;; Output streams in as it is produced, so a long-running cell shows its
@@ -1137,7 +1139,7 @@ buffer had of its own rather than assuming it had none."
     (define-key map (kbd "C-c C-j") #'jsonyter-kernel-connect)
     (define-key map (kbd "C-c M-h") #'jsonyter-kernel-history)
     (define-key map (kbd "C-c C-d") #'jsonyter-repl-inspect)
-    (define-key map (kbd "C-c C-k") #'jsonyter-reset)
+    (define-key map (kbd "C-c C-k") #'jsonyter-unstick)
     (define-key map (kbd "C-c M-o") #'jsonyter-repl-clear)
     map)
   "Keymap for `jsonyter-repl-mode'.")
@@ -1812,7 +1814,10 @@ immediately even while an execute is still running."
     (message "jsonyter: interrupt sent")))
 
 (defun jsonyter-restart (&optional session)
-  "Restart SESSION's kernel (default the session in play), keeping its id."
+  "Restart SESSION's kernel (default the session in play), keeping its id.
+The kernel process itself is replaced, so all of its state is lost; to
+merely unstick a REPL stuck at \"kernel is busy\" without touching the
+kernel at all, see `jsonyter-unstick'."
   (interactive)
   (let* ((session (or session (jsonyter--command-session)))
          (id (jsonyter--session-kernel-id session)))
@@ -1830,6 +1835,21 @@ immediately even while an execute is still running."
             jsonyter--clear-pending nil)
       (jsonyter--subscribe session)
       (jsonyter--after-kernel-reset "[kernel restarted]" session))))
+
+;; Named to sit with the other `jsonyter-kernel-*' commands
+;; (`jsonyter-kernel-connect', `jsonyter-kernel-reconnect',
+;; `jsonyter-kernel-history') where a user looking for kernel operations
+;; -- report #3's "restart the kernel, keeping its id" -- will find it by
+;; `M-x' completion.  An alias, not a rename: `jsonyter-restart' is the
+;; name in the README, the commentary key table and every mode's keymap
+;; (`C-c C-r'), and `jsonyter-org-restart' delegates to it by that name.
+;;;###autoload
+(defalias 'jsonyter-kernel-restart #'jsonyter-restart
+  "Restart this session's kernel, keeping its id and discarding its state.
+An alias for `jsonyter-restart', named to sit with the other
+`jsonyter-kernel-*' commands (`jsonyter-kernel-connect',
+`jsonyter-kernel-reconnect', `jsonyter-kernel-history') where a user
+looking for kernel operations will find it by completion.")
 
 (defun jsonyter-shutdown (&optional session)
   "Shut SESSION's kernel down (default the session in play).
@@ -1854,12 +1874,16 @@ stays up for the buffer's other sessions."
         (jsonyter--announce "[kernel shut down]" session))
       (force-mode-line-update))))
 
-(defun jsonyter-reset (&optional session)
+(defun jsonyter-unstick (&optional session)
   "Recover a REPL stuck at a \"kernel is busy\" prompt.
 Abandons any in-flight requests, clears SESSION's busy flag and draws a
 fresh prompt.  The kernel is left running: if it is genuinely still
 working, interrupt it with \\[jsonyter-interrupt] first, or this prompt
-will sit alongside output that is still on its way."
+will sit alongside output that is still on its way.
+
+This never touches the kernel itself — only Emacs's own busy-tracking
+state.  To restart the kernel and discard its state, keeping its id, use
+`jsonyter-restart' (aka `jsonyter-kernel-restart') instead."
   (interactive)
   (let ((session (or session (jsonyter--command-session))))
     (when jsonyter--callbacks (clrhash jsonyter--callbacks))
@@ -1867,6 +1891,9 @@ will sit alongside output that is still on its way."
     (setq jsonyter--clear-pending nil)
     (force-mode-line-update)
     (jsonyter--after-kernel-reset "[reset — kernel left running]" session)))
+
+;;;###autoload
+(define-obsolete-function-alias 'jsonyter-reset #'jsonyter-unstick "2.3.0")
 
 (defun jsonyter--after-kernel-reset (text &optional session)
   "Put this buffer back in a usable state after a restart or reset.
