@@ -2542,6 +2542,67 @@ afresh on descent past a `/'."
         (should (string-match-p "backup/trials-Copy1\\.csv" said))
         (should-not (string-match-p "backup/trials\\.csv\\'" said))))))
 
+(ert-deftest jsonyter-test-remote-dired-export-uses-server-path ()
+  "`jsonyter-remote-dired-export' calls `export_notebook' with the
+entry's own `server_path' -- the one place a real Contents-API path is
+already in hand, unlike a notebook buffer's `jsonyter-notebook-export'
+-- and runs it through the browser's owning buffer."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "analysis.ipynb"
+                      (vector " " "analysis.ipynb" "10 B" "2026-09-07 10:00"))))
+    (puthash "analysis.ipynb"
+             '(:name "analysis.ipynb" :type "file" :path "analysis.ipynb")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (jsonyter-remote-dired-export "html" "/tmp/out.html"))
+      (should (equal "html" (plist-get sent :format)))
+      (should (equal "analysis.ipynb" (plist-get sent :server_path)))
+      (should (equal "/tmp/out.html" (plist-get sent :to_path)))
+      (should-not (plist-member sent :cells)))))
+
+(ert-deftest jsonyter-test-remote-dired-export-refuses-non-notebook ()
+  "Refuses a non-`.ipynb' entry outright, without sending anything."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "data.csv" (vector " " "data.csv" "10 B" "2026-09-07 10:00"))))
+    (puthash "data.csv" '(:name "data.csv" :type "file" :path "data.csv")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--export-run)
+               (lambda (&rest _) (error "must not be called"))))
+      (should-error (jsonyter-remote-dired-export "html" "/tmp/out.html")
+                    :type 'user-error))))
+
+(ert-deftest jsonyter-test-remote-dired-export-refuses-directory ()
+  "Refuses a directory entry outright."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries
+          (list (list "sub" (vector " " "sub/" "" "2026-09-07 10:00"))))
+    (puthash "sub" '(:name "sub" :type "directory" :path "sub")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--export-run)
+               (lambda (&rest _) (error "must not be called"))))
+      (should-error (jsonyter-remote-dired-export "html" "/tmp/out.html")
+                    :type 'user-error))))
+
 (ert-deftest jsonyter-test-error-message-renders-transfer-recovery ()
   "Each TransferConflict reason gets its recovery hint; a proxy 413 names the
 chunk-size option."

@@ -4650,6 +4650,7 @@ jsonyter never touches `dired-mode-map' on its own."
     (define-key map (kbd "g")   #'jsonyter-remote-dired-refresh)
     (define-key map (kbd "U")   #'jsonyter-remote-dired-upload)
     (define-key map (kbd "D")   #'jsonyter-remote-dired-download)
+    (define-key map (kbd "E")   #'jsonyter-remote-dired-export)
     (define-key map (kbd "R")   #'jsonyter-remote-dired-rename)
     (define-key map (kbd "C")   #'jsonyter-remote-dired-copy)
     (define-key map (kbd "+")   #'jsonyter-remote-dired-mkdir)
@@ -4825,6 +4826,73 @@ dimmed.  Pure -- no I/O -- so the rendering is unit-testable."
        (jsonyter--resolve-transfer-context) "download"
        (append (list :remote_path remote :local_path (expand-file-name local))
                (and overwrite (list :overwrite t)))))))
+
+(defun jsonyter-remote-dired-export (format to-path)
+  "Export the notebook at point on the server to FORMAT, writing the
+result to TO-PATH.
+
+Uses `server_path' -- the one place in this package a real path in the
+Jupyter server's own Contents API namespace is already in hand, unlike
+`jsonyter-notebook-export', which builds its notebook from a buffer's
+own cells because an ordinary notebook buffer has no such server path at
+all.  Runs through this browser's owning session's bridge, the same one
+`jsonyter-remote-dired-download' uses, so it works whether or not that
+session's buffer happens to be selected.
+
+Interactively, refuses a directory or a non-`.ipynb' entry outright,
+reads FORMAT via `completing-read' over what the server actually offers
+-- refusing early when it offers none, before a request that could take
+two minutes to fail -- and defaults TO-PATH next to
+`jsonyter-download-directory', the same default
+`jsonyter-remote-dired-download' uses, with a best-guess extension for
+FORMAT."
+  (interactive
+   (let ((child (jsonyter--remote-at-point)))
+     (unless child (user-error "jsonyter: no entry here"))
+     (when (equal (plist-get child :type) "directory")
+       (user-error "jsonyter: %s is a directory" (plist-get child :name)))
+     (unless (string-suffix-p ".ipynb" (plist-get child :path))
+       (user-error "jsonyter: %s is not a notebook" (plist-get child :name)))
+     (let* ((context (jsonyter--resolve-transfer-context))
+            (owner (car context))
+            (probe (with-current-buffer owner (jsonyter--list-export-formats)))
+            (formats (and (plist-get probe :available)
+                         (jsonyter--export-format-names (plist-get probe :formats)))))
+       (unless formats
+         (user-error "jsonyter: export not available on %s -- %s"
+                     (with-current-buffer owner jsonyter-server-url)
+                     (or (plist-get probe :reason) "unknown reason")))
+       (let* ((format (completing-read "Export format: " formats nil t))
+              (dir (or jsonyter-download-directory default-directory))
+              (base (file-name-sans-extension
+                     (file-name-nondirectory
+                      (directory-file-name (plist-get child :path)))))
+              (default (expand-file-name
+                        (concat base (jsonyter--export-format-guess-extension format))
+                        dir)))
+         (list format (read-file-name "Export to: " dir default nil
+                                      (file-name-nondirectory default)))))))
+  (let* ((child (jsonyter--remote-at-point))
+         (context (jsonyter--resolve-transfer-context))
+         (owner (car context))
+         (session (cdr context))
+         (remote (and child (plist-get child :path))))
+    (unless child (user-error "jsonyter: no entry here"))
+    (when (equal (plist-get child :type) "directory")
+      (user-error "jsonyter: %s is a directory" (plist-get child :name)))
+    (unless (string-suffix-p ".ipynb" remote)
+      (user-error "jsonyter: %s is not a notebook" (plist-get child :name)))
+    (with-current-buffer owner
+      (jsonyter--ensure-bridge)
+      (jsonyter--export-run
+       session
+       (list :format format :server_path remote :to_path (expand-file-name to-path))
+       (lambda (result)
+         (message "jsonyter: exported %s to %s (%s)"
+                  (plist-get result :format)
+                  (plist-get result :path)
+                  (file-size-human-readable (or (plist-get result :bytes) 0)
+                                            nil " " "B")))))))
 
 (defun jsonyter-remote-dired-upload ()
   "Upload a local file into the directory being shown."
