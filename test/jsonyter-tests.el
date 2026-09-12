@@ -1965,7 +1965,8 @@ reachability up front, is treated the same as any other failure here."
 ;; involved anywhere in this section.
 
 (defun jsonyter-tests--script-cell (&rest plist)
-  "A (:cell_type ... :source ...) plist from PLIST, for `jsonyter--cells-to-script'."
+  "A (:cell_type ... :source ...) plist from PLIST.
+For `jsonyter--cells-to-script'."
   plist)
 
 (ert-deftest jsonyter-test-cells-to-script-output-shape ()
