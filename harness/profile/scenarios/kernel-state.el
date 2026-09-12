@@ -18,9 +18,9 @@
 
   (jy-use-scripts "dying-kernel.jsonl")
   (jy-start-repl)
-  (eh-expect-equal (jy-harness-state) ":idle")
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix))
 
-  (eh-wait (lambda () (jy-harness--state-p ":dead")) 20)
+  (eh-wait (lambda () (jy-harness--state-p (concat ":dead" jy-harness-kernel-id-suffix))) 20)
   (eh-expect-match "kernel died" (buffer-string))
   (eh-expect-match "C-c C-r" (buffer-string)
                    "the message must name the key that fixes it")
@@ -29,7 +29,7 @@
   (jsonyter--handle-event
    '(:kernel_id "kernel-python-0001"
      :event (:type "status" :execution_state "idle")))
-  (eh-expect-equal (jy-harness-state) ":dead"
+  (eh-expect-equal (jy-harness-state) (concat ":dead" jy-harness-kernel-id-suffix)
                    "once dead, a trailing `idle' status must not undo the verdict"))
 
 (eh-scenario jsonyter/a-lost-connection-is-offline-not-dead
@@ -42,7 +42,7 @@
 
   (jy-use-scripts "lost-connection.jsonl")
   (jy-start-repl)
-  (eh-wait (lambda () (jy-harness--state-p ":offline")) 20)
+  (eh-wait (lambda () (jy-harness--state-p (concat ":offline" jy-harness-kernel-id-suffix))) 20)
   (eh-expect-match "connection lost" (buffer-string))
   (eh-expect (not (string-match-p "kernel died" (buffer-string)))
              "a lost connection must not be reported as a dead kernel"))
@@ -57,8 +57,8 @@
 
   (jy-use-scripts "busy-elsewhere.jsonl")
   (jy-start-repl)
-  (eh-wait (lambda () (jy-harness--state-p ":run[ext]")) 20)
-  (eh-expect-equal (jy-harness-state) ":run[ext]"))
+  (eh-wait (lambda () (jy-harness--state-p (concat ":run[ext]" jy-harness-kernel-id-suffix))) 20)
+  (eh-expect-equal (jy-harness-state) (concat ":run[ext]" jy-harness-kernel-id-suffix)))
 
 (eh-scenario jsonyter/an-unanswered-request-times-out-instead-of-hanging
   :doc "The SAS kernel never answers `history' at all, and the bridge
@@ -84,7 +84,7 @@
   ;; And the session is usable afterwards: a bounded request that left
   ;; the buffer wedged would have solved nothing.
   (eh-expect (jy-harness--bridge-live-p) "the bridge must survive a timeout")
-  (eh-expect-equal (jy-harness-state) ":idle"
+  (eh-expect-equal (jy-harness-state) (concat ":idle" jy-harness-kernel-id-suffix)
                    "a timed-out introspection call must not leave the kernel `busy'"))
 
 (eh-scenario jsonyter/a-forbidden-server-says-what-fixes-it
@@ -163,5 +163,5 @@
   (eh-type-text "ask_for_input()")
   (eh-send-keys "RET")
   (eh-wait (lambda () (string-match-p "the kernel heard you" (buffer-string))) 20)
-  (eh-wait (lambda () (jy-harness--state-p ":idle")) 20)
+  (eh-wait (lambda () (jy-harness--state-p (concat ":idle" jy-harness-kernel-id-suffix))) 20)
   (eh-expect-match "the kernel heard you" (buffer-string)))
