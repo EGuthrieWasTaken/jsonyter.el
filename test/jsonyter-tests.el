@@ -18,6 +18,7 @@
 (require 'ert)
 (require 'json)
 (require 'cl-lib)
+(require 'dired)
 (require 'jsonyter)
 
 ;; `-Q' has no `auto-mode-alist' entry for notebooks; the tests open
@@ -2729,6 +2730,2595 @@ kernel and \"reset\" was the misleading part."
       (setf (jsonyter--session-busy s) t)
       (with-no-warnings (jsonyter-reset s))
       (should-not (jsonyter--session-busy s)))))
+
+;;;; Kernel control commands (interrupt/restart/unstick/shutdown)
+
+(ert-deftest jsonyter-test-interrupt-sends-request-for-session-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (let (sent said)
+      (setq-local jsonyter--session-key '("python" . ""))
+      (cl-letf (((symbol-function 'jsonyter--request-sync)
+                 (lambda (method params &rest _) (setq sent (cons method params))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-interrupt))
+      (should (equal (car sent) "interrupt_kernel"))
+      (should (equal (plist-get (cdr sent) :kernel_id) "kid"))
+      (should (string-match-p "interrupt sent" said)))))
+
+(ert-deftest jsonyter-test-interrupt-errors-with-no-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") nil)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (should-error (jsonyter-interrupt) :type 'user-error)))
+
+(ert-deftest jsonyter-test-restart-confirms-and-resets-state ()
+  "`jsonyter-restart' asks first, restarts the kernel, and clears busy/count."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid"))
+          methods)
+      (setq-local jsonyter--session-key '("python" . "")
+                  jsonyter--execution-count 5)
+      (setf (jsonyter--session-busy s) t)
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (method &rest _) (push method methods)))
+                ((symbol-function 'jsonyter--subscribe) #'ignore)
+                ((symbol-function 'jsonyter--after-kernel-reset) #'ignore))
+        (jsonyter-restart))
+      (should (member "restart_kernel" methods))
+      (should (member "disconnect" methods))
+      (should-not (jsonyter--session-busy s))
+      (should (= 0 jsonyter--execution-count)))))
+
+(ert-deftest jsonyter-test-restart-declines-when-not-confirmed ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (let (called)
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter--request-sync) (lambda (&rest _) (setq called t))))
+        (jsonyter-restart))
+      (should-not called))))
+
+(ert-deftest jsonyter-test-restart-errors-with-no-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") nil)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (should-error (jsonyter-restart) :type 'user-error)))
+
+(ert-deftest jsonyter-test-shutdown-confirms-and-clears-owned-session ()
+  "In a single-kernel buffer (`jsonyter--session-key' set), shutdown also
+kills the bridge process."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid" t))
+          killed)
+      (setq-local jsonyter--session-key '("python" . ""))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--request-sync) #'ignore)
+                ((symbol-function 'jsonyter--kill-process) (lambda () (setq killed t)))
+                ((symbol-function 'jsonyter--announce) #'ignore)
+                ((symbol-function 'force-mode-line-update) #'ignore))
+        (jsonyter-shutdown))
+      (should killed)
+      (should (null (jsonyter--session-kernel-id s)))
+      (should (equal "dead" (jsonyter--session-state s)))
+      (should (null (jsonyter--session-own s))))))
+
+(ert-deftest jsonyter-test-shutdown-drops-session-when-no-session-key ()
+  "In an Org-style buffer (`jsonyter--session-key' nil), shutdown drops
+the session from the table instead of killing the shared bridge."
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "main") "kid" t)))
+      (setq-local jsonyter--session-key nil)
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--request-sync) #'ignore)
+                ((symbol-function 'jsonyter--announce) #'ignore)
+                ((symbol-function 'force-mode-line-update) #'ignore))
+        (jsonyter-shutdown s))
+      (should (= 0 (hash-table-count jsonyter--sessions))))))
+
+(ert-deftest jsonyter-test-shutdown-errors-with-no-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") nil)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (should-error (jsonyter-shutdown) :type 'user-error)))
+
+;;;; Kernel listing, labels and selection
+
+(ert-deftest jsonyter-test-running-kernels-sorts-by-recent-activity ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync)
+             (lambda (&rest _)
+               (list (list :id "old" :last_activity "2024-01-01T00:00:00")
+                     (list :id "new" :last_activity "2024-06-01T00:00:00")))))
+    (let ((kernels (jsonyter--running-kernels)))
+      (should (equal (plist-get (nth 0 kernels) :id) "new"))
+      (should (equal (plist-get (nth 1 kernels) :id) "old")))))
+
+(ert-deftest jsonyter-test-kernel-activity-formats-or-falls-back ()
+  (should (string-match-p "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\} "
+                          (jsonyter--kernel-activity
+                           (list :last_activity "2024-06-01T12:34:00"))))
+  (should (equal "raw-stamp" (jsonyter--kernel-activity
+                              (list :last_activity "raw-stamp"))))
+  (should (equal "" (jsonyter--kernel-activity (list)))))
+
+(ert-deftest jsonyter-test-kernel-label-marks-current-kernel ()
+  (let ((label (jsonyter--kernel-label
+                (list :id "abcdefgh12" :name "python3" :execution_state "idle")
+                "abcdefgh12")))
+    (should (string-prefix-p "*" label))
+    (should (string-match-p "python3" label))
+    (should (string-match-p "abcdefgh" label)))
+  (should (string-prefix-p " " (jsonyter--kernel-label (list :id "x") "y"))))
+
+(ert-deftest jsonyter-test-read-kernel-offers-current-as-default ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync)
+             (lambda (&rest _)
+               (list (list :id "kid1" :name "python3" :execution_state "idle"))))
+            ((symbol-function 'completing-read)
+             (lambda (_prompt table &rest _) (car (car table)))))
+    (should (equal "kid1" (jsonyter--read-kernel "Pick: ")))))
+
+(ert-deftest jsonyter-test-read-kernel-errors-when-none-running ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync) (lambda (&rest _) nil)))
+    (should-error (jsonyter--read-kernel "Pick: ") :type 'user-error)))
+
+(ert-deftest jsonyter-test-read-kernel-errors-on-unknown-choice ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync)
+             (lambda (&rest _) (list (list :id "kid1" :name "python3"))))
+            ((symbol-function 'completing-read) (lambda (&rest _) "not in the table")))
+    (should-error (jsonyter--read-kernel "Pick: ") :type 'user-error)))
+
+;;;; Kernelspec language resolution and adoption
+
+(ert-deftest jsonyter-test-kernelspec-language-looks-up-by-name ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync)
+             (lambda (&rest _)
+               (list :kernelspecs
+                     (list :python3 (list :name "python3" :spec (list :language "python"))
+                           :ir (list :name "ir" :spec (list :language "R")))))))
+    (should (equal "python" (jsonyter--kernelspec-language "python3")))
+    (should (equal "R" (jsonyter--kernelspec-language "ir")))
+    (should (null (jsonyter--kernelspec-language "nope")))))
+
+(ert-deftest jsonyter-test-kernelspec-language-best-effort-on-error ()
+  (cl-letf (((symbol-function 'jsonyter--request-sync) (lambda (&rest _) (error "boom"))))
+    (should (null (jsonyter--kernelspec-language "python3")))))
+
+(ert-deftest jsonyter-test-adopt-kernel-language-reports-mismatch-then-not ()
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--kernelspec-language) (lambda (_n) "R")))
+        (let ((note (jsonyter--adopt-kernel-language s "ir")))
+          (should (equal "R" (jsonyter--session-language s)))
+          (should (string-match-p "python" note))
+          (should (string-match-p "R" note)))
+        ;; Same language the second time around: no note.
+        (should (null (jsonyter--adopt-kernel-language s "ir")))))))
+
+(ert-deftest jsonyter-test-adopt-kernel-language-nil-when-unresolvable ()
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--kernelspec-language) (lambda (_n) nil)))
+        (should (null (jsonyter--adopt-kernel-language s "mystery")))
+        (should (equal "python" (jsonyter--session-language s)))))))
+
+;;;; Attaching to an existing kernel
+
+(ert-deftest jsonyter-test-attach-target-uses-session-key-when-none-current ()
+  (jsonyter-tests--with-sessions
+    (should-error (jsonyter--attach-target) :type 'user-error)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (let ((s (jsonyter--attach-target)))
+      (should (equal (jsonyter--session-key s) '("python" . ""))))))
+
+(ert-deftest jsonyter-test-attach-target-prefers-existing-current-session ()
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setq-local jsonyter--session-key '("python" . ""))
+      (should (eq (jsonyter--attach-target) s)))))
+
+(ert-deftest jsonyter-test-kernel-connect-attaches-and-reports ()
+  "Exercised via `call-interactively' so the interactive spec — reading
+the kernel id — runs too, matching how a user actually invokes it."
+  (jsonyter-tests--with-sessions
+    (setq-local jsonyter--session-key '("python" . "")
+                jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (subscribed said)
+      (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                ((symbol-function 'jsonyter--read-kernel) (lambda (&rest _) "new-kid"))
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (method &rest _)
+                   (when (equal method "get_kernel")
+                     (list :id "new-kid" :name "python3" :execution_state "idle"))))
+                ((symbol-function 'jsonyter--subscribe)
+                 (lambda (s) (setq subscribed s) (setf (jsonyter--session-state s) "idle") t))
+                ((symbol-function 'force-mode-line-update) #'ignore)
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (should (equal "new-kid" (call-interactively 'jsonyter-kernel-connect))))
+      (let ((s (jsonyter--session '("python" . ""))))
+        (should (equal "new-kid" (jsonyter--session-kernel-id s)))
+        (should (equal "python3" (jsonyter--session-kernel-name s)))
+        (should (eq subscribed s)))
+      (should (string-match-p "connected to" said)))))
+
+(ert-deftest jsonyter-test-kernel-connect-signals-user-error-when-kernel-gone ()
+  (jsonyter-tests--with-sessions
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _)
+                 (when (equal method "get_kernel") (error "not found")))))
+      (should-error (jsonyter-kernel-connect "missing-kid") :type 'user-error))))
+
+(ert-deftest jsonyter-test-kernel-reconnect-uses-last-kernel-id ()
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "") nil)))
+      (setq-local jsonyter--session-key '("python" . "")
+                  jsonyter-mode t)
+      (setf (jsonyter--session-kernel-id s) nil
+            (jsonyter--session-last-kernel s) (list :id "old-kid" :name "python3"))
+      (let (connected-id)
+        (cl-letf (((symbol-function 'jsonyter-kernel-connect)
+                   (lambda (id &optional session) (setq connected-id id) session)))
+          (jsonyter-kernel-reconnect))
+        (should (equal "old-kid" connected-id))))))
+
+(ert-deftest jsonyter-test-kernel-reconnect-errors-with-no-kernel-at-all ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") nil)
+    (setq-local jsonyter--session-key '("python" . "")
+                jsonyter-mode t)
+    (should-error (jsonyter-kernel-reconnect) :type 'user-error)))
+
+;;;; Kernel history
+
+(ert-deftest jsonyter-test-history-input-handles-plain-and-paired-entries ()
+  (should (equal "x = 1" (jsonyter--history-input '("s" 1 "x = 1"))))
+  (should (equal "x = 1" (jsonyter--history-input (list "s" 1 (cons "x = 1" "out")))))
+  (should (null (jsonyter--history-input (list "s" 1 42)))))
+
+(ert-deftest jsonyter-test-history-insert-groups-by-session-with-rules ()
+  (with-temp-buffer
+    (jsonyter--history-insert
+     (list (list "s1" 1 "a = 1") (list "s1" 2 "a") (list "s2" 1 "b = 2")))
+    (let ((text (buffer-string)))
+      (should (string-match-p "session s1" text))
+      (should (string-match-p "session s2" text))
+      (should (string-match-p "In \\[1\\]: a = 1" text))
+      (should (string-match-p "In \\[1\\]: b = 2" text)))))
+
+(ert-deftest jsonyter-test-history-insert-skips-entries-with-no-usable-input ()
+  (with-temp-buffer
+    (jsonyter--history-insert (list (list "s1" 1 42)))
+    (should (equal "" (buffer-string)))))
+
+(ert-deftest jsonyter-test-kernel-history-shows-entries-grouped-by-session ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _)
+                 (when (equal method "get_kernel") (list :id "kid" :name "python3"))))
+              ((symbol-function 'jsonyter--kernel-request)
+               (lambda (&rest _) (list :status "ok" :history (list (list "s1" 1 "x = 1"))))))
+      ;; Via `call-interactively': no prefix arg, so N and the kernel both
+      ;; come from this buffer's own session, exactly as a user's C-c M-h
+      ;; would resolve them.
+      (call-interactively 'jsonyter-kernel-history))
+    (let ((buf (get-buffer "*jsonyter-history*")))
+      (should buf)
+      (with-current-buffer buf
+        (should (string-match-p "In \\[1\\]: x = 1" (buffer-string))))
+      (kill-buffer buf))))
+
+(ert-deftest jsonyter-test-kernel-history-errors-without-any-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") nil)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (should-error (jsonyter-kernel-history 5 nil) :type 'user-error)))
+
+(ert-deftest jsonyter-test-kernel-history-errors-on-bad-count ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (should-error (jsonyter-kernel-history 0 "kid") :type 'user-error)))
+
+(ert-deftest jsonyter-test-kernel-history-reports-empty-history ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (method &rest _) (when (equal method "get_kernel") (list :id "kid"))))
+                ((symbol-function 'jsonyter--kernel-request)
+                 (lambda (&rest _) (list :status "ok" :history nil)))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-kernel-history 5 "kid"))
+      (should (string-match-p "has run nothing yet" said)))))
+
+(ert-deftest jsonyter-test-kernel-history-errors-when-kernel-refuses ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _) (when (equal method "get_kernel") (list :id "kid"))))
+              ((symbol-function 'jsonyter--kernel-request)
+               (lambda (&rest _) (list :status "error"))))
+      (should-error (jsonyter-kernel-history 5 "kid")))))
+
+;;;; Bridge stderr tail
+
+(ert-deftest jsonyter-test-stderr-tail-returns-last-lines ()
+  (let ((buf (generate-new-buffer " *fake-stderr*"))
+        (proc (start-process "jsonyter-test-fake" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "line1\nline2\nline3\nline4\nline5\nline6\nline7\n"))
+          (process-put proc 'jsonyter-stderr-buffer buf)
+          (should (equal "line5\nline6\nline7" (jsonyter--stderr-tail proc 3))))
+      (ignore-errors (delete-process proc))
+      (kill-buffer buf))))
+
+(ert-deftest jsonyter-test-stderr-tail-nil-without-a-buffer ()
+  (let ((proc (start-process "jsonyter-test-fake2" nil "cat")))
+    (unwind-protect
+        (should (null (jsonyter--stderr-tail proc)))
+      (ignore-errors (delete-process proc)))))
+
+;;;; Starting REPLs
+
+(ert-deftest jsonyter-test-start-reads-language-and-delegates ()
+  (let (started)
+    (cl-letf (((symbol-function 'jsonyter--start-repl) (lambda (lang) (setq started lang)))
+              ((symbol-function 'read-string) (lambda (&rest _) "julia")))
+      (call-interactively 'jsonyter-start))
+    (should (equal "julia" started))))
+
+(ert-deftest jsonyter-test-start-language-wrappers-delegate-to-start-repl ()
+  (let (started)
+    (cl-letf (((symbol-function 'jsonyter--start-repl) (lambda (lang) (setq started lang))))
+      (jsonyter-start-python) (should (equal "python" started))
+      (jsonyter-start-julia)  (should (equal "julia" started))
+      (jsonyter-start-R)      (should (equal "R" started))
+      (jsonyter-start-SAS)    (should (equal "sas" started)))))
+
+;;;; Resolving a transfer context
+
+(ert-deftest jsonyter-test-resolve-transfer-context-uses-remote-dired-owner ()
+  (let ((owner (generate-new-buffer "jsonyter-owner")))
+    (unwind-protect
+        (progn
+          (with-current-buffer owner
+            (setq-local jsonyter--sessions (make-hash-table :test #'equal))
+            (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (with-temp-buffer
+            (jsonyter-remote-dired-mode)
+            (setq jsonyter--remote-owner owner
+                  jsonyter--remote-session-key '("python" . ""))
+            (let ((ctx (jsonyter--resolve-transfer-context)))
+              (should (eq (car ctx) owner))
+              (should (equal (jsonyter--session-key (cdr ctx)) '("python" . ""))))))
+      (kill-buffer owner))))
+
+(ert-deftest jsonyter-test-resolve-transfer-context-errors-when-owner-gone ()
+  (let ((owner (generate-new-buffer "jsonyter-owner-2")))
+    (kill-buffer owner)
+    (with-temp-buffer
+      (jsonyter-remote-dired-mode)
+      (setq jsonyter--remote-owner owner)
+      (should-error (jsonyter--resolve-transfer-context) :type 'user-error))))
+
+(ert-deftest jsonyter-test-resolve-transfer-context-uses-current-jsonyter-buffer ()
+  (with-temp-buffer
+    (setq-local jsonyter-mode t)
+    (setq-local jsonyter--process (start-process "jsonyter-test-ctx" nil "cat"))
+    (unwind-protect
+        (let ((ctx (jsonyter--resolve-transfer-context)))
+          (should (eq (car ctx) (current-buffer)))
+          (should (null (cdr ctx))))
+      (ignore-errors (delete-process jsonyter--process)))))
+
+(ert-deftest jsonyter-test-resolve-transfer-context-falls-back-to-single-candidate ()
+  (let ((buf (generate-new-buffer "jsonyter-cand-solo")))
+    (unwind-protect
+        (with-temp-buffer
+          (cl-letf (((symbol-function 'jsonyter--transfer-buffers) (lambda () (list buf))))
+            (let ((ctx (jsonyter--resolve-transfer-context)))
+              (should (eq (car ctx) buf))
+              (should (null (cdr ctx))))))
+      (kill-buffer buf))))
+
+(ert-deftest jsonyter-test-resolve-transfer-context-prompts-among-several ()
+  (let ((buf1 (generate-new-buffer "jsonyter-cand-a"))
+        (buf2 (generate-new-buffer "jsonyter-cand-b")))
+    (unwind-protect
+        (with-temp-buffer
+          (cl-letf (((symbol-function 'jsonyter--transfer-buffers) (lambda () (list buf1 buf2)))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt table &rest _) (car table))))
+            (let ((ctx (jsonyter--resolve-transfer-context)))
+              (should (eq (car ctx) buf1)))))
+      (kill-buffer buf1) (kill-buffer buf2))))
+
+(ert-deftest jsonyter-test-resolve-transfer-context-errors-with-no-candidates ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'jsonyter--transfer-buffers) (lambda () nil)))
+      (should-error (jsonyter--resolve-transfer-context) :type 'user-error))))
+
+(ert-deftest jsonyter-test-transfer-candidates-lists-sessions-and-bare-buffers ()
+  (let ((buf1 (generate-new-buffer "jsonyter-cand-1"))
+        (buf2 (generate-new-buffer "jsonyter-cand-2")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf1
+            (setq-local jsonyter-mode t)
+            (setq-local jsonyter--process (start-process "jsonyter-test-cand1" nil "cat"))
+            (setq-local jsonyter--sessions (make-hash-table :test #'equal))
+            (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (with-current-buffer buf2
+            (setq-local jsonyter-mode t)
+            (setq-local jsonyter--process (start-process "jsonyter-test-cand2" nil "cat")))
+          (let ((cands (jsonyter--transfer-candidates)))
+            (should (seq-find (lambda (c) (string-match-p "python" (car c))) cands))
+            (should (seq-find (lambda (c) (string-match-p "no session" (car c))) cands))))
+      (dolist (b (list buf1 buf2))
+        (when (buffer-live-p b)
+          (ignore-errors (delete-process (buffer-local-value 'jsonyter--process b)))
+          (kill-buffer b))))))
+
+;;;; jsonyter-upload-file / jsonyter-download-file
+
+(ert-deftest jsonyter-test-upload-file-sends-expanded-paths ()
+  "Exercised via `call-interactively' so the interactive spec — reading
+the local file and completing the remote path — runs too."
+  (let ((tmp (make-temp-file "jsonyter-upload-")))
+    (unwind-protect
+        (let (sent)
+          (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                     (lambda () (cons (current-buffer) nil)))
+                    ((symbol-function 'read-file-name) (lambda (&rest _) tmp))
+                    ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "d/"))
+                    ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "d/x"))
+                    ((symbol-function 'jsonyter--transfer-run)
+                     (lambda (_context method params &optional _on-success)
+                       (setq sent (list method params)))))
+            (call-interactively 'jsonyter-upload-file))
+          (should (equal (car sent) "upload"))
+          (should (equal (plist-get (cadr sent) :local_path) (expand-file-name tmp)))
+          (should (equal (plist-get (cadr sent) :remote_path) "d/x")))
+      (delete-file tmp))))
+
+(ert-deftest jsonyter-test-upload-file-refuses-unreadable-local-path ()
+  (should-error (jsonyter-upload-file "/no/such/file/anywhere" "d/x") :type 'user-error))
+
+(ert-deftest jsonyter-test-upload-file-refuses-a-directory ()
+  (should-error (jsonyter-upload-file "/tmp" "d/x") :type 'user-error))
+
+(ert-deftest jsonyter-test-upload-file-refuses-empty-remote-path ()
+  (let ((tmp (make-temp-file "jsonyter-upload-")))
+    (unwind-protect
+        (should-error (jsonyter-upload-file tmp "") :type 'user-error)
+      (delete-file tmp))))
+
+(ert-deftest jsonyter-test-download-file-sends-expanded-paths ()
+  (let (sent)
+    (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+               (lambda () (cons (current-buffer) nil)))
+              ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) ""))
+              ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "d/x.csv"))
+              ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/x.csv"))
+              ((symbol-function 'jsonyter--transfer-run)
+               (lambda (_context method params &optional _on-success) (setq sent (list method params)))))
+      (call-interactively 'jsonyter-download-file))
+    (should (equal (car sent) "download"))
+    (should (equal (plist-get (cadr sent) :remote_path) "d/x.csv"))
+    (should (equal (plist-get (cadr sent) :local_path) "/tmp/x.csv"))))
+
+(ert-deftest jsonyter-test-download-file-appends-basename-to-a-directory ()
+  (let (sent)
+    (cl-letf (((symbol-function 'jsonyter--transfer-run)
+               (lambda (_context _method params &optional _on-success) (setq sent params))))
+      (jsonyter-download-file "d/x.csv" "/tmp" nil (cons (current-buffer) nil)))
+    (should (equal (plist-get sent :local_path) (expand-file-name "x.csv" "/tmp")))))
+
+(ert-deftest jsonyter-test-download-file-refuses-root-path ()
+  (should-error (jsonyter-download-file "" "/tmp/x") :type 'user-error))
+
+;;;; jsonyter--remote-call
+
+(ert-deftest jsonyter-test-remote-call-runs-through-owner-buffer ()
+  (let ((owner (generate-new-buffer "jsonyter-remote-owner")))
+    (unwind-protect
+        (with-temp-buffer
+          (jsonyter-remote-dired-mode)
+          (setq jsonyter--remote-owner owner)
+          (let (seen owner-was-current)
+            (cl-letf (((symbol-function 'jsonyter--request-sync)
+                       (lambda (method params &rest _)
+                         (setq seen (list method params)
+                               owner-was-current (eq (current-buffer) owner))
+                         'ok)))
+              (should (eq 'ok (jsonyter--remote-call "make_directory" (list :path "x")))))
+            (should (equal (car seen) "make_directory"))
+            (should owner-was-current)))
+      (kill-buffer owner))))
+
+(ert-deftest jsonyter-test-remote-call-errors-when-owner-gone ()
+  (let ((owner (generate-new-buffer "jsonyter-remote-owner-2")))
+    (kill-buffer owner)
+    (with-temp-buffer
+      (jsonyter-remote-dired-mode)
+      (setq jsonyter--remote-owner owner)
+      (should-error (jsonyter--remote-call "x" nil) :type 'user-error))))
+
+;;;; jsonyter-remote-dired-* commands
+
+(ert-deftest jsonyter-test-remote-dired-upload-sends-to-current-directory ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd "d/")
+    (let (sent refreshed)
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) nil)))
+                ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/x.csv"))
+                ((symbol-function 'jsonyter--transfer-run)
+                 (lambda (_context method params &optional on-success)
+                   (setq sent (list method params))
+                   (when on-success (funcall on-success nil))))
+                ((symbol-function 'jsonyter-remote-dired-refresh) (lambda () (setq refreshed t))))
+        (jsonyter-remote-dired-upload))
+      (should (equal (car sent) "upload"))
+      (should (equal (plist-get (cadr sent) :remote_path) "d/x.csv"))
+      (should refreshed))))
+
+(ert-deftest jsonyter-test-remote-dired-upload-asks-before-overwrite ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd "")
+    (puthash "x.csv" '(:name "x.csv") jsonyter--remote-models)
+    (let (sent asked)
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) nil)))
+                ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/x.csv"))
+                ((symbol-function 'yes-or-no-p) (lambda (&rest _) (setq asked t) t))
+                ((symbol-function 'jsonyter--transfer-run)
+                 (lambda (_context _method params &optional _on-success) (setq sent params))))
+        (jsonyter-remote-dired-upload))
+      (should asked)
+      (should (eq t (plist-get sent :overwrite))))))
+
+(ert-deftest jsonyter-test-remote-dired-download-refuses-directory ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "sub" (vector " " "sub/" "" ""))))
+    (puthash "sub" '(:name "sub" :type "directory" :path "sub") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (should-error (jsonyter-remote-dired-download) :type 'user-error)))
+
+(ert-deftest jsonyter-test-remote-dired-download-sends-to-local-path ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "x.csv" (vector " " "x.csv" "10 B" ""))))
+    (puthash "x.csv" '(:name "x.csv" :type "file" :path "x.csv") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (sent)
+      (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/x.csv"))
+                ((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) nil)))
+                ((symbol-function 'jsonyter--transfer-run)
+                 (lambda (_context method params &optional _on-success) (setq sent (list method params)))))
+        (jsonyter-remote-dired-download))
+      (should (equal (car sent) "download"))
+      (should (equal (plist-get (cadr sent) :remote_path) "x.csv")))))
+
+(ert-deftest jsonyter-test-remote-dired-find-descends-into-directory ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "sub" (vector " " "sub/" "" ""))))
+    (puthash "sub" '(:name "sub" :type "directory" :path "sub") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+      (jsonyter-remote-dired-find))
+    (should (equal "sub/" jsonyter--remote-cwd))))
+
+(ert-deftest jsonyter-test-remote-dired-find-downloads-a-file ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "x.csv" (vector " " "x.csv" "10 B" ""))))
+    (puthash "x.csv" '(:name "x.csv" :type "file" :path "x.csv") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (called)
+      (cl-letf (((symbol-function 'jsonyter-remote-dired-download) (lambda () (setq called t))))
+        (jsonyter-remote-dired-find))
+      (should called))))
+
+(ert-deftest jsonyter-test-remote-dired-find-errors-with-no-entry ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer))
+    (should-error (jsonyter-remote-dired-find) :type 'user-error)))
+
+(ert-deftest jsonyter-test-remote-dired-up-moves-to-parent ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd "a/b/")
+    (cl-letf (((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+      (jsonyter-remote-dired-up))
+    (should (equal "a/" jsonyter--remote-cwd))))
+
+(ert-deftest jsonyter-test-remote-dired-mark-and-unmark ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "x.csv" (vector " " "x.csv" "10 B" ""))
+                                        (list "y.csv" (vector " " "y.csv" "10 B" ""))))
+    (puthash "x.csv" '(:name "x.csv" :type "file" :path "x.csv") jsonyter--remote-models)
+    (puthash "y.csv" '(:name "y.csv" :type "file" :path "y.csv") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+      (jsonyter-remote-dired-mark-delete))
+    (should (member "x.csv" jsonyter--remote-marks))
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter-remote-dired-refresh) #'ignore))
+      (jsonyter-remote-dired-unmark))
+    (should-not (member "x.csv" jsonyter--remote-marks))))
+
+(ert-deftest jsonyter-test-remote-dired-execute-deletes-marked-entries ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-marks (list "x.csv" "y.csv"))
+    (let (deleted said (jsonyter-remote-confirm-delete nil))
+      (cl-letf (((symbol-function 'jsonyter--remote-call)
+                 (lambda (_method params) (push (plist-get params :path) deleted) nil))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore)
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-remote-dired-execute))
+      (should (= 2 (length deleted)))
+      (should (null jsonyter--remote-marks))
+      (should (string-match-p "deleted 2" said)))))
+
+(ert-deftest jsonyter-test-remote-dired-execute-reports-partial-failure ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-marks (list "ok.csv" "bad.csv"))
+    (let (said (jsonyter-remote-confirm-delete nil))
+      (cl-letf (((symbol-function 'jsonyter--remote-call)
+                 (lambda (_method params)
+                   (when (equal (plist-get params :path) "bad.csv")
+                     (error "permission denied"))))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore)
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-remote-dired-execute))
+      (should (equal (list "bad.csv") jsonyter--remote-marks))
+      (should (string-match-p "deleted 1, 1 failed" said)))))
+
+(ert-deftest jsonyter-test-remote-dired-execute-errors-with-nothing-marked ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer))
+    (should-error (jsonyter-remote-dired-execute) :type 'user-error)))
+
+(ert-deftest jsonyter-test-remote-dired-rename-updates-server ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "old.csv" (vector " " "old.csv" "10 B" ""))))
+    (puthash "old.csv" '(:name "old.csv" :type "file" :path "old.csv") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (sent said)
+      (cl-letf (((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "new.csv"))
+                ((symbol-function 'jsonyter--remote-call)
+                 (lambda (method params) (setq sent (list method params))))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore)
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-remote-dired-rename))
+      (should (equal (car sent) "rename_contents"))
+      (should (equal (plist-get (cadr sent) :new_path) "new.csv"))
+      (should (string-match-p "old.csv → new.csv" said)))))
+
+(ert-deftest jsonyter-test-remote-dired-rename-refuses-unchanged ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "old.csv" (vector " " "old.csv" "10 B" ""))))
+    (puthash "old.csv" '(:name "old.csv" :type "file" :path "old.csv") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "old.csv")))
+      (should-error (jsonyter-remote-dired-rename) :type 'user-error))))
+
+(ert-deftest jsonyter-test-remote-dired-mkdir-creates-directory ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd "d/")
+    (let (sent said)
+      (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "new"))
+                ((symbol-function 'jsonyter--remote-call)
+                 (lambda (method params) (setq sent (list method params))))
+                ((symbol-function 'jsonyter-remote-dired-refresh) #'ignore)
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (call-interactively 'jsonyter-remote-dired-mkdir))
+      (should (equal (car sent) "make_directory"))
+      (should (equal (plist-get (cadr sent) :path) "d/new"))
+      (should (string-match-p "created d/new" said)))))
+
+(ert-deftest jsonyter-test-remote-dired-mkdir-refuses-blank-name ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer))
+    (should-error (jsonyter-remote-dired-mkdir "") :type 'user-error)))
+
+(ert-deftest jsonyter-test-remote-dired-export-via-interactive ()
+  "Supplements the direct-call tests above: exercised via
+`call-interactively' so its own body — not just its behavior — registers
+as covered too."
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "analysis.ipynb"
+                                              (vector " " "analysis.ipynb" "10 B" ""))))
+    (puthash "analysis.ipynb" '(:name "analysis.ipynb" :type "file" :path "analysis.ipynb")
+             jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                 (lambda () (cons (current-buffer) nil)))
+                ((symbol-function 'jsonyter--list-export-formats)
+                 (lambda (&rest _) (list :available t :formats '(:html (:output_mimetype "text/html")))))
+                ((symbol-function 'completing-read) (lambda (&rest _) "html"))
+                ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/analysis.html"))
+                ((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (call-interactively 'jsonyter-remote-dired-export))
+      (should (equal (plist-get sent :format) "html"))
+      (should (equal (plist-get sent :server_path) "analysis.ipynb")))))
+
+;;;; dired integration
+
+(ert-deftest jsonyter-test-dired-upload-marked-uploads-each-file-in-turn ()
+  (require 'dired)
+  (let* ((dir (file-name-as-directory (make-temp-file "jsonyter-dired-" t)))
+         (f1 (expand-file-name "a.csv" dir))
+         (f2 (expand-file-name "b.csv" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file f1 (insert "a"))
+          (with-temp-file f2 (insert "b"))
+          (let ((dired-buf (dired-noselect dir)))
+            (unwind-protect
+                (with-current-buffer dired-buf
+                  (dired-mark-files-regexp "\\.csv\\'")
+                  (let (uploaded said)
+                    (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                               (lambda () (cons (current-buffer) nil)))
+                              ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "d/"))
+                              ((symbol-function 'jsonyter--transfer-run)
+                               (lambda (_context _method params on-success)
+                                 (push (plist-get params :remote_path) uploaded)
+                                 (funcall on-success nil)))
+                              ((symbol-function 'message)
+                               (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+                      (jsonyter-dired-upload-marked)
+                      (should (= 2 (length uploaded)))
+                      (should (member "d/a.csv" uploaded))
+                      (should (member "d/b.csv" uploaded))
+                      (should (string-match-p "uploaded 2 of 2" said)))))
+              (kill-buffer dired-buf))))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-dired-upload-marked-errors-without-marked-files ()
+  (require 'dired)
+  (let ((dir (file-name-as-directory (make-temp-file "jsonyter-dired-" t))))
+    (unwind-protect
+        (let ((dired-buf (dired-noselect dir)))
+          (unwind-protect
+              (with-current-buffer dired-buf
+                (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                           (lambda () (cons (current-buffer) nil)))
+                          ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "d/")))
+                  (should-error (jsonyter-dired-upload-marked) :type 'user-error)))
+            (kill-buffer dired-buf)))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-dired-upload-marked-refuses-outside-dired ()
+  (with-temp-buffer
+    (should-error (jsonyter-dired-upload-marked) :type 'user-error)))
+
+(ert-deftest jsonyter-test-dired-upload-dwim-dispatches-on-marks ()
+  (require 'dired)
+  (let* ((dir (file-name-as-directory (make-temp-file "jsonyter-dired-" t)))
+         (f1 (expand-file-name "a.csv" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file f1 (insert "a"))
+          (let ((dired-buf (dired-noselect dir)))
+            (unwind-protect
+                (with-current-buffer dired-buf
+                  (let (dispatched)
+                    (cl-letf (((symbol-function 'call-interactively)
+                               (lambda (cmd &rest _) (setq dispatched cmd))))
+                      (jsonyter-dired-upload-dwim))
+                    (should (eq dispatched 'jsonyter-upload-file)))
+                  (goto-char (point-min))
+                  (dired-mark-files-regexp "\\.csv\\'")
+                  (let (dispatched)
+                    (cl-letf (((symbol-function 'call-interactively)
+                               (lambda (cmd &rest _) (setq dispatched cmd))))
+                      (jsonyter-dired-upload-dwim))
+                    (should (eq dispatched 'jsonyter-dired-upload-marked))))
+              (kill-buffer dired-buf))))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-dired-setup-binds-upload-key ()
+  (require 'dired)
+  (jsonyter-dired-setup)
+  (should (eq (lookup-key dired-mode-map (kbd "C-c C-u")) #'jsonyter-dired-upload-dwim)))
+
+;;;; jsonyter-org-connect-kernel
+
+(ert-deftest jsonyter-test-org-connect-kernel-attaches-block-session ()
+  (let ((jsonyter-org-markdown-converter (lambda (text _dir) text)))
+    (jsonyter-tests--with-org-file
+        "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+      (goto-char (point-min))
+      (search-forward "x = 1")
+      (let (connected-id connected-session)
+        (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                  ((symbol-function 'jsonyter--read-kernel) (lambda (&rest _) "kid"))
+                  ((symbol-function 'jsonyter-kernel-connect)
+                   (lambda (id session) (setq connected-id id connected-session session) id)))
+          (call-interactively 'jsonyter-org-connect-kernel))
+        (should (equal "kid" connected-id))
+        (should (equal (jsonyter--session-key connected-session) '("python" . "main")))))))
+
+;;;; Running an Org jy: block against its kernel
+
+(ert-deftest jsonyter-test-org-run-block-executes-and-renders-output ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main")))
+          handlers)
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--send)
+                 (lambda (_method _params hs) (setq handlers hs) 1)))
+        (jsonyter-org-run-block))
+      (should (jsonyter--session-busy session))
+      (funcall (plist-get handlers :output) (jsonyter-tests--stream "hi\n"))
+      (funcall (plist-get handlers :result) (list :result (list :status "ok")))
+      (should-not (jsonyter--session-busy session))
+      (let ((ov (jsonyter--org-cell-at)))
+        (should (string-match-p "hi" (overlay-get ov 'jsonyter-output-string)))))))
+
+(ert-deftest jsonyter-test-org-run-block-refuses-when-busy ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (setf (jsonyter--session-kernel-id session) "kid"
+            (jsonyter--session-busy session) t)
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session)))
+        (should-error (jsonyter-org-run-block) :type 'user-error)))))
+
+(ert-deftest jsonyter-test-org-run-block-reports-empty-block ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\n\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "begin_src")
+    (let ((session (jsonyter--session-put '("python" . "main")))
+          said)
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--send) (lambda (&rest _) (error "must not run")))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-org-run-block))
+      (should (string-match-p "empty block" said)))))
+
+(ert-deftest jsonyter-test-org-run-block-and-advance-moves-to-next-block ()
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main")))
+          (start (point)))
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--send) (lambda (&rest _) 1)))
+        (jsonyter-org-run-block-and-advance))
+      (should (> (point) start))
+      (should (jsonyter--org-in-jy-block-p)))))
+
+(ert-deftest jsonyter-test-org-run-buffer-runs-each-jy-block ()
+  "`jsonyter-org-run-buffer' runs each block `jsonyter--org-goto-next-jy-block'
+finds, in turn, and reports how many it ran.
+
+`jsonyter--org-goto-next-jy-block' itself is stubbed to hand back a
+position once, then nil: Org's real navigation relies on its element
+cache, which in batch Emacs (no idle time ever passes to drain its sync
+queue) can leave a second, independent traversal of the same buffer
+unable to find a block it would find interactively -- `jsonyter-org-mode'
+enabling itself already ran one such traversal to frame stale committed
+results, so even a single-block buffer hits this by the time a test body
+runs. That is a quirk of Org in batch mode, not of `jsonyter-org-run-buffer',
+and orthogonal to what this test is actually about: the loop, the count
+and the report, not Org's own block-finding."
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((count 0) (session (jsonyter--session-put '("python" . "main")))
+          (positions (list (point-max) nil))
+          said)
+      (cl-letf (((symbol-function 'jsonyter--org-goto-next-jy-block) (lambda () (pop positions)))
+                ((symbol-function 'jsonyter-org-run-block) (lambda (&rest _) (cl-incf count)))
+                ((symbol-function 'jsonyter--org-session-at-point) (lambda (&rest _) session))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-org-run-buffer))
+      (should (= 1 count))
+      (should (string-match-p "ran 1 jy: block" said)))))
+
+;;;; Org kernel documentation
+
+(ert-deftest jsonyter-test-org-inspect-shows-documentation ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nlen([1, 2])\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "len")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-session-at-point) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--kernel-request)
+                 (lambda (&rest _) (list :found t :data (list :text/plain "len(obj) -> int")))))
+        (jsonyter-org-inspect))
+      (let ((buf (get-buffer "*jsonyter-doc*")))
+        (should buf)
+        (with-current-buffer buf
+          (should (string-match-p "len(obj)" (buffer-string))))
+        (kill-buffer buf)))))
+
+(ert-deftest jsonyter-test-org-inspect-errors-without-live-kernel ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nlen([1, 2])\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "len")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (cl-letf (((symbol-function 'jsonyter--org-session-at-point) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+        (should-error (jsonyter-org-inspect) :type 'user-error)))))
+
+;;;; Committing and clearing overlay output across a whole buffer
+
+(ert-deftest jsonyter-test-org-commit-buffer-commits-every-shown-block ()
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (pcase-let* ((`(,code1 . ,anchor1) (jsonyter--org-block-region))
+                 (ov1 (jsonyter--org-cell-overlay anchor1 t)))
+      (overlay-put ov1 'jsonyter-source-hash (jsonyter--source-hash code1))
+      (overlay-put ov1 'jsonyter-output-string "x")
+      (overlay-put ov1 'jsonyter-raw-outputs (list (jsonyter-tests--stream "one\n"))))
+    (goto-char (point-min))
+    (search-forward "x + 1")
+    (pcase-let* ((`(,code2 . ,anchor2) (jsonyter--org-block-region))
+                 (ov2 (jsonyter--org-cell-overlay anchor2 t)))
+      (overlay-put ov2 'jsonyter-source-hash (jsonyter--source-hash code2))
+      (overlay-put ov2 'jsonyter-output-string "x")
+      (overlay-put ov2 'jsonyter-raw-outputs (list (jsonyter-tests--stream "two\n"))))
+    (let (said)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-org-commit-buffer))
+      (should (string-match-p "committed 2 block" said)))
+    (let ((text (buffer-string)))
+      (should (string-match-p "^: one$" text))
+      (should (string-match-p "^: two$" text)))
+    (should (null jsonyter--org-cells))))
+
+(ert-deftest jsonyter-test-org-clear-block-output-removes-overlay ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (pcase-let* ((`(,_code . ,anchor) (jsonyter--org-block-region)))
+      (jsonyter--org-cell-overlay anchor t))
+    (should (jsonyter--org-cell-at))
+    (jsonyter-org-clear-block-output)
+    (should (null (jsonyter--org-cell-at)))))
+
+(ert-deftest jsonyter-test-org-clear-block-output-errors-without-output ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (should-error (jsonyter-org-clear-block-output) :type 'user-error)))
+
+(ert-deftest jsonyter-test-org-clear-all-output-clears-every-overlay ()
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+begin_src python :session jy:main\nx + 1\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (pcase-let* ((`(,_c1 . ,a1) (jsonyter--org-block-region))) (jsonyter--org-cell-overlay a1 t))
+    (goto-char (point-min))
+    (search-forward "x + 1")
+    (pcase-let* ((`(,_c2 . ,a2) (jsonyter--org-block-region))) (jsonyter--org-cell-overlay a2 t))
+    (should (= 2 (length jsonyter--org-cells)))
+    (jsonyter-org-clear-all-output)
+    (should (null jsonyter--org-cells))))
+
+;;;; jsonyter--export-run (the real body, not mocked)
+
+(ert-deftest jsonyter-test-export-run-reports-success ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          handlers said)
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter--export-run session (list :format "html") #'ignore))
+      (should (jsonyter--session-transfer session))
+      (should (string-match-p "exporting to html" said))
+      (funcall (plist-get handlers :result) (list :result (list :path "/tmp/a.html")))
+      (should (null (jsonyter--session-transfer session))))))
+
+(ert-deftest jsonyter-test-export-run-calls-on-success-with-result ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          handlers got)
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1))
+                ((symbol-function 'message) #'ignore))
+        (jsonyter--export-run session (list :format "html")
+                              (lambda (result) (setq got result))))
+      (funcall (plist-get handlers :result) (list :result (list :path "/tmp/a.html")))
+      (should (equal "/tmp/a.html" (plist-get got :path))))))
+
+(ert-deftest jsonyter-test-export-run-reports-failure ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          handlers said)
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter--export-run session (list :format "pdf") #'ignore)
+        (funcall (plist-get handlers :result) (list :error (list :error "ExportError" :message "boom"))))
+      (should (string-match-p "export to pdf failed" said))
+      (should (null (jsonyter--session-transfer session))))))
+
+(ert-deftest jsonyter-test-export-run-clears-tag-on-synchronous-signal ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (&rest _) (error "bridge is not running")))
+                ((symbol-function 'message) #'ignore))
+        (should-error (jsonyter--export-run session (list :format "html") #'ignore)))
+      (should (null (jsonyter--session-transfer session))))))
+
+(ert-deftest jsonyter-test-export-run-works-with-no-session ()
+  (with-temp-buffer
+    (let (handlers)
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1))
+                ((symbol-function 'message) #'ignore))
+        (jsonyter--export-run nil (list :format "html") (lambda (_r) nil)))
+      (funcall (plist-get handlers :result) (list :result (list :path "/tmp/a.html"))))))
+
+;;;; Coverage recovery: exercise already-tested commands via `call-interactively'
+;;
+;; Each command below has a complex `(interactive (FORM))' spec. Emacs's
+;; edebug/undercover coverage tracking only credits a command's own body
+;; when it runs through `call-interactively' (or a real interactive
+;; invocation) rather than a plain Lisp call. The behavioral tests above
+;; already call these commands directly and are the ones worth reading
+;; to understand what they do; these exist purely so the coverage
+;; instrumentation sees them exercised the way a user's `M-x' actually
+;; invokes them.
+
+(ert-deftest jsonyter-test-org-from-notebook-via-interactive ()
+  (let* ((jsonyter-org-markdown-converter (lambda (text _dir) text))
+         (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
+         (org (make-temp-file "jsonyter-test-" nil ".org")))
+    (unwind-protect
+        (progn
+          (jsonyter-tests--write-notebook ipynb)
+          (delete-file org)
+          (let ((calls 0))
+            (cl-letf (((symbol-function 'read-file-name)
+                       (lambda (&rest _) (cl-incf calls) (if (= calls 1) ipynb org))))
+              (call-interactively 'jsonyter-org-from-notebook)))
+          (should (get-file-buffer org))
+          (with-current-buffer (get-file-buffer org)
+            (should (string-match-p "x = 1" (buffer-string)))))
+      (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
+      (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-via-interactive ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((org-path buffer-file-name)
+          (ipynb (make-temp-file "jsonyter-test-" nil ".ipynb"))
+          sent)
+      (delete-file ipynb)
+      (unwind-protect
+          (let ((calls 0))
+            (cl-letf (((symbol-function 'read-file-name)
+                       (lambda (&rest _) (cl-incf calls) (if (= calls 1) org-path ipynb)))
+                      ((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                      ((symbol-function 'jsonyter--request-sync)
+                       (lambda (method params &rest _) (setq sent (list method params)))))
+              (call-interactively 'jsonyter-org-to-notebook)))
+        (when (file-exists-p ipynb) (delete-file ipynb)))
+      (should (equal (car sent) "write_notebook"))
+      (should (equal (plist-get (cadr sent) :path) (expand-file-name ipynb))))))
+
+(ert-deftest jsonyter-test-org-export-script-via-interactive ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out)
+            (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) out)))
+              (call-interactively 'jsonyter-org-export-script))
+            (should (file-exists-p out)))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-notebook-export-script-via-interactive ()
+  (jsonyter-tests--with-notebook
+    (let ((out (make-temp-file "jsonyter-script-export-" nil ".py")))
+      (unwind-protect
+          (progn
+            (delete-file out)
+            (cl-letf (((symbol-function 'read-file-name) (lambda (&rest _) out)))
+              (call-interactively 'jsonyter-notebook-export-script))
+            (should (file-exists-p out)))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-notebook-export-via-interactive-happy-path ()
+  (jsonyter-tests--with-notebook
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--list-export-formats)
+                 (lambda (&rest _) (list :available t :formats '(:html (:output_mimetype "text/html")))))
+                ((symbol-function 'completing-read) (lambda (&rest _) "html"))
+                ((symbol-function 'read-file-name) (lambda (&rest _) "/tmp/out.html"))
+                ((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (call-interactively 'jsonyter-notebook-export))
+      (should (equal (plist-get sent :format) "html"))
+      (should (equal (plist-get sent :to_path) "/tmp/out.html")))))
+
+(ert-deftest jsonyter-test-notebook-export-format-wrappers-delegate ()
+  "Each `jsonyter-notebook-export-FORMAT' wrapper fixes FORMAT and reads
+TO-PATH the same way the general command does."
+  (dolist (spec '((jsonyter-notebook-export-html . "html")
+                   (jsonyter-notebook-export-markdown . "markdown")
+                   (jsonyter-notebook-export-pdf . "pdf")
+                   (jsonyter-notebook-export-latex . "latex")
+                   (jsonyter-notebook-export-webpdf . "webpdf")
+                   (jsonyter-notebook-export-slides . "slides")))
+    (let ((fn (car spec)) (fmt (cdr spec)) sent)
+      (cl-letf (((symbol-function 'jsonyter-notebook-export)
+                 (lambda (format to-path) (setq sent (cons format to-path))))
+                ((symbol-function 'read-file-name) (lambda (&rest _) (concat "/tmp/out." fmt))))
+        (call-interactively fn))
+      (should (equal (car sent) fmt))
+      (should (equal (cdr sent) (concat "/tmp/out." fmt))))))
+
+(ert-deftest jsonyter-test-export-read-to-path-defaults-extension ()
+  (let ((buffer-file-name "/tmp/analysis.ipynb"))
+    (cl-letf (((symbol-function 'read-file-name)
+               (lambda (_prompt _dir default &rest _) default)))
+      (should (equal "/tmp/analysis.html" (jsonyter--export-read-to-path "html"))))))
+
+;;;; Token resolution and bridge command construction
+
+(ert-deftest jsonyter-test-token-prefers-function-then-string ()
+  (let ((jsonyter-server-token (lambda () "func-token"))
+        (jsonyter-server-token-file nil))
+    (should (equal "func-token" (jsonyter--token))))
+  (let ((jsonyter-server-token "str-token")
+        (jsonyter-server-token-file nil))
+    (should (equal "str-token" (jsonyter--token))))
+  (let ((jsonyter-server-token "")
+        (jsonyter-server-token-file nil))
+    (should (null (jsonyter--token)))))
+
+(ert-deftest jsonyter-test-token-reads-from-file ()
+  (let ((file (make-temp-file "jsonyter-token-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "  file-token  \n"))
+          (let ((jsonyter-server-token nil)
+                (jsonyter-server-token-file file))
+            (should (equal "file-token" (jsonyter--token)))))
+      (delete-file file))))
+
+(ert-deftest jsonyter-test-token-errors-on-missing-file ()
+  (let ((jsonyter-server-token nil)
+        (jsonyter-server-token-file "/no/such/token/file/anywhere"))
+    (should-error (jsonyter--token))))
+
+(ert-deftest jsonyter-test-build-command-argv-transport ()
+  (let ((jsonyter-command '("jsonyter"))
+        (jsonyter-server-url "http://localhost:8888")
+        (jsonyter-token-transport 'argv)
+        (jsonyter-exec-timeout nil)
+        (jsonyter-insecure-tls nil))
+    (should (equal '("jsonyter" "--url" "http://localhost:8888" "--token" "tok")
+                   (jsonyter--build-command "tok")))))
+
+(ert-deftest jsonyter-test-build-command-stdin-transport ()
+  (let ((jsonyter-command '("jsonyter"))
+        (jsonyter-token-transport 'stdin))
+    (should (member "--token-file" (jsonyter--build-command "tok")))
+    (should (member "-" (jsonyter--build-command "tok")))))
+
+(ert-deftest jsonyter-test-build-command-file-transport ()
+  (let ((jsonyter-command '("jsonyter"))
+        (jsonyter-token-transport 'file)
+        (jsonyter-server-token-file "/tmp/tok.txt"))
+    (should (member "--token-file" (jsonyter--build-command nil)))
+    (should (member (expand-file-name "/tmp/tok.txt") (jsonyter--build-command nil)))))
+
+(ert-deftest jsonyter-test-build-command-env-transport-omits-token ()
+  (let ((jsonyter-command '("jsonyter"))
+        (jsonyter-token-transport 'env))
+    (should-not (member "--token" (jsonyter--build-command "tok")))))
+
+(ert-deftest jsonyter-test-build-command-includes-timeout-and-insecure ()
+  (let ((jsonyter-command '("jsonyter"))
+        (jsonyter-token-transport 'env)
+        (jsonyter-exec-timeout 30)
+        (jsonyter-insecure-tls t))
+    (let ((cmd (jsonyter--build-command nil)))
+      (should (member "--exec-timeout" cmd))
+      (should (member "30" cmd))
+      (should (member "--insecure" cmd)))))
+
+(ert-deftest jsonyter-test-start-bridge-refuses-encrypted-file-with-file-transport ()
+  (with-temp-buffer
+    (let ((jsonyter-token-transport 'file)
+          (jsonyter-server-token-file "/tmp/secret.gpg"))
+      (should-error (jsonyter--start-bridge) :type 'user-error))))
+
+(ert-deftest jsonyter-test-start-bridge-reports-missing-executable ()
+  (with-temp-buffer
+    (let ((jsonyter-command '("jsonyter-definitely-not-a-real-binary-xyz")))
+      (should-error (jsonyter--start-bridge) :type 'user-error))))
+
+(ert-deftest jsonyter-test-start-bridge-starts-a-real-process ()
+  (with-temp-buffer
+    (let ((jsonyter-command '("cat"))
+          (jsonyter-server-url "http://localhost:8888")
+          (jsonyter-token-transport 'stdin)
+          (jsonyter-server-token "tok"))
+      (let ((proc (jsonyter--start-bridge)))
+        (unwind-protect
+            (progn
+              (should (process-live-p proc))
+              (should (equal jsonyter--command
+                             '("cat" "--url" "http://localhost:8888" "--token-file" "-")))
+              (should (buffer-live-p (process-get proc 'jsonyter-stderr-buffer))))
+          (jsonyter--kill-process))))))
+
+;;;; Session/command resolution in Org buffers
+
+(ert-deftest jsonyter-test-command-session-resolves-via-org-block-at-point ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (should (eq (jsonyter--command-session) session)))))
+
+(ert-deftest jsonyter-test-attach-target-uses-org-session-at-point ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (should (eq (jsonyter--attach-target) session)))))
+
+(ert-deftest jsonyter-test-attach-target-registers-new-org-session-with-no-kernel ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--attach-target)))
+      (should (equal (jsonyter--session-key session) '("python" . "main"))))))
+
+(ert-deftest jsonyter-test-current-session-and-busy-in-org-buffer ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (should (null (jsonyter-current-session)))
+    (should (null (jsonyter-current-session-name)))
+    (should (null (jsonyter-current-kernel-busy-p)))
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (setf (jsonyter--session-busy session) t)
+      (should (eq (jsonyter-current-session) session))
+      (should (equal "main" (jsonyter-current-session-name)))
+      (should (jsonyter-current-kernel-busy-p)))))
+
+(ert-deftest jsonyter-test-org-connect-attaches-via-at-kernel-id-name ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:@abc123\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((key '("python" . "@abc123"))
+          connected)
+      (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                ((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter-kernel-connect)
+                 (lambda (id session) (setq connected (cons id session)) id)))
+        (jsonyter--org-connect key))
+      (should (equal (car connected) "abc123")))))
+
+(ert-deftest jsonyter-test-org-connect-already-live-skips-reconnect ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:@abc123\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((key '("python" . "@abc123")))
+      (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                ((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter-kernel-connect)
+                 (lambda (&rest _) (error "must not reconnect when already live"))))
+        (jsonyter--org-connect key)))))
+
+(ert-deftest jsonyter-test-org-ensure-session-at-point-no-kernel-just-registers ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--org-ensure-session-at-point 'no-kernel)))
+      (should (equal (jsonyter--session-key session) '("python" . "main"))))))
+
+(ert-deftest jsonyter-test-org-ensure-session-at-point-errors-without-jy-session ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (should-error (jsonyter--org-ensure-session-at-point) :type 'user-error)))
+
+(ert-deftest jsonyter-test-org-kernel-control-wrappers-delegate-to-block-session ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (let (target)
+        (cl-letf (((symbol-function 'jsonyter-interrupt) (lambda (s) (setq target s))))
+          (jsonyter-org-interrupt))
+        (should (eq target session)))
+      (let (target)
+        (cl-letf (((symbol-function 'jsonyter-restart) (lambda (s) (setq target s))))
+          (jsonyter-org-restart))
+        (should (eq target session))))))
+
+(ert-deftest jsonyter-test-org-reconnect-uses-last-kernel ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (setf (jsonyter--session-last-kernel session) (list :id "old-kid"))
+      (let (connected)
+        (cl-letf (((symbol-function 'jsonyter-kernel-connect)
+                   (lambda (id s) (setq connected (cons id s)))))
+          (jsonyter-org-reconnect))
+        (should (equal (car connected) "old-kid"))))))
+
+(ert-deftest jsonyter-test-org-reconnect-errors-with-no-kernel ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (jsonyter--session-put '("python" . "main"))
+    (should-error (jsonyter-org-reconnect) :type 'user-error)))
+
+(ert-deftest jsonyter-test-org-kernel-history-uses-block-session ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (let (kid)
+        (cl-letf (((symbol-function 'jsonyter-kernel-history) (lambda (_n k) (setq kid k))))
+          (jsonyter-org-kernel-history))
+        (should (equal kid "kid"))))))
+
+(ert-deftest jsonyter-test-org-previous-block-reports-when-none-found ()
+  "Kept to a buffer with no blocks at all -- see the commentary on
+`jsonyter-test-org-run-buffer-runs-each-jy-block' for why a *second*
+real Org src-block traversal is unreliable in batch Emacs."
+  (jsonyter-tests--with-org-file "plain text only, no blocks\n"
+    (let (said (start (point)))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-org-previous-block))
+      (should (= (point) start))
+      (should (string-match-p "no earlier jy: block" said)))))
+
+(ert-deftest jsonyter-test-org-fallthrough-runs-the-key-binding-with-mode-off ()
+  (with-temp-buffer
+    (let (ran mode-during-check)
+      (cl-letf (((symbol-function 'key-binding)
+                 (lambda (&rest _) (setq mode-during-check jsonyter-org-mode) 'some-command))
+                ((symbol-function 'commandp) (lambda (&rest _) t))
+                ((symbol-function 'call-interactively) (lambda (cmd) (setq ran cmd))))
+        (setq-local jsonyter-org-mode t)
+        (jsonyter--org-fallthrough))
+      (should (eq ran 'some-command))
+      (should-not mode-during-check))))
+
+(ert-deftest jsonyter-test-org-fallthrough-dings-when-no-command ()
+  (with-temp-buffer
+    (let (dinged)
+      (cl-letf (((symbol-function 'key-binding) (lambda (&rest _) nil))
+                ((symbol-function 'commandp) (lambda (&rest _) nil))
+                ((symbol-function 'ding) (lambda (&rest _) (setq dinged t))))
+        (jsonyter--org-fallthrough))
+      (should dinged))))
+
+;;;; jsonyter--remote-root-for
+
+(ert-deftest jsonyter-test-remote-root-for-resolves-alist-string-or-nil ()
+  (let ((jsonyter-remote-root '(("http://a" . "/root/a") ("http://b" . "/root/b"))))
+    (should (equal "/root/b" (jsonyter--remote-root-for "http://b"))))
+  (let ((jsonyter-remote-root "/plain/root"))
+    (should (equal "/plain/root" (jsonyter--remote-root-for "anything"))))
+  (let ((jsonyter-remote-root nil))
+    (should (null (jsonyter--remote-root-for "anything")))))
+
+;;;; Live-REPL commands (send/inspect/navigation)
+
+(defmacro jsonyter-tests--with-live-repl (&rest body)
+  "Run BODY in a `jsonyter-repl-mode' buffer with a prompt already drawn.
+`jsonyter--live-p' and friends still need mocking per test: this only
+sets up the buffer/session shape, not a real process."
+  (declare (indent 0) (debug t))
+  `(with-temp-buffer
+     (jsonyter-repl-mode)
+     (setq-local jsonyter--session-key '("python" . ""))
+     (let ((session (jsonyter--session-put jsonyter--session-key)))
+       (setf (jsonyter--session-kernel-id session) "kid")
+       (jsonyter--insert-prompt)
+       ,@body)))
+
+(ert-deftest jsonyter-test-repl-send-executes-unconditionally ()
+  (jsonyter-tests--with-live-repl
+    (insert "print(1)")
+    (let (executed)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter--execute) (lambda (code) (setq executed code))))
+        (jsonyter-repl-send))
+      (should (equal "print(1)" executed)))))
+
+(ert-deftest jsonyter-test-repl-send-errors-without-live-kernel ()
+  (jsonyter-tests--with-live-repl
+    (insert "print(1)")
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+      (should-error (jsonyter-repl-send) :type 'user-error))))
+
+(ert-deftest jsonyter-test-repl-send-reports-busy-kernel ()
+  (jsonyter-tests--with-live-repl
+    (insert "print(1)")
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) t))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-repl-send))
+      (should (string-match-p "kernel is busy" said)))))
+
+(ert-deftest jsonyter-test-repl-send-reports-nothing-to-send-on-blank ()
+  (jsonyter-tests--with-live-repl
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-repl-send))
+      (should (string-match-p "nothing to send" said)))))
+
+(ert-deftest jsonyter-test-repl-inspect-shows-documentation ()
+  (jsonyter-tests--with-live-repl
+    (insert "len")
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+              ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil))
+              ((symbol-function 'jsonyter--kernel-request)
+               (lambda (&rest _) (list :found t :data (list :text/plain "len(x)")))))
+      (jsonyter-repl-inspect))
+    (let ((buf (get-buffer "*jsonyter-doc*")))
+      (should buf)
+      (with-current-buffer buf (should (string-match-p "len(x)" (buffer-string))))
+      (kill-buffer buf))))
+
+(ert-deftest jsonyter-test-repl-inspect-errors-without-live-kernel ()
+  (jsonyter-tests--with-live-repl
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+      (should-error (jsonyter-repl-inspect) :type 'user-error))))
+
+(ert-deftest jsonyter-test-repl-inspect-errors-when-busy ()
+  (jsonyter-tests--with-live-repl
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+              ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) t)))
+      (should-error (jsonyter-repl-inspect) :type 'user-error))))
+
+(ert-deftest jsonyter-test-repl-inspect-reports-nothing-found ()
+  (jsonyter-tests--with-live-repl
+    (insert "xyz")
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter--kernel-request) (lambda (&rest _) (list :found :json-false)))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-repl-inspect))
+      (should (string-match-p "no documentation found" said)))))
+
+(ert-deftest jsonyter-test-repl-beginning-of-line-goes-to-input-start ()
+  (jsonyter-tests--with-live-repl
+    (insert "abc")
+    (jsonyter-repl-beginning-of-line)
+    (should (= (point) jsonyter--input-start))))
+
+(ert-deftest jsonyter-test-repl-beginning-of-line-falls-back-off-prompt-line ()
+  (jsonyter-tests--with-live-repl
+    (insert "line one\nline two")
+    (goto-char (point-max))
+    (jsonyter-repl-beginning-of-line)
+    (should (looking-at-p "line two"))))
+
+(ert-deftest jsonyter-test-repl-newline-inserts-at-input-start ()
+  (jsonyter-tests--with-live-repl
+    (jsonyter-repl-newline)
+    (should (equal "\n" (jsonyter--current-input)))))
+
+(ert-deftest jsonyter-test-clear-cell-output-deletes-running-region ()
+  (jsonyter-tests--with-live-repl
+    (goto-char (point-max))
+    (set-marker jsonyter--output-start (point))
+    (insert "some output")
+    (set-marker jsonyter--output-end (point-max))
+    (jsonyter--clear-cell-output)
+    (should (= (marker-position jsonyter--output-start) (point-max)))))
+
+;;;; Small standalone helpers
+
+(ert-deftest jsonyter-test-insert-html-renders-with-shr ()
+  (with-temp-buffer
+    (jsonyter--insert-html "<b>hi</b>")
+    (should (string-match-p "hi" (buffer-string)))))
+
+(ert-deftest jsonyter-test-clear-dispatches-per-buffer-kind ()
+  (jsonyter-tests--with-notebook
+    (let (called)
+      (cl-letf (((symbol-function 'jsonyter-notebook-clear-all-output) (lambda () (setq called 'notebook))))
+        (jsonyter-clear))
+      (should (eq called 'notebook))))
+  (with-temp-buffer
+    (jsonyter-repl-mode)
+    (let (called)
+      (cl-letf (((symbol-function 'jsonyter-repl-clear) (lambda () (setq called 'repl))))
+        (jsonyter-clear))
+      (should (eq called 'repl))))
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (let (called)
+      (cl-letf (((symbol-function 'jsonyter-script-clear-all-output) (lambda () (setq called 'script))))
+        (jsonyter-clear))
+      (should (eq called 'script))))
+  (with-temp-buffer
+    (should-error (jsonyter-clear) :type 'user-error)))
+
+(ert-deftest jsonyter-test-save-buffer-dispatches-notebook-vs-plain ()
+  (jsonyter-tests--with-notebook
+    (let (called)
+      (cl-letf (((symbol-function 'jsonyter-notebook-save-buffer) (lambda () (setq called t))))
+        (jsonyter-save-buffer))
+      (should called)))
+  (with-temp-buffer
+    (let (called)
+      (cl-letf (((symbol-function 'save-buffer) (lambda (&rest _) (setq called t))))
+        (jsonyter-save-buffer))
+      (should called))))
+
+(ert-deftest jsonyter-test-notebook-clear-cell-output-clears-and-marks-touched ()
+  (jsonyter-tests--with-notebook
+    (let ((cell (jsonyter-tests--cell 0)))
+      (jsonyter--nb-set-output cell "results\n" nil t)
+      (goto-char (overlay-start cell))
+      (jsonyter-notebook-clear-cell-output)
+      (should (equal "" (jsonyter-tests--output-text cell))))))
+
+(ert-deftest jsonyter-test-notebook-clear-cell-output-errors-without-cell ()
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--nb-cell-at) (lambda (&rest _) nil)))
+      (should-error (jsonyter-notebook-clear-cell-output) :type 'user-error))))
+
+(ert-deftest jsonyter-test-notebook-run-all-runs-every-code-cell ()
+  (jsonyter-tests--with-notebook
+    (let (run-order)
+      (cl-letf (((symbol-function 'jsonyter--nb-ensure-kernel) #'ignore)
+                ((symbol-function 'jsonyter-notebook-run-cell)
+                 (lambda (&rest _) (push (jsonyter--nb-cell-source (jsonyter--nb-cell-at)) run-order)))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil)))
+        (jsonyter-notebook-run-all))
+      (should (equal (nreverse run-order) '("x = 1" "print(x)"))))))
+
+(ert-deftest jsonyter-test-nb-ensure-kernel-starts-when-allowed ()
+  (jsonyter-tests--with-notebook
+    (let (started)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter-notebook-start-kernel) (lambda () (setq started t))))
+        (jsonyter--nb-ensure-kernel))
+      (should started))))
+
+(ert-deftest jsonyter-test-nb-ensure-kernel-errors-when-auto-start-disabled ()
+  (jsonyter-tests--with-notebook
+    (let ((jsonyter-notebook-auto-start-kernel nil))
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+        (should-error (jsonyter--nb-ensure-kernel) :type 'user-error)))))
+
+(ert-deftest jsonyter-test-nb-ensure-kernel-noop-when-already-live ()
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+              ((symbol-function 'jsonyter-notebook-start-kernel)
+               (lambda () (error "must not start a new kernel"))))
+      (jsonyter--nb-ensure-kernel))))
+
+(ert-deftest jsonyter-test-notebook-new-via-interactive ()
+  (let ((path (make-temp-file "jsonyter-new-" nil ".ipynb"))
+        buf)
+    (delete-file path)
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "python"))
+                    ((symbol-function 'read-file-name) (lambda (&rest _) path)))
+            (setq buf (call-interactively 'jsonyter-notebook-new)))
+          (should (file-exists-p path))
+          (should (buffer-live-p buf)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf (set-buffer-modified-p nil))
+        (kill-buffer buf))
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-and-advance-delegates ()
+  (jsonyter-tests--with-notebook
+    (let (advanced)
+      (cl-letf (((symbol-function 'jsonyter-notebook-run-cell) (lambda (&optional adv) (setq advanced adv))))
+        (jsonyter-notebook-run-cell-and-advance))
+      (should advanced))))
+
+(ert-deftest jsonyter-test-resume-download-delegates-to-resume-transfer ()
+  (let (which)
+    (cl-letf (((symbol-function 'jsonyter--resume-transfer) (lambda (m) (setq which m))))
+      (jsonyter-resume-download))
+    (should (equal "download" which))))
+
+(ert-deftest jsonyter-test-script-run-cell-and-advance-delegates ()
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (let (advanced)
+      (cl-letf (((symbol-function 'jsonyter-script-run-cell) (lambda (&optional adv) (setq advanced adv))))
+        (jsonyter-script-run-cell-and-advance))
+      (should advanced))))
+
+;;;; Script cells: staleness, clearing, language/spec resolution
+
+(ert-deftest jsonyter-test-script-stale-after-change-flags-touched-cell ()
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (buffer-enable-undo)
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (forward-line 1)
+    (pcase-let* ((`(,start . ,end) (jsonyter--script-cell-bounds))
+                 (ov (jsonyter--script-output-overlay start end)))
+      (overlay-put ov 'jsonyter-source-hash (jsonyter--source-hash "x = 1"))
+      (overlay-put ov 'jsonyter-output-string "1\n")
+      (should-not (overlay-get ov 'jsonyter-output-stale))
+      (goto-char (line-end-position))
+      (insert " + 9")
+      (should (overlay-get ov 'jsonyter-output-stale)))))
+
+(ert-deftest jsonyter-test-script-clear-all-output-removes-every-overlay ()
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (insert "# %%\nx = 1\n# %%\nx + 1\n")
+    (goto-char (point-min))
+    (forward-line 1)
+    (pcase-let* ((`(,s1 . ,e1) (jsonyter--script-cell-bounds))) (jsonyter--script-output-overlay s1 e1))
+    (goto-char (point-max))
+    (pcase-let* ((`(,s2 . ,e2) (jsonyter--script-cell-bounds))) (jsonyter--script-output-overlay s2 e2))
+    (should (= 2 (length jsonyter--script-cells)))
+    (jsonyter-script-clear-all-output)
+    (should (null jsonyter--script-cells))))
+
+(ert-deftest jsonyter-test-script-export-spec-falls-back-to-metadata-extension ()
+  (let ((spec (jsonyter--script-export-spec "haskell" (list :language_info (list :file_extension ".hs")))))
+    (should (equal ".hs" (plist-get spec :extension)))
+    (should (equal "# %%" (plist-get spec :divider)))))
+
+(ert-deftest jsonyter-test-script-export-spec-generic-fallback-with-no-metadata ()
+  (let ((spec (jsonyter--script-export-spec "haskell" nil)))
+    (should (equal ".txt" (plist-get spec :extension)))))
+
+(ert-deftest jsonyter-test-script-language-errors-for-unknown-mode ()
+  (with-temp-buffer
+    (fundamental-mode)
+    (should-error (jsonyter--script-language) :type 'user-error)))
+
+(ert-deftest jsonyter-test-script-cell-output-overlay-nil-without-one ()
+  (with-temp-buffer
+    (insert "hi\n")
+    (should (null (jsonyter--script-cell-output-overlay (point-max))))))
+
+;;;; jsonyter--nb-output-to-spec (kernel-shape -> nbformat-shape)
+
+(ert-deftest jsonyter-test-nb-output-to-spec-covers-every-output-type ()
+  (should (equal (list :output_type "stream" :name "stdout" :text "hi\n")
+                 (jsonyter--nb-output-to-spec (list :type "stream" :text "hi\n"))))
+  (should (equal (list :output_type "stream" :name "stderr" :text "oops\n")
+                 (jsonyter--nb-output-to-spec (list :type "stream" :name "stderr" :text "oops\n"))))
+  (let ((spec (jsonyter--nb-output-to-spec
+               (list :type "execute_result" :execution_count 3
+                     :data (list :text/plain "42") :metadata nil))))
+    (should (equal "execute_result" (plist-get spec :output_type)))
+    (should (equal 3 (plist-get spec :execution_count))))
+  (let ((spec (jsonyter--nb-output-to-spec (list :type "update_display_data" :data (list :text/plain "x")))))
+    (should (equal "display_data" (plist-get spec :output_type)))
+    (should-not (plist-member spec :execution_count)))
+  (let ((spec (jsonyter--nb-output-to-spec
+               (list :type "error" :ename "ValueError" :evalue "bad" :traceback '("l1" "l2")))))
+    (should (equal "error" (plist-get spec :output_type)))
+    (should (equal ["l1" "l2"] (plist-get spec :traceback))))
+  (let ((spec (jsonyter--nb-output-to-spec (list :type "something_unknown"))))
+    (should (equal "stream" (plist-get spec :output_type)))
+    (should (string-match-p "unrecognized output type" (plist-get spec :text)))))
+
+;;;; jsonyter--render-output (the REPL/notebook rendering pipeline)
+
+(ert-deftest jsonyter-test-render-output-covers-every-output-type ()
+  (with-temp-buffer
+    (setq-local jsonyter--clear-pending nil)
+    (jsonyter--render-output (jsonyter-tests--stream "hi\n"))
+    (should (string-match-p "hi" (buffer-string))))
+  (with-temp-buffer
+    (jsonyter--render-output (list :type "execute_result" :execution_count 3
+                                   :data (list :text/plain "42")))
+    (should (string-match-p "Out\\[3\\]: " (buffer-string)))
+    (should (string-match-p "42" (buffer-string))))
+  (with-temp-buffer
+    (jsonyter--render-output (list :type "display_data" :data (list :text/plain "a figure")))
+    (should (string-match-p "a figure" (buffer-string))))
+  (with-temp-buffer
+    (jsonyter--render-output (list :type "error" :traceback '("line1" "line2")))
+    (should (string-match-p "line1" (buffer-string)))
+    (should (string-match-p "line2" (buffer-string))))
+  (with-temp-buffer
+    (setq-local jsonyter--output-start (make-marker))
+    (setq-local jsonyter--output-end (make-marker))
+    (insert "leftover")
+    (set-marker jsonyter--output-start (point-min))
+    (set-marker jsonyter--output-end (point-max))
+    (jsonyter--render-output (list :type "clear_output" :wait nil))
+    (should (equal "" (buffer-string))))
+  (with-temp-buffer
+    (setq-local jsonyter--clear-pending nil)
+    (jsonyter--render-output (list :type "clear_output" :wait t))
+    (should jsonyter--clear-pending))
+  (with-temp-buffer
+    (setq-local jsonyter--output-start (make-marker))
+    (setq-local jsonyter--output-end (make-marker))
+    (setq-local jsonyter--clear-pending t)
+    (insert "leftover")
+    (set-marker jsonyter--output-start (point-min))
+    (set-marker jsonyter--output-end (point-max))
+    (jsonyter--render-output (jsonyter-tests--stream "fresh\n"))
+    (should-not jsonyter--clear-pending)
+    (should (string-match-p "fresh" (buffer-string)))
+    (should-not (string-match-p "leftover" (buffer-string)))))
+
+;;;; jsonyter--insert-mimebundle (richest-representation fallback)
+
+(ert-deftest jsonyter-test-insert-mimebundle-renders-html-then-plain-then-nothing ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+      (jsonyter--insert-mimebundle (list :text/html "<b>hi</b>"))
+      (should (string-match-p "hi" (buffer-string)))))
+  (with-temp-buffer
+    (let ((jsonyter-render-html nil))
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+        (jsonyter--insert-mimebundle (list :text/plain "plain text"))
+        (should (string-match-p "plain text" (buffer-string))))))
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+      (jsonyter--insert-mimebundle (list))
+      (should (string-match-p "unrenderable output" (buffer-string))))))
+
+(ert-deftest jsonyter-test-insert-mimebundle-falls-back-through-image-types ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (type) (memq type '(jpeg))))
+              ((symbol-function 'jsonyter--insert-encoded-image)
+               (lambda (_data type) (insert (format "[%s image]" type)))))
+      (jsonyter--insert-mimebundle (list :image/jpeg "irrelevant-base64"))
+      (should (string-match-p "\\[jpeg image\\]" (buffer-string)))))
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (type) (memq type '(svg))))
+              ((symbol-function 'create-image) (lambda (&rest _) 'fake-svg-image))
+              ((symbol-function 'jsonyter--insert-image) (lambda (_img alt) (insert alt))))
+      (jsonyter--insert-mimebundle (list :image/svg+xml "<svg></svg>"))
+      (should (string-match-p "\\[svg image\\]" (buffer-string))))))
+
+;;;; jsonyter--org-result-body / jsonyter--org-var-atom / jsonyter--org-file-base64
+
+(ert-deftest jsonyter-test-org-result-body-covers-image-and-error-types ()
+  (cl-letf (((symbol-function 'jsonyter--org-write-image) (lambda (_data ext) (format "plot.%s" ext))))
+    (should (equal "[[file:plot.png]]"
+                   (jsonyter--org-result-body
+                    (list (list :type "display_data" :data (list :image/png "pngdata"))))))
+    (should (equal "[[file:plot.jpg]]"
+                   (jsonyter--org-result-body
+                    (list (list :type "display_data" :data (list :image/jpeg "jpegdata"))))))
+    (should (equal "[[file:plot.svg]]"
+                   (jsonyter--org-result-body
+                    (list (list :type "display_data" :data (list :image/svg+xml "<svg/>")))))))
+  (should (equal ": boom" (jsonyter--org-result-body
+                           (list (list :type "error" :traceback '("boom")))))))
+
+(ert-deftest jsonyter-test-org-var-atom-covers-every-lisp-shape ()
+  (should (equal "None" (jsonyter--org-var-atom nil "None" "True")))
+  (should (equal "True" (jsonyter--org-var-atom t "None" "True")))
+  (should (equal "3" (jsonyter--org-var-atom 3 "None" "True")))
+  (should (string-match-p "\"hi\"" (jsonyter--org-var-atom "hi" "None" "True")))
+  (should (string-match-p "sym" (jsonyter--org-var-atom 'sym "None" "True"))))
+
+(ert-deftest jsonyter-test-org-file-base64-encodes-file-bytes ()
+  (let ((file (make-temp-file "jsonyter-b64-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file (set-buffer-multibyte nil) (insert "hi"))
+          (should (equal (base64-encode-string "hi") (jsonyter--org-file-base64 file))))
+      (delete-file file))))
+
+;;;; Org-babel language wrappers (advice + standalone)
+
+(ert-deftest jsonyter-test-org-babel-execute-language-wrappers-delegate ()
+  (dolist (spec '((jsonyter--org-babel-execute:python . "python")
+                   (jsonyter--org-babel-execute:R . "R")
+                   (jsonyter--org-babel-execute:julia . "julia")
+                   (jsonyter--org-babel-execute:SAS . "SAS")))
+    (let (seen)
+      (cl-letf (((symbol-function 'jsonyter--org-babel-dispatch)
+                 (lambda (lang orig-fun body params) (setq seen (list lang orig-fun body params)))))
+        (funcall (car spec) 'orig "body" '(:x 1)))
+      (should (equal (nth 0 seen) (cdr spec)))
+      (should (eq (nth 1 seen) 'orig))))
+  (dolist (spec '((jsonyter--org-babel-standalone:python . "python")
+                   (jsonyter--org-babel-standalone:R . "R")
+                   (jsonyter--org-babel-standalone:julia . "julia")
+                   (jsonyter--org-babel-standalone:SAS . "SAS")))
+    (let (seen)
+      (cl-letf (((symbol-function 'jsonyter--org-babel-dispatch)
+                 (lambda (lang orig-fun body params) (setq seen (list lang orig-fun body params)))))
+        (funcall (car spec) "body" '(:x 1)))
+      (should (equal (nth 0 seen) (cdr spec)))
+      (should (null (nth 1 seen))))))
+
+(ert-deftest jsonyter-test-org-babel-dispatch-errors-with-no-backend ()
+  (cl-letf (((symbol-function 'jsonyter--org-babel-jy-p) (lambda (&rest _) nil)))
+    (should-error (jsonyter--org-babel-dispatch "SAS" nil "body" nil))))
+
+(ert-deftest jsonyter-test-org-babel-dispatch-falls-through-to-orig-fun ()
+  (cl-letf (((symbol-function 'jsonyter--org-babel-jy-p) (lambda (&rest _) nil)))
+    (should (equal "ran" (jsonyter--org-babel-dispatch "python" (lambda (_b _p) "ran") "body" nil)))))
+
+;;;; jsonyter--org-markdown-convert
+
+(ert-deftest jsonyter-test-org-markdown-convert-uses-custom-converter ()
+  (let ((jsonyter-org-markdown-converter (lambda (text dir) (format "[%s:%s]" dir text))))
+    (should (equal "[to-org:hi]" (jsonyter--org-markdown-convert "hi" 'to-org)))))
+
+(ert-deftest jsonyter-test-org-markdown-convert-falls-back-with-no-converter ()
+  (let ((jsonyter-org-markdown-converter nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (let ((out (jsonyter--org-markdown-convert "hi" 'to-org)))
+        (should (string-match-p "no Markdown->Org converter" out))
+        (should (string-match-p "hi" out)))
+      (let ((out (jsonyter--org-markdown-convert "hi" 'to-markdown)))
+        (should (string-match-p "no Markdown<-Org converter" out))))))
+
+(ert-deftest jsonyter-test-org-markdown-convert-uses-pandoc-when-available ()
+  (let ((jsonyter-org-markdown-converter nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "/usr/bin/pandoc"))
+              ((symbol-function 'call-process-region)
+               (lambda (beg end _prog &optional _del _out _disp &rest _)
+                 (delete-region beg end)
+                 (insert "converted")
+                 0)))
+      (should (equal "converted" (jsonyter--org-markdown-convert "hi" 'to-org))))))
+
+(ert-deftest jsonyter-test-org-markdown-convert-reports-pandoc-failure ()
+  (let ((jsonyter-org-markdown-converter nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "/usr/bin/pandoc"))
+              ((symbol-function 'call-process-region) (lambda (&rest _) 1)))
+      (should (string-match-p "pandoc failed" (jsonyter--org-markdown-convert "hi" 'to-org))))))
+
+;;;; jsonyter-notebook-run-cell (the real body)
+
+(ert-deftest jsonyter-test-notebook-run-cell-executes-and-shows-output ()
+  (jsonyter-tests--with-notebook
+    (jsonyter--session-put jsonyter--session-key)
+    (let ((cell (jsonyter-tests--cell 0)) handlers)
+      (goto-char (overlay-start cell))
+      (cl-letf (((symbol-function 'jsonyter--nb-ensure-kernel) #'ignore)
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-notebook-run-cell))
+      (should (jsonyter--session-busy (jsonyter--session)))
+      (funcall (plist-get handlers :output) (jsonyter-tests--stream "hi\n"))
+      (funcall (plist-get handlers :result) (list :result (list :execution_count 1)))
+      (should-not (jsonyter--session-busy (jsonyter--session)))
+      (should (string-match-p "hi" (jsonyter-tests--output-text cell))))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-reports-execute-error ()
+  (jsonyter-tests--with-notebook
+    (jsonyter--session-put jsonyter--session-key)
+    (let ((cell (jsonyter-tests--cell 0)) handlers)
+      (goto-char (overlay-start cell))
+      (cl-letf (((symbol-function 'jsonyter--nb-ensure-kernel) #'ignore)
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-notebook-run-cell))
+      (funcall (plist-get handlers :result) (list :error (list :error "NameError" :message "boom")))
+      (should (string-match-p "execute failed" (jsonyter-tests--output-text cell))))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-markdown-cell-does-not-execute ()
+  (jsonyter-tests--with-notebook
+    (let ((cell (jsonyter-tests--cell 2)))
+      (goto-char (overlay-start cell))
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (&rest _) (error "must not execute"))))
+        (jsonyter-notebook-run-cell)))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-refuses-when-busy ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (setf (jsonyter--session-busy (jsonyter--session-put jsonyter--session-key)) t)
+    (let (said)
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-notebook-run-cell))
+      (should (string-match-p "kernel is busy" said)))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-errors-without-cell ()
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--nb-cell-at) (lambda (&rest _) nil)))
+      (should-error (jsonyter-notebook-run-cell) :type 'user-error))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-reports-empty-cell ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (jsonyter-insert-cell-below)
+    (goto-char (overlay-start (jsonyter-tests--cell 1)))
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--nb-ensure-kernel) #'ignore)
+                ((symbol-function 'jsonyter--send) (lambda (&rest _) (error "must not run")))
+                ((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-notebook-run-cell))
+      (should (string-match-p "empty cell" said)))))
+
+;;;; jsonyter-kernel-history: remaining branches
+
+(ert-deftest jsonyter-test-kernel-history-with-prefix-arg-prompts-for-count-and-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'read-number) (lambda (&rest _) 7))
+              ((symbol-function 'jsonyter--read-kernel) (lambda (&rest _) "other-kid"))
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _) (when (equal method "get_kernel") (list :id "other-kid"))))
+              ((symbol-function 'jsonyter--kernel-request)
+               (lambda (&rest _) (list :status "ok" :history nil))))
+      (let ((current-prefix-arg '(4)))
+        (call-interactively 'jsonyter-kernel-history)))
+    (let ((buf (get-buffer "*jsonyter-history*"))) (when buf (kill-buffer buf)))))
+
+(ert-deftest jsonyter-test-kernel-history-disconnects-when-viewing-other-kernel ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (let (disconnected)
+      (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+                ((symbol-function 'jsonyter--request-sync)
+                 (lambda (method params &rest _)
+                   (cond ((equal method "get_kernel") (list :id "other-kid"))
+                         ((equal method "disconnect") (setq disconnected (plist-get params :kernel_id))))))
+                ((symbol-function 'jsonyter--kernel-request)
+                 (lambda (&rest _) (list :status "ok" :history (list (list "s1" 1 "y = 2"))))))
+        (jsonyter-kernel-history 5 "other-kid"))
+      (should (equal disconnected "other-kid")))
+    (let ((buf (get-buffer "*jsonyter-history*"))) (when buf (kill-buffer buf)))))
+
+(ert-deftest jsonyter-test-kernel-history-errors-when-kernel-unreachable ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _) (when (equal method "get_kernel") (error "gone")))))
+      (should-error (jsonyter-kernel-history 5 "kid") :type 'user-error))))
+
+(ert-deftest jsonyter-test-kernel-history-errors-when-history-request-fails ()
+  (jsonyter-tests--with-sessions
+    (jsonyter-tests--bind-session '("python" . "") "kid")
+    (setq-local jsonyter--session-key '("python" . ""))
+    (cl-letf (((symbol-function 'jsonyter--ensure-live-bridge) #'ignore)
+              ((symbol-function 'jsonyter--request-sync)
+               (lambda (method &rest _) (when (equal method "get_kernel") (list :id "kid"))))
+              ((symbol-function 'jsonyter--kernel-request) (lambda (&rest _) (error "no history"))))
+      (should-error (jsonyter-kernel-history 5 "kid") :type 'user-error))))
+
+;;;; jsonyter-org-run-block / jsonyter-script-run-cell: error and aborted branches
+
+(ert-deftest jsonyter-test-org-run-block-reports-execute-error ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main")))
+          handlers)
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-org-run-block))
+      (funcall (plist-get handlers :result) (list :error (list :error "NameError" :message "boom")))
+      (let ((ov (jsonyter--org-cell-at)))
+        (should (string-match-p "execute failed" (overlay-get ov 'jsonyter-output-string)))))))
+
+(ert-deftest jsonyter-test-org-run-block-reports-aborted-status ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main")))
+          handlers)
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--org-connect) (lambda (&rest _) session))
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-org-run-block))
+      (funcall (plist-get handlers :result) (list :result (list :status "aborted")))
+      (let ((ov (jsonyter--org-cell-at)))
+        (should (string-match-p "execution aborted" (overlay-get ov 'jsonyter-output-string)))))))
+
+(ert-deftest jsonyter-test-script-run-cell-reports-execute-error ()
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (insert "# %%\nx = 1\n")
+    (goto-char (point-min))
+    (forward-line 1)
+    (let ((session (jsonyter--session-put (cons "python" "")))
+          handlers)
+      (setq-local jsonyter--session-key (cons "python" ""))
+      (setf (jsonyter--session-kernel-id session) "kid")
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-script-run-cell))
+      (funcall (plist-get handlers :result) (list :error (list :error "NameError" :message "boom")))
+      (let ((ov (jsonyter--script-cell-output-overlay (point-max))))
+        (should (string-match-p "execute failed" (overlay-get ov 'jsonyter-output-string)))))))
+
+;;;; jsonyter--org-parse-results-drawer / jsonyter--org-result-images: image branches
+
+(ert-deftest jsonyter-test-org-parse-results-drawer-recovers-image-output ()
+  (jsonyter-tests--with-org-file
+      (concat "* h\n#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+RESULTS:\n:results:\n[[file:plot.png]]\n:end:\n")
+    (let* ((dir (file-name-directory buffer-file-name))
+           (img (expand-file-name "plot.png" dir)))
+      (unwind-protect
+          (progn
+            (let ((coding-system-for-write 'binary))
+              (with-temp-file img (set-buffer-multibyte nil) (insert "fake-bytes")))
+            (goto-char (point-min))
+            (search-forward "x = 1")
+            (let* ((info (jsonyter--org-block-info))
+                   (outputs (jsonyter--org-parse-results-drawer info dir)))
+              (should (= 1 (length outputs)))
+              (should (equal "display_data" (plist-get (car outputs) :output_type)))
+              (should (plist-get (plist-get (car outputs) :data) :image/png))))
+        (when (file-exists-p img) (delete-file img))))))
+
+(ert-deftest jsonyter-test-org-parse-results-drawer-skips-missing-image-file ()
+  (jsonyter-tests--with-org-file
+      (concat "* h\n#+begin_src python :session jy:main\nx = 1\n#+end_src\n\n"
+              "#+RESULTS:\n:results:\n[[file:does-not-exist-anywhere.png]]\n:end:\n")
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let* ((info (jsonyter--org-block-info))
+           (outputs (jsonyter--org-parse-results-drawer info default-directory)))
+      (should (null outputs)))))
+
+(ert-deftest jsonyter-test-org-result-images-collects-managed-links ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x")
+    (let* ((info (jsonyter--org-block-info))
+           (dir (jsonyter--org-image-dir))
+           (f (expand-file-name "plot-abc.png" dir)))
+      (make-directory dir t)
+      (with-temp-file f (insert "x"))
+      (save-excursion
+        (goto-char (point-max))
+        (insert (format "\n#+RESULTS:\n:results:\n[[file:%s]]\n:end:\n"
+                        (file-relative-name f (file-name-directory buffer-file-name)))))
+      (should (member f (jsonyter--org-result-images info))))))
+
+;;;; jsonyter--resolve-kernel-name
+
+(ert-deftest jsonyter-test-resolve-kernel-name-honors-configured-alist ()
+  (let ((jsonyter-kernel-names '(("python" . "py3-special"))))
+    (should (equal "py3-special" (jsonyter--resolve-kernel-name "python")))))
+
+(ert-deftest jsonyter-test-resolve-kernel-name-queries-server-and-prefers-default ()
+  (let ((jsonyter-kernel-names nil))
+    (cl-letf (((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _)
+                 (list :default "python3"
+                       :kernelspecs (list :python3 (list :name "python3" :spec (list :language "python"))
+                                          :python2 (list :name "python2" :spec (list :language "python")))))))
+      (should (equal "python3" (jsonyter--resolve-kernel-name "python"))))))
+
+(ert-deftest jsonyter-test-resolve-kernel-name-falls-back-to-first-match-without-default ()
+  "With no server default among the matches, the first kernelspec the
+table lists for the language wins -- `matches' is built by `push', so
+`(car (last matches))' is the earliest one found, not the latest."
+  (let ((jsonyter-kernel-names nil))
+    (cl-letf (((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _)
+                 (list :default "R"
+                       :kernelspecs (list :p2 (list :name "python2" :spec (list :language "python"))
+                                          :p3 (list :name "python3" :spec (list :language "python")))))))
+      (should (equal "python2" (jsonyter--resolve-kernel-name "python"))))))
+
+(ert-deftest jsonyter-test-resolve-kernel-name-errors-with-no-match ()
+  (let ((jsonyter-kernel-names nil))
+    (cl-letf (((symbol-function 'jsonyter--request-sync)
+               (lambda (&rest _)
+                 (list :default nil
+                       :kernelspecs (list :ir (list :name "ir" :spec (list :language "R")))))))
+      (should-error (jsonyter--resolve-kernel-name "python")))))
+
+;;;; Small notebook-cell helpers
+
+(ert-deftest jsonyter-test-nb-major-mode-falls-back-to-prog-mode ()
+  (should (eq #'prog-mode (jsonyter--nb-major-mode "some-unknown-language"))))
+
+(ert-deftest jsonyter-test-nb-cell-at-nil-outside-any-cell ()
+  (with-temp-buffer
+    (insert "not a notebook buffer")
+    (should (null (jsonyter--nb-cell-at (point-min))))))
+
+(ert-deftest jsonyter-test-nb-ensure-notebook-errors-outside-notebook-mode ()
+  (with-temp-buffer
+    (should-error (jsonyter--nb-ensure-notebook) :type 'user-error)))
+
+(ert-deftest jsonyter-test-insert-cell-with-markdown-prefix ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (jsonyter-insert-cell-below t)
+    (should (equal "markdown" (overlay-get (jsonyter-tests--cell 1) 'jsonyter-cell-type)))
+    (jsonyter-insert-cell-above t)
+    (should (equal "markdown" (overlay-get (jsonyter-tests--cell 1) 'jsonyter-cell-type)))))
+
+;;;; jsonyter--org-defkey-generated commands
+;;
+;; No coverage-recovery test here for the overwrite-confirmation branches
+;; of `jsonyter-org-from-notebook'/`jsonyter-org-export-script'
+;; (`(and (file-exists-p ...) (called-interactively-p 'interactive))'):
+;; `called-interactively-p' is documented to be unreliable for interpreted
+;; (non-byte-compiled) code, and this test suite runs uncompiled -- even
+;; a direct `call-interactively' from an ERT test body does not reliably
+;; make it return non-nil here, so a test built on it would be asserting
+;; on an interpreter quirk rather than the function's actual behavior.
+
+(ert-deftest jsonyter-test-org-defkey-generated-command-falls-through-outside-jy-block ()
+  (jsonyter-tests--with-org-file "* heading\nplain text\n"
+    (goto-char (point-max))
+    (let (fell-through)
+      (cl-letf (((symbol-function 'jsonyter--org-fallthrough) (lambda () (setq fell-through t))))
+        (jsonyter-org-C-RET))
+      (should fell-through))))
+
+(ert-deftest jsonyter-test-org-defkey-generated-command-runs-jy-command-in-block ()
+  (jsonyter-tests--with-org-file "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let (ran)
+      (cl-letf (((symbol-function 'jsonyter-org-run-block) (lambda () (interactive) (setq ran t))))
+        (jsonyter-org-C-RET))
+      (should ran))))
+
+;;;; Upload/download overwrite prefix argument
+
+(ert-deftest jsonyter-test-upload-file-passes-overwrite-flag ()
+  (let ((tmp (make-temp-file "jsonyter-upload-")))
+    (unwind-protect
+        (let (sent)
+          (cl-letf (((symbol-function 'jsonyter--transfer-run)
+                     (lambda (_ctx _method params &optional _cb) (setq sent params))))
+            (jsonyter-upload-file tmp "d/x" t (cons (current-buffer) nil)))
+          (should (eq t (plist-get sent :overwrite))))
+      (delete-file tmp))))
+
+(ert-deftest jsonyter-test-download-file-passes-overwrite-flag ()
+  (let (sent)
+    (cl-letf (((symbol-function 'jsonyter--transfer-run)
+               (lambda (_ctx _method params &optional _cb) (setq sent params))))
+      (jsonyter-download-file "d/x" "/tmp/x" t (cons (current-buffer) nil)))
+    (should (eq t (plist-get sent :overwrite)))))
+
+;;;; jsonyter-remote-dired-export: unavailable-formats branch
+
+(ert-deftest jsonyter-test-remote-dired-export-refuses-when-formats-unavailable ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-owner (current-buffer)
+          jsonyter--remote-cwd ""
+          tabulated-list-entries (list (list "a.ipynb" (vector " " "a.ipynb" "10 B" ""))))
+    (puthash "a.ipynb" '(:name "a.ipynb" :type "file" :path "a.ipynb") jsonyter--remote-models)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+               (lambda () (cons (current-buffer) nil)))
+              ((symbol-function 'jsonyter--list-export-formats)
+               (lambda (&rest _) (list :available nil :reason "no nbconvert"))))
+      (should-error (call-interactively 'jsonyter-remote-dired-export) :type 'user-error))))
+
+;;;; A few last, narrow branches
+
+(ert-deftest jsonyter-test-start-bridge-env-transport-sets-jupyter-token-env-var ()
+  (with-temp-buffer
+    (let ((jsonyter-command '("cat"))
+          (jsonyter-server-url "http://localhost:8888")
+          (jsonyter-token-transport 'env)
+          (jsonyter-server-token "tok")
+          seen-env)
+      (cl-letf (((symbol-function 'make-process)
+                 (lambda (&rest _) (setq seen-env process-environment) 'fake-proc))
+                ((symbol-function 'process-get) (lambda (&rest _) nil))
+                ((symbol-function 'process-put) #'ignore))
+        (jsonyter--start-bridge))
+      (should (member "JUPYTER_TOKEN=tok" seen-env)))))
+
+(ert-deftest jsonyter-test-insert-cell-below-above-with-no-cell-at-point ()
+  (jsonyter-tests--with-notebook
+    (cl-letf (((symbol-function 'jsonyter--nb-cell-at) (lambda (&rest _) nil)))
+      (jsonyter-insert-cell-below)
+      (jsonyter-insert-cell-above))))
+
+(ert-deftest jsonyter-test-connect-kernel-sets-session-key-outside-org-mode ()
+  (with-temp-buffer
+    (setq-local jsonyter--sessions (make-hash-table :test #'equal))
+    (setq-local jsonyter--process nil)
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--ensure-live-bridge) #'ignore))
+        (jsonyter--connect-kernel '("python" . "") "python3-pinned"))
+      (should (equal jsonyter--session-key '("python" . "")))
+      (should (equal "python3-pinned" (jsonyter--session-kernel-name session))))))
+
+;;;; More narrow branches, for a comfortable margin above the threshold
+
+(ert-deftest jsonyter-test-answer-input-reads-plain-string-without-password ()
+  (let ((proc (start-process "jsonyter-test-answer" nil "cat")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "plain-answer"))
+                  ((symbol-function 'process-send-string)
+                   (lambda (_proc s) (should (string-match-p "plain-answer" s)))))
+          (jsonyter--answer-input proc 1 (list :prompt "> " :password :json-false)))
+      (ignore-errors (delete-process proc)))))
+
+(ert-deftest jsonyter-test-send-errors-when-bridge-not-running ()
+  (with-temp-buffer
+    (setq-local jsonyter--process nil)
+    (should-error (jsonyter--send "execute" nil) :type 'error)))
+
+(ert-deftest jsonyter-test-suppress-and-restore-line-spacing-both-branches ()
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+            ((symbol-function 'frame-char-height) (lambda (&rest _) 20)))
+    ;; No buffer-local line-spacing yet: suppress records `kill', and
+    ;; restoring kills the local value it set.
+    (with-temp-buffer
+      (setq-default line-spacing 0.5)
+      (unwind-protect
+          (progn
+            (jsonyter--suppress-line-spacing)
+            (should (local-variable-p 'line-spacing))
+            (should (equal 0 line-spacing))
+            (jsonyter--restore-line-spacing)
+            (should-not (local-variable-p 'line-spacing))
+            (should (null jsonyter--line-spacing-restore)))
+        (setq-default line-spacing nil)))
+    ;; A pre-existing buffer-local value: suppress records it, and
+    ;; restoring puts that exact value back.
+    (with-temp-buffer
+      (setq-local line-spacing 7)
+      (jsonyter--suppress-line-spacing)
+      (should (equal 0 line-spacing))
+      (jsonyter--restore-line-spacing)
+      (should (equal 7 line-spacing)))))
+
+(ert-deftest jsonyter-test-mode-line-string-sole-session-with-no-current-key ()
+  (jsonyter-tests--with-sessions
+    (let ((s (jsonyter-tests--bind-session '("python" . "main") "kid")))
+      (setq-local jsonyter--session-key nil)
+      (should (equal (jsonyter--session-status-tag s) (jsonyter--mode-line-string))))))
+
+(ert-deftest jsonyter-test-announce-outside-repl-goes-to-echo-area ()
+  (with-temp-buffer
+    (jsonyter-tests--with-sessions
+      (let ((s (jsonyter-tests--bind-session '("python" . "sess1") "kid"))
+            said)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+          (jsonyter--announce "[a note]" s))
+        (should (string-match-p "sess1" said))
+        (should (string-match-p "a note" said))))))
+
+(ert-deftest jsonyter-test-insert-prompt-freezes-history-and-marks-input-start ()
+  (with-temp-buffer
+    (jsonyter-repl-mode)
+    (jsonyter--insert-prompt)
+    (should (marker-position jsonyter--input-start))
+    (should (= (point) jsonyter--input-start))))
+
+(ert-deftest jsonyter-test-mime-joins-list-values ()
+  (should (equal "ab" (jsonyter--mime (list :text/plain '("a" "b")) :text/plain)))
+  (should (equal "x" (jsonyter--mime (list :text/plain "x") :text/plain)))
+  (should (null (jsonyter--mime (list :text/plain "x") :text/html))))
+
+(ert-deftest jsonyter-test-insert-encoded-image-reports-when-undecodable ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image) (lambda (&rest _) nil)))
+      (jsonyter--insert-encoded-image (base64-encode-string "not an image") 'png)
+      (should (string-match-p "could not decode" (buffer-string))))))
+
+(ert-deftest jsonyter-test-insert-html-swallows-shr-errors ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'shr-render-region) (lambda (&rest _) (error "shr blew up"))))
+      (jsonyter--insert-html "<p>hi</p>")
+      (should (string-match-p "<p>hi</p>" (buffer-string))))))
+
+(ert-deftest jsonyter-test-history-add-trims-past-the-configured-size ()
+  (with-temp-buffer
+    (setq-local jsonyter--history nil)
+    (let ((jsonyter-history-size 2))
+      (jsonyter--history-add "a")
+      (jsonyter--history-add "b")
+      (jsonyter--history-add "c")
+      (should (equal '("c" "b") jsonyter--history)))))
+
+(ert-deftest jsonyter-test-command-session-falls-back-to-org-session-at-point ()
+  (jsonyter-tests--with-org-file
+      "#+begin_src python :session jy:main\nx = 1\n#+end_src\n"
+    (goto-char (point-min))
+    (search-forward "x = 1")
+    (let ((session (jsonyter--session-put '("python" . "main"))))
+      (should (eq (jsonyter--command-session) session)))))
+
+(ert-deftest jsonyter-test-nb-text-joins-list-of-lines ()
+  (should (equal "a\nb" (jsonyter--nb-text '("a\n" "b"))))
+  (should (equal "solo" (jsonyter--nb-text "solo")))
+  (should (equal "" (jsonyter--nb-text nil))))
+
+(ert-deftest jsonyter-test-nb-output-to-spec-plain-display-data ()
+  (let ((spec (jsonyter--nb-output-to-spec
+               (list :type "display_data" :data (list :text/plain "a figure") :metadata nil))))
+    (should (equal "display_data" (plist-get spec :output_type)))
+    (should-not (plist-member spec :execution_count))))
+
+;;;; Still more narrow branches
+
+(ert-deftest jsonyter-test-notebook-previous-cell-navigates-back ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 1)))
+    (jsonyter-notebook-previous-cell)
+    (should (= (point) (overlay-start (jsonyter-tests--cell 0))))))
+
+(ert-deftest jsonyter-test-notebook-previous-cell-reports-first-cell ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (let (said)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-notebook-previous-cell))
+      (should (string-match-p "first cell" said)))))
+
+(ert-deftest jsonyter-test-dispatch-handles-unparseable-json ()
+  (with-temp-buffer
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--announce)
+                 (lambda (text &rest _) (setq said text))))
+        (jsonyter--dispatch nil "not valid json {"))
+      (should (string-match-p "unparseable bridge output" said)))))
+
+(ert-deftest jsonyter-test-dispatch-answers-input-request ()
+  (with-temp-buffer
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (answered)
+      (cl-letf (((symbol-function 'jsonyter--answer-input)
+                 (lambda (proc id content) (setq answered (list proc id content)))))
+        (jsonyter--dispatch 'fake-proc "{\"id\": 5, \"input_request\": {\"prompt\": \"> \"}}"))
+      (should (eq (car answered) 'fake-proc))
+      (should (equal (nth 1 answered) 5)))))
+
+(ert-deftest jsonyter-test-dispatch-announces-bridge-error-with-no-handler ()
+  (with-temp-buffer
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--announce) (lambda (text &rest _) (setq said text))))
+        (jsonyter--dispatch nil "{\"id\": 9, \"error\": {\"error\": \"Boom\", \"message\": \"bad\"}}"))
+      (should (string-match-p "bridge error" said)))))
+
+(ert-deftest jsonyter-test-repl-return-errors-without-live-kernel ()
+  (jsonyter-tests--with-live-repl
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+      (should-error (jsonyter-repl-return) :type 'user-error))))
+
+(ert-deftest jsonyter-test-repl-return-reports-busy ()
+  (jsonyter-tests--with-live-repl
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) t))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-repl-return))
+      (should (string-match-p "kernel is busy" said)))))
+
+(ert-deftest jsonyter-test-repl-return-jumps-to-end-when-point-before-input ()
+  (jsonyter-tests--with-live-repl
+    (insert "code")
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+              ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil)))
+      (jsonyter-repl-return))
+    (should (= (point) (point-max)))))
+
+(ert-deftest jsonyter-test-repl-return-reports-nothing-to-send-on-blank ()
+  (jsonyter-tests--with-live-repl
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+                ((symbol-function 'jsonyter--busy-p) (lambda (&rest _) nil))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-repl-return))
+      (should (string-match-p "nothing to send" said)))))
+
+(ert-deftest jsonyter-test-after-kernel-reset-blanks-notebook-cell-counts ()
+  (jsonyter-tests--with-notebook
+    (let ((cell (jsonyter-tests--cell 0)))
+      (overlay-put cell 'jsonyter-exec-count 5)
+      (overlay-put cell 'jsonyter-running t)
+      (jsonyter--after-kernel-reset "[kernel restarted]")
+      (should (null (overlay-get cell 'jsonyter-exec-count)))
+      (should (null (overlay-get cell 'jsonyter-running))))))
+
+(ert-deftest jsonyter-test-request-sync-times-out-and-blames-dead-bridge ()
+  (with-temp-buffer
+    (setq-local jsonyter--process 'fake-proc)
+    (setq-local jsonyter--callbacks (make-hash-table :test #'eql))
+    (let ((jsonyter-request-timeout 0.01))
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (&rest _) 1))
+                ((symbol-function 'process-live-p) (lambda (&rest _) nil))
+                ((symbol-function 'jsonyter--stderr-tail)
+                 (lambda (&rest _) "ImportError: no module named jsonyter")))
+        (let ((err (should-error (jsonyter--request-sync "list_kernelspecs" nil))))
+          (should (string-match-p "bridge process died" (cadr err)))
+          (should (string-match-p "ImportError" (cadr err))))))))
+
+(ert-deftest jsonyter-test-start-repl-pops-to-existing-live-buffer ()
+  (let ((buf (get-buffer-create "*jsonyter[python]*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local jsonyter--session-key '("python" . ""))
+          (setq-local jsonyter--process (start-process "jsonyter-test-repl" nil "cat"))
+          (unwind-protect
+              (let (popped)
+                (cl-letf (((symbol-function 'pop-to-buffer) (lambda (b &rest _) (setq popped b))))
+                  (jsonyter--start-repl "python"))
+                (should (eq popped buf)))
+            (ignore-errors (delete-process jsonyter--process))))
+      (kill-buffer buf))))
+
+(ert-deftest jsonyter-test-notebook-run-cell-draws-outputs-when-nothing-streamed ()
+  (jsonyter-tests--with-notebook
+    (jsonyter--session-put jsonyter--session-key)
+    (let ((cell (jsonyter-tests--cell 0)) handlers)
+      (goto-char (overlay-start cell))
+      (cl-letf (((symbol-function 'jsonyter--nb-ensure-kernel) #'ignore)
+                ((symbol-function 'jsonyter--send) (lambda (_m _p hs) (setq handlers hs) 1)))
+        (jsonyter-notebook-run-cell t))
+      (funcall (plist-get handlers :result)
+               (list :result (list :execution_count 1
+                                    :outputs (list (list :type "stream" :name "stdout" :text "late\n")))))
+      (should (string-match-p "late" (jsonyter-tests--output-text cell)))
+      (should (= (point) (overlay-start (jsonyter-tests--cell 1)))))))
+
+(ert-deftest jsonyter-test-nb-cell-at-falls-back-to-preceding-overlay-at-buffer-end ()
+  (jsonyter-tests--with-notebook
+    (should (eq (jsonyter-tests--cell 2) (jsonyter--nb-cell-at (point-max))))))
+
+(ert-deftest jsonyter-test-read-kernel-defaults-to-sessions-last-kernel ()
+  (with-temp-buffer
+    (setq-local jsonyter--sessions (make-hash-table :test #'equal))
+    (setq-local jsonyter--process nil)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (let ((session (jsonyter-tests--bind-session '("python" . "") nil)))
+      (setf (jsonyter--session-last-kernel session) (list :id "last-kid"))
+      (cl-letf (((symbol-function 'jsonyter--request-sync)
+                 (lambda (&rest _) (list (list :id "last-kid" :name "python3" :execution_state "idle"))))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt _table &optional _pred _req _init _hist default) default)))
+        (should (equal "last-kid" (jsonyter--read-kernel "Pick: ")))))))
 
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
