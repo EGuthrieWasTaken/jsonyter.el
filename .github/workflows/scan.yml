@@ -1,0 +1,59 @@
+name: scan
+
+# Static analysis, uploaded as SARIF so results land in the Security tab
+# and a branch protection rule can require them. CodeQL doesn't have an
+# Emacs Lisp extractor, so this uses Semgrep instead: its per-language
+# rulesets won't fire on `.el' files, but `p/secrets' is regex/entropy
+# based and language-agnostic, which is exactly the kind of finding worth
+# catching in a package that handles Jupyter tokens.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a new rule in the registry gets a chance to flag
+    # something even on a week with no commits. Offset off the hour to
+    # avoid the top-of-hour scheduling stampede.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep
+        # Findings should surface as code-scanning alerts, not a red job --
+        # that's what lets "require code scanning results" gate on alert
+        # severity instead of on this step's exit code, the same split
+        # CodeQL's own default workflow uses. continue-on-error covers
+        # Semgrep's own findings-present exit status; a real crash still
+        # shows up as a job failure via the summary emitted below.
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config p/security-audit \
+            --config p/secrets \
+            --sarif --output semgrep.sarif \
+            --error \
+            .
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif

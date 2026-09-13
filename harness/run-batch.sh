@@ -45,8 +45,18 @@ set -- \
                 eh-profile-bridge-scripts-dir \"$profile/bridge-scripts\"
                 eh-profile-scratch-dir \"$work/scratch\"
                 eh-fake-bridge \"$harness/bin/eh-fake-bridge\")" \
-  -l eh-driver -l eh-scenario -l eh-profile \
-  -l "$profile/init.el"
+  -l eh-driver -l eh-scenario -l eh-profile
+
+# A hook for tooling that has to run before `init.el' requires
+# jsonyter.el -- coverage instrumentation, so far the only user of it.
+# Not for anything a scenario itself needs: that belongs in init.el or
+# the scenario file, where it stays part of the profile rather than a
+# side channel only CI knows about.
+if [ -n "${EH_BATCH_PRELOAD:-}" ]; then
+  set -- "$@" -l "$EH_BATCH_PRELOAD"
+fi
+
+set -- "$@" -l "$profile/init.el"
 
 for file in "$profile"/scenarios/*.el; do
   set -- "$@" -l "$file"
