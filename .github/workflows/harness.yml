@@ -173,7 +173,7 @@ jobs:
             -f ert-run-tests-batch-and-exit
 
       - name: Check out emacs-harness
-        # Deliberately after the suite above: those 91 tests need none of
+        # Deliberately after the suite above: those 400 tests need none of
         # this, and a missing token should not hide their result.
         uses: actions/checkout@v4
         with:

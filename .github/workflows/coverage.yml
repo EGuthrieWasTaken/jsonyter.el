@@ -13,8 +13,9 @@ name: coverage
 # separate container this one never touches. So this number is a floor,
 # not the package's true test coverage.
 #
-# COVERAGE_THRESHOLD is deliberately below what the suites clear today --
-# 43.3% headless-only, ~90% is the eventual target once more tests exist.
+# COVERAGE_THRESHOLD tracks the combined suites' actual line coverage,
+# with a small margin below it so ordinary variance (a differently-ordered
+# test run, a small future refactor) doesn't flip this job red on its own.
 # Raise it as coverage grows; a floor nobody can slip under is only useful
 # once it is close to the truth.
 
@@ -29,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  COVERAGE_THRESHOLD: "40"
+  COVERAGE_THRESHOLD: "90"
   # Same commit as harness.yml's HARNESS_REF -- bump both together, or
   # this job silently measures a different harness than CI actually tests
   # against.

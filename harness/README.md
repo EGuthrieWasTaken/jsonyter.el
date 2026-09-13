@@ -2,7 +2,7 @@
 
 `test/jsonyter-tests.el` answers *is the logic right*. It runs under
 `emacs -Q --batch`, where there is no frame, no X server, no redisplay
-and no images. That covers a lot — 91 tests of it — but it structurally
+and no images. That covers a lot — 400 tests of it — but it structurally
 cannot see the half of this package that is about what appears on
 screen: whether a base64 PNG in a mimebundle actually decodes or renders
 as a placeholder box, whether a tall figure becomes five drawable rows
