@@ -1,0 +1,83 @@
+name: coverage
+
+# Line coverage for jsonyter.el's headless suite (test/jsonyter-tests.el),
+# gated at 90% so a branch protection rule can require this job to pass.
+# GitHub has no native coverage-threshold check, so the threshold is
+# enforced here, in the job itself, off a plain lcov report -- no external
+# coverage service or token involved.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COVERAGE_THRESHOLD: "90"
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emacs and lcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends emacs-nox lcov
+
+      - name: Install undercover.el
+        # A test-only dependency pulled from MELPA at run time, not added
+        # to jsonyter.el's own `Package-Requires:' header, which lists
+        # what a *user* of the package needs, not what testing it needs.
+        run: |
+          emacs -Q --batch \
+            --eval "(require 'package)" \
+            --eval "(setq package-archives '((\"melpa\" . \"https://melpa.org/packages/\")))" \
+            --eval "(package-initialize)" \
+            --eval "(package-refresh-contents)" \
+            --eval "(package-install 'undercover)"
+
+      - name: test/jsonyter-tests.el, instrumented
+        # undercover has to be armed with `(undercover ...)' before
+        # `test/jsonyter-tests.el' requires jsonyter.el itself, or there is
+        # nothing left for it to instrument.
+        run: |
+          mkdir -p coverage
+          emacs -Q --batch -L . \
+            --eval "(package-initialize)" \
+            --eval "(require 'undercover)" \
+            --eval "(undercover \"jsonyter.el\" (:report-format 'lcov) (:report-file \"coverage/lcov.info\") (:send-report nil))" \
+            -l test/jsonyter-tests.el \
+            -f ert-run-tests-batch-and-exit
+
+      - name: Enforce line coverage >= ${{ env.COVERAGE_THRESHOLD }}%
+        run: |
+          lcov --summary coverage/lcov.info | tee coverage/summary.txt
+          python3 - "$COVERAGE_THRESHOLD" <<'PY'
+          import re, sys
+          threshold = float(sys.argv[1])
+          text = open("coverage/summary.txt").read()
+          match = re.search(r"lines\.+:\s*([\d.]+)%", text)
+          if not match:
+              print("could not find a line-coverage percentage in lcov's summary")
+              sys.exit(1)
+          pct = float(match.group(1))
+          print(f"line coverage: {pct}% (threshold {threshold}%)")
+          if pct < threshold:
+              print(f"::error::line coverage {pct}% is below the required {threshold}%")
+              sys.exit(1)
+          PY
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: ignore
