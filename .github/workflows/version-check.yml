@@ -1,0 +1,74 @@
+name: version
+
+# release.yml already enforces that a *release tag* matches the ';;
+# Version:' header at release time -- but by then the number has already
+# merged. This runs at review time instead: every pull request touching
+# jsonyter.el must bump that header to a value that has never appeared
+# in the file's history before, so a merge can never produce two
+# different commits claiming the same version.
+#
+# "Never appeared before" is checked against every version the header
+# has ever held on any commit reachable from this checkout -- which,
+# because pull_request checks out the merge of the PR into its base,
+# covers the base branch's full history and the PR branch's own history
+# in one pass -- plus every `vX.Y.Z' release tag, in case a header and
+# its tag ever drifted apart.
+
+on:
+  pull_request:
+    paths:
+      - jsonyter.el
+
+permissions:
+  contents: read
+
+jobs:
+  version-is-new:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the merged PR, full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ";; Version: header must not reuse a version that already exists"
+        run: |
+          set -euo pipefail
+
+          extract() {
+            # `tr -d' also eats the line's own trailing newline, so it is
+            # added back explicitly -- otherwise every call below runs
+            # together into one unseparated line once looped.
+            sed -n 's/^;;[[:space:]]*Version:[[:space:]]*//p' | head -n1 | tr -d '[:space:]'
+            printf '\n'
+          }
+
+          current="$(extract < jsonyter.el)"
+          if [ -z "$current" ]; then
+            echo "::error file=jsonyter.el::no ';; Version:' header found"
+            exit 1
+          fi
+          echo "this PR's version: $current"
+
+          # Every version the header has held at any commit that ever
+          # touched the file, on the current commit's ancestry -- except
+          # the current commit itself, which is the one being judged.
+          here="$(git rev-parse HEAD)"
+          used="$(mktemp)"
+          git log --format='%H' -- jsonyter.el | grep -vxF "$here" | while read -r sha; do
+            git show "$sha:jsonyter.el" 2>/dev/null | extract
+          done | sort -u > "$used"
+
+          # Release tags too, in case a header and its tag ever drifted.
+          git tag -l 'v*' | sed 's/^v//' >> "$used"
+          sort -u -o "$used" "$used"
+
+          echo "versions already used:"
+          cat "$used"
+
+          if grep -qxF "$current" "$used"; then
+            echo "::error file=jsonyter.el::';; Version: $current' has already been used in this repository's history -- bump it to a value that has never appeared before."
+            exit 1
+          fi
+
+          echo "OK: $current has not been used before"
