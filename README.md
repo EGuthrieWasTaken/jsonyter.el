@@ -624,6 +624,166 @@ limit. After any failure, `jsonyter-resume-upload` /
 `jsonyter-resume-download` re-issue the last transfer from where it
 stopped.
 
+## Syncing directories
+
+`jsonyter-upload-file`, `jsonyter-download-file` and `jsonyter-remote-dired`
+cover the deliberate, one-file-at-a-time case; `jsonyter-sync` covers the
+standing relationship instead — **a local directory and a remote one
+that are supposed to hold the same thing.** One command makes them
+agree, moving only what actually differs and never silently discarding
+an edit.
+
+This is **on-demand, not continuous**: there is no watching, no daemon,
+no polling loop. Every sync is a discrete command with a beginning and
+an end; run `jsonyter-sync` again whenever you want the two sides to
+converge again.
+
+The idea worth holding on to: **a baseline is what makes a bidirectional
+sync safe.** Comparing local and remote alone can only say "these
+differ" — it takes a record of what the two last agreed on to say *who*
+changed, which is what tells a routine one-sided update apart from a
+genuine conflict, and a deletion apart from a file that was never
+created. The bridge keeps this baseline (one small JSON file per pair,
+under `$XDG_STATE_HOME/jsonyter/sync/` by default) and it is disposable
+by design: `jsonyter-sync-reset-baseline` discards it, and the next sync
+just starts fresh, as a first sync would.
+
+### Pairs
+
+A *pair* is a local directory and a remote (Contents-API) directory kept
+in agreement:
+
+```elisp
+(setq jsonyter-sync-pairs
+      '(("~/project/data" . "work/data")
+        (:local "~/project/results" :remote "work/results"
+         :server "https://jupyter.example.org"
+         :conflict newest :delete push :ignore ("*.log"))))
+```
+
+The short `(LOCAL . REMOTE)` form covers the common case; the plist form
+pins a pair to one server and overrides the conflict/delete policy and
+ignore patterns for that pair alone. `:server` defaults to nil (any
+server); `:local` is expanded with `expand-file-name`; `:remote` is a
+Contents-API path — POSIX, relative to the server's `root_dir`, no
+leading slash, under the same rule as everywhere else transfer touches
+(see [Contents paths are not kernel
+paths](#contents-paths-are-not-kernel-paths)).
+
+You rarely need to write `jsonyter-sync-pairs` by hand: with no pair
+configured for the directory you're in, `jsonyter-sync` offers to create
+one on the spot, seeded from the current directory and the same
+kernel-cwd probe transfer commands use — normally two confirmations and
+no typing. `jsonyter-sync-add-pair` does the same thing as a standalone
+command, and `jsonyter-sync-forget-pair` removes one again, optionally
+deleting its baseline.
+
+Which pair a command means is resolved in order: the pair whose
+`:local` is the current directory or one of its parents (the most
+specific match wins); otherwise the one pair left after filtering by
+server; otherwise a choice among the ones that remain.
+
+### Commands
+
+| Command | What it does |
+| --- | --- |
+| `jsonyter-sync` (`C-c C-y`) | Reconcile the current pair: plan, review if warranted, apply |
+| `jsonyter-sync-status` | Plan only — the read-only "what would change?" verb |
+| `jsonyter-sync-push` | Reconcile with **local** winning every conflict |
+| `jsonyter-sync-pull` | Reconcile with **remote** winning every conflict |
+| `jsonyter-sync-abort` | Stop a running sync after the current file |
+| `jsonyter-sync-add-pair` | Define a pair interactively |
+| `jsonyter-sync-forget-pair` | Drop a pair, optionally deleting its baseline |
+| `jsonyter-sync-reset-baseline` | Discard a pair's baseline; the next sync starts fresh |
+
+`jsonyter-sync-push`/`-pull` are **not** "upload the tree" / "download
+the tree": unchanged files are still skipped, ignore patterns still
+apply, and nothing is deleted unless the delete policy says so — only a
+genuine conflict is forced to one side.
+
+In `jsonyter-remote-dired`, `S` runs `jsonyter-sync` and `%` runs
+`jsonyter-sync-status`, against whichever pair covers the directory
+being browsed.
+
+### Policies
+
+```elisp
+(setq jsonyter-sync-conflict-policy 'ask)     ; ask | newest | local | remote | skip
+(setq jsonyter-sync-delete-policy 'none)      ; none | push | pull | both
+(setq jsonyter-sync-review 'when-destructive) ; always | when-destructive | never
+```
+
+**Conflicts default to `ask`**, not `newest`, even though the bridge's
+own non-interactive `sync()` defaults to `newest` — a script can't
+answer a question, but Emacs can, and putting the decision in front of
+whoever knows which edit they meant to keep is the whole point of a
+front end. `newest` (clock-skew corrected, and it refuses to guess when
+the two timestamps are too close to call) is one keystroke away in the
+plan buffer.
+
+**Deletion propagation is off by default**, matching the bridge: a file
+missing on one side is left alone and reported, never silently removed
+from the other. Turn it on, per pair or globally, once you trust it —
+and note the bulk-deletion guard, `jsonyter-sync-max-deletes` (default
+25): it refuses a plan that would delete an implausible number of
+files, the signature of an unmounted volume or a wrong directory rather
+than of real intent.
+
+**The review buffer** (`jsonyter-sync-review`) shows itself when a plan
+would delete something, resolve a conflict by overwriting a side, or
+move more than `jsonyter-sync-review-threshold` files (10 by default); a
+prefix argument to any sync command forces it open regardless, and a
+purely additive small sync just runs.
+
+### The plan buffer
+
+A `tabulated-list` buffer, `*jsonyter-sync: <local> <-> <remote>*`,
+shown before anything moves whenever review is warranted:
+
+```
+  ~/project/data <-> work/data on https://jupyter.example.org   8 to
+  transfer (184.3 MB up, 4.1 KB down) · 1 conflict · 110 unchanged
+
+     File                        Size      Local      Remote     Note
+  >  trials.csv                  184.3 MB  14:22      09-07      new
+  <  out/fig.png                   4.1 KB  --         15:58      new
+  !  notes.md                      2.1 KB  15:40      16:10      both changed
+```
+
+| Key | Action |
+| --- | --- |
+| `RET` | Describe the entry: both hashes, both mtimes, the baseline |
+| `>` / `<` | Override: local wins / remote wins |
+| `d` | Override to delete a copy (asks which, on a two-sided conflict) |
+| `k` | Override to skip |
+| `n` / `N` | Resolve a conflict by newest / by whichever side is *not* newest |
+| `u` / `U` | Clear the override at point / clear all overrides |
+| `g` | Re-plan — the trees may have moved since |
+| `T` | Toggle whether unchanged (`=`) rows are shown |
+| `D` | Diff this entry's two versions (`ediff-files` by default) |
+| `x` | **Apply the plan.** The only key here that writes anything |
+| `q` | Quit without doing anything |
+
+Overrides are sent to the bridge as data alongside the unmodified plan,
+never as an edited plan — the bridge stays the authority on what a plan
+means.
+
+### Progress and reporting
+
+A running sync shows its progress in the echo area and a `:sync I/N` tag
+in the mode line of the session it belongs to, the same way a transfer's
+`:up NN%` does. On completion:
+
+```
+jsonyter: synced ~/project/data <-> work/data — 3 up (184.3 MB), 5 down
+(4.1 KB), 1 converged, sha256 verified, 32s
+```
+
+An unresolved conflict or a failed file is named explicitly, with its
+recovery (`jsonyter-sync-status` to resolve it, or a re-run to pick up a
+file that changed mid-sync); the full per-file detail is kept in
+`*jsonyter-sync-log*`.
+
 ## Script cells (`# %%`)
 
 `jsonyter-script-mode` gives an ordinary `.py`/`.R`/`.jl`/`.sas` script the

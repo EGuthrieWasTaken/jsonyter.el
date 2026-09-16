@@ -1,0 +1,40 @@
+# sync.jsonl -- the directory-sync verbs (`sync_plan'/`sync_apply').
+# Layered *before* base.jsonl, like transfer.jsonl, so these win; base
+# still answers the connection lifecycle around them.
+#
+# A real Jupyter server could answer the Contents-API listings a real
+# sync_plan issues, but not on cue, and it cannot emit the `progress'
+# lines a scan or a multi-file sync streams while it runs -- the same
+# reason transfer.jsonl is hand-written rather than recorded. Hand-written
+# here for the same reason.
+
+# A plan with one brand-new local file and nothing else: no conflicts, no
+# deletions, one file moved -- well under `jsonyter-sync-review-threshold',
+# so `jsonyter-sync' applies it directly without ever opening the review
+# buffer.
+{"on": {"method": "sync_plan", "remote_dir": "~^work/synctest$~"},
+ "reply": {"local_dir": "/tmp/sync-local", "remote_dir": "work/synctest",
+           "server": "http://localhost:8888", "hash_algorithm": "sha256",
+           "integrity": "sha256", "baseline": "absent", "clock_skew": 0.1,
+           "conflict_policy": "ask", "delete_policy": "none",
+           "scanned": {"local": 1, "remote": 0, "directories": 1, "requests": 2},
+           "entries": [
+             {"path": "trials.csv", "action": "push", "reason": "local-new",
+              "local": {"size": 100, "hash": "3f2a", "mtime": 1757260000.1},
+              "remote": null, "baseline_hash": null, "bytes": 100}
+           ],
+           "totals": {"push": 1, "pull": 0, "converge": 0, "skip": 0,
+                      "conflict": 0, "push_delete": 0, "pull_delete": 0,
+                      "bytes_up": 100, "bytes_down": 0},
+           "warnings": [],
+           "state_path": "/tmp/sync-state/abc123.json"}}
+
+# Applying that plan: the one file pushed, nothing else, ok.
+{"on": {"method": "sync_apply"},
+ "reply": {"ok": true,
+           "moved": {"pushed": 1, "pulled": 0, "converged": 0,
+                     "deleted_local": 0, "deleted_remote": 0},
+           "bytes_up": 100, "bytes_down": 0, "skipped": 0,
+           "conflicts_unresolved": 0, "failed": [], "conflict_copies": [],
+           "integrity": "sha256", "elapsed": 0.42,
+           "baseline": "/tmp/sync-state/abc123.json"}}
