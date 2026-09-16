@@ -1,0 +1,79 @@
+name: version
+
+# release.yml already enforces that a *release tag* matches the ';;
+# Version:' header at release time -- but by then the number has already
+# merged. This runs at review time instead: every pull request touching
+# jsonyter.el must bump that header to a value that has never appeared
+# in the file's history before, so a merge can never produce two
+# different commits claiming the same version.
+#
+# "Never appeared before" is checked against every version the header
+# ever held on a commit reachable from the PR's *base* -- i.e. every
+# version that existed before this PR -- plus every `vX.Y.Z' release
+# tag, in case a header and its tag ever drifted apart. Deliberately
+# rooted at the base commit rather than at the checked-out merge: `git
+# log -- jsonyter.el' treats a clean, non-conflicting merge as
+# TREESAME to the side that changed the file and does not list the
+# merge commit itself, so the commit that actually shows up is the PR's
+# own bump commit -- which of course already carries the new version.
+# Walking from HEAD and excluding only the merge commit's own hash
+# still counts the PR's own commit as "history" and flags every PR as
+# reusing its own version; walking from the base sidesteps that
+# entirely, since the PR's own commits are never reachable from there.
+
+on:
+  pull_request:
+    paths:
+      - jsonyter.el
+
+permissions:
+  contents: read
+
+jobs:
+  version-is-new:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the merged PR, full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ";; Version: header must not reuse a version that already exists"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          extract() {
+            # `tr -d' also eats the line's own trailing newline, so it is
+            # added back explicitly -- otherwise every call below runs
+            # together into one unseparated line once looped.
+            sed -n 's/^;;[[:space:]]*Version:[[:space:]]*//p' | head -n1 | tr -d '[:space:]'
+            printf '\n'
+          }
+
+          current="$(extract < jsonyter.el)"
+          if [ -z "$current" ]; then
+            echo "::error file=jsonyter.el::no ';; Version:' header found"
+            exit 1
+          fi
+          echo "this PR's version: $current"
+
+          used="$(mktemp)"
+          git log --format='%H' "$BASE_SHA" -- jsonyter.el | while read -r sha; do
+            git show "$sha:jsonyter.el" 2>/dev/null | extract
+          done > "$used"
+
+          # Release tags too, in case a header and its tag ever drifted.
+          git tag -l 'v*' | sed 's/^v//' >> "$used"
+          sort -u -o "$used" "$used"
+
+          echo "versions that existed before this PR:"
+          cat "$used"
+
+          if grep -qxF "$current" "$used"; then
+            echo "::error file=jsonyter.el::';; Version: $current' has already been used in this repository's history -- bump it to a value that has never appeared before."
+            exit 1
+          fi
+
+          echo "OK: $current has not been used before"
