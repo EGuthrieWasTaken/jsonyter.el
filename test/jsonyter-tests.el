@@ -3593,6 +3593,985 @@ as covered too."
   (jsonyter-dired-setup)
   (should (eq (lookup-key dired-mode-map (kbd "C-c C-u")) #'jsonyter-dired-upload-dwim)))
 
+;;;; jsonyter-sync
+
+;; Pure-function and stubbed-bridge coverage, in the same spirit as the
+;; file-transfer tests above: `jsonyter--sync-entries' is fed fabricated
+;; plans (one case per decision-table action), override bookkeeping and
+;; the destructive-review threshold are exercised directly, and
+;; `jsonyter--sync-run'/`jsonyter-sync-abort' are driven with
+;; `jsonyter--send' stubbed.  Nothing here talks to a real bridge.
+
+(defun jsonyter-tests--sync-side (size hash mtime)
+  (list :size size :hash hash :mtime mtime))
+
+(cl-defun jsonyter-tests--sync-entry (path action reason &key local remote
+                                           baseline-hash bytes resolution newest
+                                           mtime-delta)
+  (append
+   (list :path path :action action :reason reason
+         :local local :remote remote :baseline_hash baseline-hash)
+   (and bytes (list :bytes bytes))
+   (and resolution (list :resolution resolution))
+   (and newest (list :newest newest))
+   (and mtime-delta (list :mtime_delta mtime-delta))))
+
+(cl-defun jsonyter-tests--sync-plan (entries &key (push 0) (pull 0) (converge 0)
+                                             (skip 0) (conflict 0)
+                                             (push-delete 0) (pull-delete 0)
+                                             (bytes-up 0) (bytes-down 0)
+                                             (integrity "sha256") (server "http://x"))
+  (list :local_dir "/tmp/x" :remote_dir "work/data" :server server
+        :hash_algorithm "sha256" :integrity integrity :baseline "present"
+        :clock_skew 0.0 :conflict_policy "ask" :delete_policy "none"
+        :scanned (list :local 1 :remote 1 :directories 1 :requests 1)
+        :entries entries
+        :totals (list :push push :pull pull :converge converge :skip skip
+                      :conflict conflict :push_delete push-delete :pull_delete pull-delete
+                      :bytes_up bytes-up :bytes_down bytes-down)
+        :warnings nil))
+
+(ert-deftest jsonyter-test-sync-pair-plist-normalizes-cons-and-plist ()
+  (should (equal (jsonyter--sync-pair-plist (cons "~/data" "work/data"))
+                 (list :local "~/data" :remote "work/data")))
+  (let ((pl (list :local "~/data" :remote "work/data" :conflict 'newest)))
+    (should (eq (jsonyter--sync-pair-plist pl) pl))))
+
+(ert-deftest jsonyter-test-sync-pair-accessors ()
+  (let ((pair (list :local "/tmp/x/" :remote "/work/data/" :conflict 'newest
+                    :delete 'push :ignore '("*.tmp"))))
+    (should (equal (jsonyter--sync-pair-local pair) "/tmp/x"))
+    (should (equal (jsonyter--sync-pair-remote pair) "work/data"))
+    (should (equal (jsonyter--sync-pair-conflict pair) "newest"))
+    (should (equal (jsonyter--sync-pair-delete pair) "push"))
+    (let ((jsonyter-sync-ignore '("*.bak")))
+      (should (equal (jsonyter--sync-pair-ignore pair) '("*.tmp" "*.bak")))))
+  (let ((pair (list :local "/tmp/x")))
+    (should (equal (jsonyter--sync-pair-conflict pair) "ask"))
+    (should (equal (jsonyter--sync-pair-delete pair) "none"))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-picks-most-specific-local-match ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/project/data/nested/")
+    (let ((jsonyter-sync-pairs
+           (list (cons "/tmp/project" "work")
+                (cons "/tmp/project/data" "work/data"))))
+      (should (equal (jsonyter--sync-pair-remote
+                     (jsonyter--sync-resolve-pair (cons (current-buffer) nil)))
+                    "work/data")))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-matches-remote-dired-cwd ()
+  (with-temp-buffer
+    (jsonyter-remote-dired-mode)
+    (setq jsonyter--remote-cwd "work/data/")
+    (let ((jsonyter-sync-pairs (list (list :local "/tmp/project" :remote "work")
+                                     (list :local "/tmp/project/data" :remote "work/data"))))
+      (should (equal (jsonyter--sync-pair-local
+                     (jsonyter--sync-resolve-pair (cons (current-buffer) nil)))
+                    (directory-file-name (expand-file-name "/tmp/project/data")))))))
+
+(ert-deftest jsonyter-test-sync-invoking-directory-uses-dired-current-directory ()
+  (require 'dired)
+  (let ((dir (file-name-as-directory (make-temp-file "jsonyter-sync-dired-" t))))
+    (unwind-protect
+        (let ((dired-buf (dired-noselect dir)))
+          (unwind-protect
+              (with-current-buffer dired-buf
+                (should (equal (jsonyter--sync-invoking-directory) (dired-current-directory))))
+            (kill-buffer dired-buf)))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-excludes-server-mismatch ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/project/")
+    (setq-local jsonyter--url "http://serverA")
+    (let ((jsonyter-sync-pairs
+           (list (list :local "/tmp/project" :remote "wrong" :server "http://serverB")
+                (list :local "/tmp/project" :remote "right" :server "http://serverA"))))
+      (should (equal (jsonyter--sync-pair-remote
+                     (jsonyter--sync-resolve-pair (cons (current-buffer) nil)))
+                    "right")))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-offers-to-create-when-none-match ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/newproj/")
+    (let ((jsonyter-sync-pairs nil))
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (_p) t))
+                ((symbol-function 'customize-save-variable) (lambda (sym val) (set sym val)))
+                ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "work/"))
+                ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "work/newproj")))
+        (let ((pair (jsonyter--sync-resolve-pair (cons (current-buffer) nil))))
+          (should (equal (jsonyter--sync-pair-remote pair) "work/newproj"))
+          (should (equal jsonyter-sync-pairs (list pair))))))))
+
+(ert-deftest jsonyter-test-sync-entries-glyphs-and-faces ()
+  (let* ((entries
+          (list (jsonyter-tests--sync-entry
+                "a.csv" "push" "local-changed"
+                :local (jsonyter-tests--sync-side 10 "h1" 100.0)
+                :remote (jsonyter-tests--sync-side 8 "h0" "2026-01-01T00:00:00Z"))
+               (jsonyter-tests--sync-entry
+                "b.csv" "pull" "remote-changed"
+                :local (jsonyter-tests--sync-side 5 "h0" 90.0)
+                :remote (jsonyter-tests--sync-side 6 "h1" "2026-01-01T00:00:00Z"))
+               (jsonyter-tests--sync-entry
+                "c.csv" "conflict" "both-changed"
+                :local (jsonyter-tests--sync-side 1 "hl" 1.0)
+                :remote (jsonyter-tests--sync-side 2 "hr" "2026-01-01T00:00:00Z"))
+               (jsonyter-tests--sync-entry
+                "d.csv" "push-delete" "local-missing"
+                :remote (jsonyter-tests--sync-side 3 "hh" "2026-01-01T00:00:00Z"))
+               (jsonyter-tests--sync-entry
+                "e.csv" "pull-delete" "remote-missing"
+                :local (jsonyter-tests--sync-side 4 "hh" 1.0))))
+         (plan (jsonyter-tests--sync-plan entries))
+         (rows (jsonyter--sync-entries plan nil t))
+         (row (lambda (path) (cadr (assoc path rows)))))
+    (should (= 5 (length rows)))
+    (should (equal (substring-no-properties (aref (funcall row "a.csv") 0)) ">"))
+    (should (eq (get-text-property 0 'face (aref (funcall row "a.csv") 0)) 'jsonyter-sync-push-face))
+    (should (equal (substring-no-properties (aref (funcall row "b.csv") 0)) "<"))
+    (should (eq (get-text-property 0 'face (aref (funcall row "b.csv") 0)) 'jsonyter-sync-pull-face))
+    (should (equal (substring-no-properties (aref (funcall row "c.csv") 0)) "!"))
+    (should (eq (get-text-property 0 'face (aref (funcall row "c.csv") 0)) 'jsonyter-sync-conflict-face))
+    (should (equal (substring-no-properties (aref (funcall row "d.csv") 0)) ">D"))
+    (should (equal (substring-no-properties (aref (funcall row "e.csv") 0)) "<D"))
+    (should (equal (aref (funcall row "a.csv") 2) (jsonyter--human-size 10)))
+    (should (equal (aref (funcall row "b.csv") 2) (jsonyter--human-size 6)))))
+
+(ert-deftest jsonyter-test-sync-entries-hides-unchanged-by-default ()
+  (let* ((entries (list (jsonyter-tests--sync-entry
+                        "same.csv" "converge" "identical"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0)
+                        :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z"))
+                       (jsonyter-tests--sync-entry
+                        "unchanged.csv" "skip" "unchanged"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0)
+                        :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z"))
+                       (jsonyter-tests--sync-entry
+                        "moved.csv" "push" "local-changed"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil)))
+         (plan (jsonyter-tests--sync-plan entries)))
+    (should (= 1 (length (jsonyter--sync-entries plan nil nil))))
+    (should (= 3 (length (jsonyter--sync-entries plan nil t))))))
+
+(ert-deftest jsonyter-test-sync-entries-shows-missing-side-skip-always ()
+  (let* ((entries (list (jsonyter-tests--sync-entry
+                        "leftover.csv" "skip" "remote-missing"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil)))
+         (plan (jsonyter-tests--sync-plan entries)))
+    (should (= 1 (length (jsonyter--sync-entries plan nil nil))))))
+
+(ert-deftest jsonyter-test-sync-set-override-only-genuine ()
+  (let ((jsonyter--sync-entries-by-path (make-hash-table :test #'equal))
+        (jsonyter--sync-overrides nil))
+    (puthash "a.csv" (list :path "a.csv" :action "push") jsonyter--sync-entries-by-path)
+    (puthash "b.csv" (list :path "b.csv" :action "conflict") jsonyter--sync-entries-by-path)
+    (jsonyter--sync-set-override "a.csv" "push")
+    (should (null jsonyter--sync-overrides))
+    (jsonyter--sync-set-override "b.csv" "pull")
+    (should (equal jsonyter--sync-overrides '(("b.csv" . "pull"))))
+    (jsonyter--sync-set-override "b.csv" "skip")
+    (should (equal jsonyter--sync-overrides '(("b.csv" . "skip"))))))
+
+(ert-deftest jsonyter-test-sync-resolve-newest-and-other-directions ()
+  (with-temp-buffer
+    (jsonyter-sync-mode)
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work"))
+    (setq jsonyter--sync-plan
+          (jsonyter-tests--sync-plan
+           (list (jsonyter-tests--sync-entry
+                 "both.csv" "conflict" "both-changed"
+                 :local (jsonyter-tests--sync-side 1 "hl" 1.0)
+                 :remote (jsonyter-tests--sync-side 2 "hr" "2026-01-01T00:00:00Z")
+                 :newest "remote")
+                (jsonyter-tests--sync-entry
+                 "localmissing.csv" "conflict" "local-missing"
+                 :local nil :remote (jsonyter-tests--sync-side 2 "hr" "2026-01-01T00:00:00Z")
+                 :newest "local"))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (jsonyter-sync-resolve-newest)
+    (should (equal (cdr (assoc "both.csv" jsonyter--sync-overrides)) "pull"))
+    (goto-char (point-min))
+    (jsonyter-sync-clear-override)
+    (goto-char (point-min))
+    (jsonyter-sync-resolve-other)
+    (should (equal (cdr (assoc "both.csv" jsonyter--sync-overrides)) "push"))
+    ;; "localmissing.csv": local is absent, remote present, and the
+    ;; (fabricated) newest side is "local" -- local's absence wins, so
+    ;; the remote copy must be deleted to match it.
+    (goto-char (point-min))
+    (forward-line 1)
+    (jsonyter-sync-resolve-newest)
+    (should (equal (cdr (assoc "localmissing.csv" jsonyter--sync-overrides)) "push-delete"))))
+
+(ert-deftest jsonyter-test-sync-override-delete-picks-correct-side ()
+  (with-temp-buffer
+    (jsonyter-sync-mode)
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work"))
+    (setq jsonyter--sync-plan
+          (jsonyter-tests--sync-plan
+           (list (jsonyter-tests--sync-entry
+                 "localonly.csv" "push" "local-new"
+                 :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil)
+                (jsonyter-tests--sync-entry
+                 "remoteonly.csv" "pull" "remote-new"
+                 :local nil :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z"))
+                (jsonyter-tests--sync-entry
+                 "both.csv" "conflict" "both-changed"
+                 :local (jsonyter-tests--sync-side 1 "h" 1.0)
+                 :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z")))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (jsonyter-sync-override-delete)
+    (should (equal (cdr (assoc "localonly.csv" jsonyter--sync-overrides)) "pull-delete"))
+    (goto-char (point-min)) (forward-line 1)
+    (jsonyter-sync-override-delete)
+    (should (equal (cdr (assoc "remoteonly.csv" jsonyter--sync-overrides)) "push-delete"))
+    (goto-char (point-min)) (forward-line 2)
+    (cl-letf (((symbol-function 'read-char-choice) (lambda (&rest _) ?r)))
+      (jsonyter-sync-override-delete))
+    (should (equal (cdr (assoc "both.csv" jsonyter--sync-overrides)) "push-delete"))))
+
+(ert-deftest jsonyter-test-sync-destructive-p-triggers-correctly ()
+  (let ((jsonyter-sync-review-threshold 3))
+    (should-not (jsonyter--sync-destructive-p
+                (jsonyter-tests--sync-plan
+                 (list (jsonyter-tests--sync-entry "a" "push" "local-new")) :push 1)))
+    (should (jsonyter--sync-destructive-p
+            (jsonyter-tests--sync-plan
+             (list (jsonyter-tests--sync-entry "a" "push-delete" "local-missing"))
+             :push-delete 1)))
+    (should (jsonyter--sync-destructive-p
+            (jsonyter-tests--sync-plan
+             (mapcar (lambda (n) (jsonyter-tests--sync-entry (format "f%d" n) "push" "local-new"))
+                    (number-sequence 1 4))
+             :push 4)))
+    (should (jsonyter--sync-destructive-p
+            (jsonyter-tests--sync-plan
+             (list (jsonyter-tests--sync-entry "a" "push" "both-changed" :resolution "push"))
+             :push 1)))))
+
+(ert-deftest jsonyter-test-sync-should-review-p-honors-policy ()
+  (let ((plan (jsonyter-tests--sync-plan
+              (list (jsonyter-tests--sync-entry "a" "push" "local-new")) :push 1)))
+    (let ((jsonyter-sync-review 'always))
+      (should (jsonyter--sync-should-review-p plan nil)))
+    (let ((jsonyter-sync-review 'never))
+      (should-not (jsonyter--sync-should-review-p plan nil))
+      (should (jsonyter--sync-should-review-p plan t)))
+    (let ((jsonyter-sync-review 'when-destructive))
+      (should-not (jsonyter--sync-should-review-p plan nil)))))
+
+(ert-deftest jsonyter-test-sync-plan-for-wire-nullifies-and-vconcats ()
+  (let* ((entries (list (jsonyter-tests--sync-entry
+                        "a" "push" "local-new"
+                        :local (jsonyter-tests--sync-side 5 "h" 1.0) :remote nil)))
+         (plan (plist-put (jsonyter-tests--sync-plan entries :push 1) :clock_skew nil)))
+    (let* ((wire (jsonyter--sync-plan-for-wire plan))
+           (wentries (plist-get wire :entries)))
+      (should (vectorp wentries))
+      (should (eq :null (plist-get wire :clock_skew)))
+      (let ((wentry (aref wentries 0)))
+        (should (eq :null (plist-get wentry :remote)))
+        (should (eq :null (plist-get wentry :resolution)))
+        (should (equal (plist-get (plist-get wentry :local) :size) 5)))
+      (should (stringp (json-serialize wire))))))
+
+(ert-deftest jsonyter-test-error-message-sync-refused-reasons ()
+  (should (string-match-p
+          "jsonyter-sync-max-deletes"
+          (jsonyter--error-message
+           '(:error "SyncRefused" :message "refusing to sync: too many deletes"
+             :reason "too-many-deletes" :count 40 :max_deletes 25))))
+  (should (string-match-p
+          "jsonyter-sync-abort"
+          (jsonyter--error-message
+           '(:error "SyncRefused" :message "another sync is running"
+             :reason "locked" :holder "1234"))))
+  (should (string-match-p
+          "directory you meant to sync"
+          (jsonyter--error-message
+           '(:error "SyncRefused" :message "too many files"
+             :reason "too-many-files" :max_files 5000)))))
+
+(ert-deftest jsonyter-test-sync-run-sets-mode-line-tag-and-clears ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (handlers nil) (id nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (_m _p hs) (setq handlers hs) 1)))
+        (setq id (jsonyter--sync-run (cons (current-buffer) session) "sync_plan" nil #'ignore))
+        (funcall (plist-get handlers :progress) '(:phase "scan" :op "local"))
+        (should (equal "sync" (plist-get (jsonyter--session-transfer session) :phase)))
+        (should (null (plist-get (jsonyter--session-transfer session) :files_total)))
+        (funcall (plist-get handlers :progress)
+                '(:phase "sync" :op "push" :file_index 4 :files_total 12))
+        (should (equal 4 (plist-get (jsonyter--session-transfer session) :file_index)))
+        (should (equal 12 (plist-get (jsonyter--session-transfer session) :files_total)))
+        (should (equal id (plist-get (jsonyter--session-transfer session) :request-id)))
+        (funcall (plist-get handlers :result) '(:result (:ok t)))
+        (should (null (jsonyter--session-transfer session)))))))
+
+(ert-deftest jsonyter-test-session-status-tag-renders-sync-phase ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (jsonyter-mode-line-show-kernel-id nil))
+      (setf (jsonyter--session-transfer session) '(:phase "sync"))
+      (should (equal ":sync" (jsonyter--session-status-tag session)))
+      (setf (jsonyter--session-transfer session) '(:phase "sync" :file_index 4 :files_total 12))
+      (should (equal ":sync 4/12" (jsonyter--session-status-tag session))))))
+
+(ert-deftest jsonyter-test-sync-abort-errors-with-nothing-running ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session))))
+        (should-error (jsonyter-sync-abort) :type 'user-error)))))
+
+(ert-deftest jsonyter-test-sync-abort-sends-cancel-with-recorded-id ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (sent-method nil) (sent-params nil))
+      (setf (jsonyter--session-transfer session) '(:phase "sync" :request-id 42))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--send)
+                (lambda (m p &rest _) (setq sent-method m sent-params p))))
+        (jsonyter-sync-abort)
+        (should (equal sent-method "cancel_sync"))
+        (should (equal (plist-get sent-params :request_id) 42))))))
+
+(ert-deftest jsonyter-test-sync-state-path-matches-known-hash ()
+  (let ((pair (list :local "/home/e/project/data" :remote "work/data"))
+        (jsonyter-sync-state-directory "/custom/state"))
+    (should (equal (jsonyter--sync-state-path "http://localhost:8888" pair)
+                  "/custom/state/26c4e9c9f55e0cc5.json"))))
+
+(ert-deftest jsonyter-test-sync-forget-pair-removes-matching-entry ()
+  (let ((jsonyter-sync-pairs (list (cons "/tmp/a" "work/a") (cons "/tmp/b" "work/b"))))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_p) nil)))
+      (jsonyter-sync-forget-pair (jsonyter--sync-pair-plist (cons "/tmp/a" "work/a")) nil))
+    (should (= 1 (length jsonyter-sync-pairs)))
+    (should (equal (jsonyter--sync-pair-remote (jsonyter--sync-pair-plist (car jsonyter-sync-pairs)))
+                  "work/b"))))
+
+(ert-deftest jsonyter-test-sync-execute-sends-plan-and-overrides ()
+  (with-temp-buffer
+    (jsonyter-sync-mode)
+    (setq jsonyter--sync-owner (current-buffer)
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides '(("b.csv" . "skip")))
+    (setq jsonyter--sync-plan
+          (jsonyter-tests--sync-plan
+           (list (jsonyter-tests--sync-entry
+                 "a.csv" "push" "local-new"
+                 :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+           :push 1))
+    (let (sent-method sent-params)
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (m p &rest _) (setq sent-method m sent-params p) 1))
+                ((symbol-function 'y-or-n-p) (lambda (_p) t)))
+        (jsonyter-sync-execute))
+      (should (equal sent-method "sync_apply"))
+      (should (equal (gethash "b.csv" (plist-get sent-params :overrides)) "skip")))))
+
+;; The orchestration layer (`jsonyter--sync-command' and friends) and the
+;; standalone pair/baseline commands are otherwise only exercised end to
+;; end by the harness scenario (sync.el), which a batch coverage run does
+;; not see. These stub `jsonyter--send' to answer synchronously, so a
+;; whole plan-then-apply round trip runs inline within one `should'.
+
+(ert-deftest jsonyter-test-sync-command-applies-directly-and-reports ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work"))
+           (plan (jsonyter-tests--sync-plan
+                  (list (jsonyter-tests--sync-entry
+                        "a.csv" "push" "local-new"
+                        :local (jsonyter-tests--sync-side 10 "h" 1.0) :remote nil))
+                  :push 1))
+           (apply-result (list :ok t :moved (list :pushed 1 :pulled 0 :converged 0
+                                                  :deleted_local 0 :deleted_remote 0)
+                               :bytes_up 10 :bytes_down 0 :skipped 0
+                               :conflicts_unresolved 0 :failed nil :conflict_copies nil
+                               :integrity "sha256" :elapsed 0.1))
+           (calls nil) (said nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'jsonyter--send)
+                (lambda (method params handlers)
+                  (push method calls)
+                  (pcase method
+                    ("sync_plan" (funcall (plist-get handlers :result) (list :result plan)))
+                    ("sync_apply" (funcall (plist-get handlers :result) (list :result apply-result))))
+                  1))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync))
+      (should (equal (nreverse calls) '("sync_plan" "sync_apply")))
+      (should (string-match-p "synced .*1 up" said))
+      (should (null (seq-find (lambda (b) (string-prefix-p "*jsonyter-sync: " (buffer-name b)))
+                              (buffer-list)))))))
+
+(ert-deftest jsonyter-test-sync-command-opens-review-when-destructive ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work"))
+           (plan (jsonyter-tests--sync-plan
+                  (list (jsonyter-tests--sync-entry
+                        "gone.csv" "push-delete" "local-missing"
+                        :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z")))
+                  :push-delete 1))
+           (calls nil) (buf nil))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                      (lambda () (cons (current-buffer) session)))
+                      ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                      ((symbol-function 'jsonyter--send)
+                      (lambda (method _params handlers)
+                        (push method calls)
+                        (when (equal method "sync_plan")
+                          (funcall (plist-get handlers :result) (list :result plan)))
+                        1)))
+              (jsonyter-sync))
+            (should (equal calls '("sync_plan")))
+            (setq buf (seq-find (lambda (b) (string-prefix-p "*jsonyter-sync: " (buffer-name b)))
+                                (buffer-list)))
+            (should buf)
+            (should (with-current-buffer buf (derived-mode-p 'jsonyter-sync-mode))))
+        (when buf (kill-buffer buf))))))
+
+(ert-deftest jsonyter-test-sync-command-reports-plan-error ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work"))
+           (calls nil) (said nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'jsonyter--send)
+                (lambda (method _params handlers)
+                  (push method calls)
+                  (funcall (plist-get handlers :result) (list :error (list :message "no such directory")))
+                  1))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync))
+      (should (equal calls '("sync_plan")))
+      (should (string-match-p "no such directory" said)))))
+
+(ert-deftest jsonyter-test-sync-command-reports-apply-error ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work"))
+           (plan (jsonyter-tests--sync-plan
+                  (list (jsonyter-tests--sync-entry
+                        "a.csv" "push" "local-new"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+                  :push 1))
+           (said nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'jsonyter--send)
+                (lambda (method _params handlers)
+                  (pcase method
+                    ("sync_plan" (funcall (plist-get handlers :result) (list :result plan)))
+                    ("sync_apply" (funcall (plist-get handlers :result)
+                                          (list :error (list :message "locked.db changed")))))
+                  1))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync))
+      (should (string-match-p "locked.db changed" said)))))
+
+(ert-deftest jsonyter-test-sync-command-refuses-second-sync-and-can-abort ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (cancel-sent nil))
+      (setf (jsonyter--session-transfer session) '(:phase "sync" :request-id 7))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'y-or-n-p) (lambda (_p) t))
+                ((symbol-function 'jsonyter--send)
+                (lambda (method params &rest _)
+                  (when (equal method "cancel_sync") (setq cancel-sent params)))))
+        (jsonyter-sync))
+      (should (equal (plist-get cancel-sent :request_id) 7)))))
+
+(ert-deftest jsonyter-test-sync-command-refuses-second-sync-when-declined ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-transfer session) '(:phase "sync" :request-id 7))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'y-or-n-p) (lambda (_p) nil)))
+        (should-error (jsonyter-sync) :type 'user-error)))))
+
+(ert-deftest jsonyter-test-sync-command-refuses-when-busy-with-other-phase ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (setf (jsonyter--session-transfer session) '(:phase "upload" :pct 40))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session))))
+        (should-error (jsonyter-sync) :type 'user-error)))))
+
+(ert-deftest jsonyter-test-sync-push-and-pull-force-conflict-policy ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (pair (list :local "/tmp/x" :remote "work"))
+          (sent nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'jsonyter--send)
+                (lambda (_m params _h) (push params sent) 1)))
+        (jsonyter-sync-push)
+        (should (equal (plist-get (car sent) :conflict) "local"))
+        ;; The stub never completes the request, so nothing clears the
+        ;; session's `busy' transfer slot on its own -- reset it here the
+        ;; way a real finished sync would, or the second call reads
+        ;; `jsonyter--sync-command''s "already running" branch and hits
+        ;; a real `y-or-n-p' with no minibuffer to answer it from.
+        (setf (jsonyter--session-transfer session) nil)
+        (jsonyter-sync-pull)
+        (should (equal (plist-get (car sent) :conflict) "remote"))))))
+
+(ert-deftest jsonyter-test-sync-status-never-auto-applies ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work"))
+           (plan (jsonyter-tests--sync-plan
+                  (list (jsonyter-tests--sync-entry
+                        "a.csv" "push" "local-new"
+                        :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+                  :push 1))
+           (calls nil) (buf nil))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                      (lambda () (cons (current-buffer) session)))
+                      ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                      ((symbol-function 'jsonyter--send)
+                      (lambda (method _params handlers)
+                        (push method calls)
+                        (when (equal method "sync_plan")
+                          (funcall (plist-get handlers :result) (list :result plan)))
+                        1)))
+              (jsonyter-sync-status))
+            (should (equal calls '("sync_plan")))
+            (setq buf (seq-find (lambda (b) (string-prefix-p "*jsonyter-sync: " (buffer-name b)))
+                                (buffer-list)))
+            (should buf))
+        (when buf (kill-buffer buf))))))
+
+(defmacro jsonyter-tests--with-sync-buffer (owner-var &rest body)
+  "Run BODY in a fresh `jsonyter-sync-mode' buffer, OWNER-VAR bound to a
+throwaway owner buffer that is killed afterward along with the sync buffer."
+  (declare (indent 1) (debug t))
+  `(let ((,owner-var (generate-new-buffer " *sync-owner*")))
+     (unwind-protect
+         (with-temp-buffer
+           (jsonyter-sync-mode)
+           ,@body)
+       (kill-buffer ,owner-var))))
+
+(ert-deftest jsonyter-test-sync-replan-updates-plan-and-clears-overrides ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-conflict-override nil
+          jsonyter--sync-overrides '(("old.csv" . "skip"))
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry "old.csv" "push" "local-new"))
+                              :push 1))
+    (let ((new-plan (jsonyter-tests--sync-plan
+                     (list (jsonyter-tests--sync-entry "new.csv" "pull" "remote-new"))
+                     :pull 1)))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (_m _p handlers) (funcall (plist-get handlers :result) (list :result new-plan)) 1)))
+        (jsonyter-sync-replan))
+      (should (equal (plist-get jsonyter--sync-plan :entries) (plist-get new-plan :entries)))
+      (should (null jsonyter--sync-overrides)))))
+
+(ert-deftest jsonyter-test-sync-replan-reports-error ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry "old.csv" "push" "local-new"))
+                              :push 1))
+    (let (said)
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (_m _p handlers)
+                  (funcall (plist-get handlers :result) (list :error (list :message "offline")))
+                  1))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync-replan))
+      (should (string-match-p "offline" said)))))
+
+(ert-deftest jsonyter-test-sync-execute-reports-completion-and-replans ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides nil
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "a.csv" "push" "local-new"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+                              :push 1))
+    (let ((result (list :ok t :moved (list :pushed 1 :pulled 0 :converged 0
+                                           :deleted_local 0 :deleted_remote 0)
+                        :bytes_up 1 :bytes_down 0 :skipped 0 :conflicts_unresolved 0
+                        :failed nil :conflict_copies nil :integrity "sha256" :elapsed 0.05))
+          (calls nil) (said nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (method _params handlers)
+                  (push method calls)
+                  (pcase method
+                    ("sync_apply" (funcall (plist-get handlers :result) (list :result result)))
+                    ("sync_plan" (funcall (plist-get handlers :result)
+                                         (list :result (jsonyter-tests--sync-plan nil)))))
+                  1))
+                ((symbol-function 'y-or-n-p) (lambda (_p) t))
+                ((symbol-function 'message)
+                ;; The automatic re-plan that follows a successful apply
+                ;; messages too ("re-planning ..."), overwriting a single
+                ;; captured string -- collect every message instead of
+                ;; keeping only the last.
+                (lambda (fmt &rest args) (push (apply #'format fmt args) said))))
+        (jsonyter-sync-execute))
+      (should (equal (nreverse calls) '("sync_apply" "sync_plan")))
+      (should (seq-some (lambda (s) (string-match-p "synced .*1 up" s)) said)))))
+
+(ert-deftest jsonyter-test-sync-execute-reports-error-without-replanning ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides nil
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "a.csv" "push" "local-new"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+                              :push 1))
+    (let ((calls nil) (said nil))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (method _params handlers)
+                  (push method calls)
+                  (funcall (plist-get handlers :result) (list :error (list :message "stale")))
+                  1))
+                ((symbol-function 'y-or-n-p) (lambda (_p) t))
+                ((symbol-function 'message)
+                (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync-execute))
+      (should (equal calls '("sync_apply")))
+      (should (string-match-p "stale" said)))))
+
+(ert-deftest jsonyter-test-sync-execute-confirms-when-plan-moves-nothing ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides nil
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry "a.csv" "skip" "unchanged"))))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_p) nil)))
+      (should-error (jsonyter-sync-execute) :type 'user-error))))
+
+(ert-deftest jsonyter-test-sync-execute-aborts-when-declined ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides nil
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "a.csv" "push" "local-new"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))
+                              :push 1))
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--send) (lambda (&rest _) (setq sent t)))
+                ((symbol-function 'y-or-n-p) (lambda (_p) nil)))
+        (should-error (jsonyter-sync-execute) :type 'user-error))
+      (should-not sent))))
+
+(ert-deftest jsonyter-test-sync-add-pair-pushes-and-persists-on-request ()
+  (let ((jsonyter-sync-pairs nil) (saved nil))
+    (cl-letf (((symbol-function 'customize-save-variable)
+              (lambda (sym val) (setq saved (list sym val)))))
+      (jsonyter-sync-add-pair "/tmp/proj" "work/proj" "http://x" nil)
+      (should (null saved))
+      (should (equal (car jsonyter-sync-pairs) '(:local "/tmp/proj" :remote "work/proj" :server "http://x")))
+      (jsonyter-sync-add-pair "/tmp/proj2" "work/proj2" nil t)
+      (should (equal saved (list 'jsonyter-sync-pairs jsonyter-sync-pairs))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-interactive-form ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (jsonyter-sync-pairs nil))
+      (setq-local jsonyter--url "http://y")
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'read-directory-name) (lambda (&rest _) "/tmp/interactive"))
+                ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "work/"))
+                ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "work/interactive"))
+                ((symbol-function 'y-or-n-p) (lambda (_p) nil))
+                ((symbol-function 'customize-save-variable) #'ignore))
+        (call-interactively #'jsonyter-sync-add-pair))
+      (should (equal (car jsonyter-sync-pairs)
+                    '(:local "/tmp/interactive" :remote "work/interactive" :server "http://y"))))))
+
+(ert-deftest jsonyter-test-sync-forget-pair-deletes-baseline-when-asked ()
+  (let* ((jsonyter-sync-pairs (list (list :local "/tmp/a" :remote "work/a" :server "http://x")))
+         (deleted nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_p) nil))
+              ((symbol-function 'jsonyter--sync-delete-baseline)
+              (lambda (server pair) (setq deleted (list server pair)))))
+      (jsonyter-sync-forget-pair (car jsonyter-sync-pairs) t))
+    (should (equal deleted (list "http://x" (car (list (list :local "/tmp/a" :remote "work/a" :server "http://x"))))))))
+
+(ert-deftest jsonyter-test-sync-forget-pair-interactive-form ()
+  (let ((jsonyter-sync-pairs (list (cons "/tmp/a" "work/a") (cons "/tmp/b" "work/b"))))
+    (cl-letf (((symbol-function 'completing-read)
+              (lambda (&rest _) "/tmp/a <-> work/a"))
+              ((symbol-function 'y-or-n-p) (lambda (_p) nil)))
+      (call-interactively #'jsonyter-sync-forget-pair))
+    (should (= 1 (length jsonyter-sync-pairs)))
+    (should (equal (jsonyter--sync-pair-remote (jsonyter--sync-pair-plist (car jsonyter-sync-pairs)))
+                  "work/b"))))
+
+(ert-deftest jsonyter-test-sync-reset-baseline-deletes-when-confirmed ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work" :server "http://x"))
+           (deleted nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'y-or-n-p) (lambda (_p) t))
+                ((symbol-function 'jsonyter--sync-delete-baseline)
+                (lambda (server p) (setq deleted (list server p)))))
+        (jsonyter-sync-reset-baseline))
+      (should (equal deleted (list "http://x" pair))))))
+
+(ert-deftest jsonyter-test-sync-reset-baseline-declined-deletes-nothing ()
+  (jsonyter-tests--with-sessions
+    (let* ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+           (pair (list :local "/tmp/x" :remote "work" :server "http://x"))
+           (deleted nil))
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session)))
+                ((symbol-function 'jsonyter--sync-resolve-pair) (lambda (_ctx) pair))
+                ((symbol-function 'y-or-n-p) (lambda (_p) nil))
+                ((symbol-function 'jsonyter--sync-delete-baseline)
+                (lambda (&rest args) (setq deleted args))))
+        (jsonyter-sync-reset-baseline))
+      (should (null deleted)))))
+
+(ert-deftest jsonyter-test-sync-baseline-server-prefers-pairs-own-server ()
+  (let ((pair (list :local "/tmp/x" :remote "work" :server "http://explicit")))
+    (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+              (lambda () (error "must not be called when the pair names a server"))))
+      (should (equal (jsonyter--sync-baseline-server pair) "http://explicit")))))
+
+(ert-deftest jsonyter-test-sync-baseline-server-falls-back-to-context ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+          (pair (list :local "/tmp/x" :remote "work")))
+      (setq-local jsonyter--url "http://from-context")
+      (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) session))))
+        (should (equal (jsonyter--sync-baseline-server pair) "http://from-context"))))))
+
+(ert-deftest jsonyter-test-sync-delete-baseline-removes-file-and-reports-missing ()
+  (let* ((dir (make-temp-file "jsonyter-sync-baseline-" t))
+         (jsonyter-sync-state-directory dir)
+         (pair (list :local "/tmp/x" :remote "work"))
+         (path (jsonyter--sync-state-path "http://x" pair))
+         (said nil))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "{}"))
+          (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+            (jsonyter--sync-delete-baseline "http://x" pair))
+          (should-not (file-exists-p path))
+          (should (string-match-p "deleted baseline" said))
+          (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+            (jsonyter--sync-delete-baseline "http://x" pair))
+          (should (string-match-p "no baseline on record" said)))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-sync-diff-entry-refuses-when-one-side-missing ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "a.csv" "push" "local-new"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0) :remote nil))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (should-error (jsonyter-sync-diff-entry) :type 'user-error)))
+
+(ert-deftest jsonyter-test-sync-diff-entry-refuses-when-oversized ()
+  (jsonyter-tests--with-sync-buffer owner
+    (let ((jsonyter-sync-diff-max-size 100))
+      (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+            jsonyter--sync-plan (jsonyter-tests--sync-plan
+                                (list (jsonyter-tests--sync-entry
+                                      "big.csv" "conflict" "both-changed"
+                                      :local (jsonyter-tests--sync-side 200 "h1" 1.0)
+                                      :remote (jsonyter-tests--sync-side 200 "h2" "2026-01-01T00:00:00Z")))))
+      (jsonyter--sync-render)
+      (goto-char (point-min))
+      (should-error (jsonyter-sync-diff-entry) :type 'user-error))))
+
+(ert-deftest jsonyter-test-sync-diff-entry-downloads-and-diffs ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-owner owner
+          jsonyter--sync-session-key nil
+          jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "both.csv" "conflict" "both-changed"
+                                    :local (jsonyter-tests--sync-side 10 "h1" 1.0)
+                                    :remote (jsonyter-tests--sync-side 10 "h2" "2026-01-01T00:00:00Z")))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (let (diff-args)
+      (cl-letf (((symbol-function 'jsonyter--transfer-run)
+                (lambda (_ctx _method _params on-success) (funcall on-success nil)))
+                ((symbol-function 'jsonyter-sync-diff-function)
+                (lambda (&rest _) nil)))
+        (let ((jsonyter-sync-diff-function (lambda (a b) (setq diff-args (list a b)))))
+          (jsonyter-sync-diff-entry)))
+      (should (equal (car diff-args) (expand-file-name "both.csv" "/tmp/x")))
+      (should (stringp (cadr diff-args))))))
+
+(ert-deftest jsonyter-test-sync-describe-entry-formats-message ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "both.csv" "conflict" "both-changed"
+                                    :local (jsonyter-tests--sync-side 10 "h1" 1.0)
+                                    :remote (jsonyter-tests--sync-side 12 "h2" "2026-01-01T00:00:00Z")
+                                    :newest "remote" :mtime-delta 30.0))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (let (said)
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync-describe-entry))
+      (should (string-match-p "both.csv: conflict/both-changed" said))
+      (should (string-match-p "remote newer by" said)))))
+
+(ert-deftest jsonyter-test-sync-override-push-pull-skip-commands ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry "a.csv" "conflict" "both-changed"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0)
+                                    :remote (jsonyter-tests--sync-side 1 "h2" "2026-01-01T00:00:00Z")))))
+    (jsonyter--sync-render)
+    (goto-char (point-min))
+    (jsonyter-sync-override-push)
+    (should (equal (cdr (assoc "a.csv" jsonyter--sync-overrides)) "push"))
+    (goto-char (point-min))
+    (jsonyter-sync-override-pull)
+    (should (equal (cdr (assoc "a.csv" jsonyter--sync-overrides)) "pull"))
+    (goto-char (point-min))
+    (jsonyter-sync-override-skip)
+    (should (equal (cdr (assoc "a.csv" jsonyter--sync-overrides)) "skip"))))
+
+(ert-deftest jsonyter-test-sync-toggle-unchanged-and-clear-all-overrides ()
+  (jsonyter-tests--with-sync-buffer owner
+    (setq jsonyter--sync-pair (list :local "/tmp/x" :remote "work")
+          jsonyter--sync-overrides '(("a.csv" . "skip"))
+          jsonyter--sync-plan (jsonyter-tests--sync-plan
+                              (list (jsonyter-tests--sync-entry
+                                    "same.csv" "converge" "identical"
+                                    :local (jsonyter-tests--sync-side 1 "h" 1.0)
+                                    :remote (jsonyter-tests--sync-side 1 "h" "2026-01-01T00:00:00Z")))))
+    (jsonyter--sync-render)
+    (should-not jsonyter--sync-show-unchanged)
+    (should (= 0 (length tabulated-list-entries)))
+    (jsonyter-sync-toggle-unchanged)
+    (should jsonyter--sync-show-unchanged)
+    (should (= 1 (length tabulated-list-entries)))
+    (let (said)
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq said (apply #'format fmt args)))))
+        (jsonyter-sync-clear-all-overrides))
+      (should (null jsonyter--sync-overrides))
+      (should (string-match-p "all overrides cleared" said)))))
+
+(ert-deftest jsonyter-test-sync-glyph-forget-and-unknown-actions ()
+  (should (equal (car (jsonyter--sync-glyph "forget")) "."))
+  (should (equal (car (jsonyter--sync-glyph "something-else")) "?")))
+
+(ert-deftest jsonyter-test-sync-format-remote-mtime-handles-nil-and-garbage ()
+  (should (equal (jsonyter--sync-format-remote-mtime nil) "--"))
+  (should (equal (jsonyter--sync-format-remote-mtime "not-a-date") "not-a-date")))
+
+(ert-deftest jsonyter-test-sync-note-integrity-warns-once-per-server ()
+  (let ((jsonyter--sync-integrity-warned (make-hash-table :test #'equal))
+        (pair (list :local "/tmp/x" :remote "work"))
+        (said nil) (count 0))
+    (cl-letf (((symbol-function 'message)
+              (lambda (fmt &rest args) (cl-incf count) (setq said (apply #'format fmt args)))))
+      (jsonyter--sync-note-integrity pair (jsonyter-tests--sync-plan nil :integrity "size" :server "http://x"))
+      (jsonyter--sync-note-integrity pair (jsonyter-tests--sync-plan nil :integrity "size" :server "http://x")))
+    (should (= 1 count))
+    (should (string-match-p "verifies sync by size only" said))))
+
+(ert-deftest jsonyter-test-sync-run-signals-and-clears-tag-on-send-error ()
+  (jsonyter-tests--with-sessions
+    (let ((session (jsonyter-tests--bind-session '("python" . "") "kid")))
+      (cl-letf (((symbol-function 'jsonyter--send)
+                (lambda (&rest _) (error "jsonyter: bridge process is not running"))))
+        (should-error (jsonyter--sync-run (cons (current-buffer) session) "sync_plan" nil #'ignore)))
+      (should (null (jsonyter--session-transfer session))))))
+
+(ert-deftest jsonyter-test-sync-ensure-pair-declines-when-user-says-no ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/declineme/")
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_p) nil))
+              ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "work/")))
+      (should-error (jsonyter--sync-resolve-pair (cons (current-buffer) nil)) :type 'user-error))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-uses-sole-pair-by-server ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/elsewhere/")
+    (let ((jsonyter-sync-pairs (list (list :local "/tmp/project" :remote "work"))))
+      (should (equal (jsonyter--sync-pair-remote
+                     (jsonyter--sync-resolve-pair (cons (current-buffer) nil)))
+                    "work")))))
+
+(ert-deftest jsonyter-test-sync-resolve-pair-reads-among-multiple-by-server ()
+  (with-temp-buffer
+    (setq default-directory "/tmp/elsewhere/")
+    (let ((jsonyter-sync-pairs (list (list :local "/tmp/a" :remote "work/a")
+                                     (list :local "/tmp/b" :remote "work/b"))))
+      (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "/tmp/b <-> work/b")))
+        (should (equal (jsonyter--sync-pair-remote
+                       (jsonyter--sync-resolve-pair (cons (current-buffer) nil)))
+                      "work/b"))))))
+
+(ert-deftest jsonyter-test-sync-mode-revert-buffer-function-replans ()
+  (jsonyter-tests--with-sync-buffer owner
+    (let (replanned)
+      (cl-letf (((symbol-function 'jsonyter-sync-replan) (lambda () (setq replanned t))))
+        (funcall revert-buffer-function))
+      (should replanned))))
+
 ;;;; jsonyter-org-connect-kernel
 
 (ert-deftest jsonyter-test-org-connect-kernel-attaches-block-session ()
