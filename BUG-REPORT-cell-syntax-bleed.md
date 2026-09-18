@@ -1,13 +1,14 @@
 # Bug report: one cell's punctuation re-colours the rest of the notebook
 
-**Status:** open
+**Status:** fixed
 **Date:** 2026-09-18
 **Affects:** `jsonyter.el` 2.4.0 (this repo)
 **Verified against:** GNU Emacs 29.3 (`-Q --batch`)
 **Severity:** visual, but unbounded in reach — a single character can change
 the colour of every cell below it, to the end of the buffer
 **Tests added:** `test/jsonyter-tests.el`, section "Font lock: a cell's syntax
-must stop at the cell" (3 tests, all `:expected-result :failed`)
+must stop at the cell" (3 tests, all originally `:expected-result :failed`;
+the marker is now removed from all 3 — see §7)
 
 ---
 
@@ -217,6 +218,28 @@ is.
    text too** (`jsonyter--nb-outputs-string`) and should get the same treatment;
    they happen to contain only box-drawing characters today, but that is not a
    guarantee.
+
+**Fixed**, following this shape closely:
+
+1. `jsonyter--nb-syntax-propertize`, a `syntax-propertize-function` installed
+   in `jsonyter-notebook-mode`, blankets every character of each
+   `jsonyter--nb-non-code-spans` span (output spans plus non-code cells'
+   source, merged) with punctuation syntax. `parse-sexp-lookup-properties`
+   is set buffer-locally in `jsonyter-notebook-mode`, not assumed from the
+   language mode.
+2. `jsonyter--nb-show-output-as-text` now calls `(syntax-ppss-flush-cache
+   src-end)` after rewriting an output region.
+3. Took the cheaper option: `jsonyter--nb-map-source-runs` (shared by
+   `jsonyter--nb-fontify-region`/`jsonyter--nb-unfontify-region`) now skips
+   `jsonyter--nb-non-code-spans` rather than only output spans, so a
+   markdown/raw cell's source gets neither the kernel language's syntax nor
+   its font-lock painting — manifestations A and C both close this way.
+4. The cell prompt is an overlay `before-string`
+   (`jsonyter--nb-refresh-prompt`), not buffer text, so `syntax-ppss` never
+   sees it and it needs no propertizing. The output block's own border
+   text (`jsonyter--nb-outputs-string`) *is* buffer text, but it already
+   falls inside the output span `jsonyter--nb-output-spans` reports, so it
+   was covered without further change.
 
 ---
 

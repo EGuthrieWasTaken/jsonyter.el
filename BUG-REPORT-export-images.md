@@ -1,6 +1,7 @@
 # Bug report: exporting a notebook that contains images
 
-**Status:** open
+**Status:** fixed (defects 1–4, in this repository); defect 5 filed against
+the `jsonyter` Python bridge, out of scope here — see §5
 **Date:** 2026-09-18
 **Affects:** `jsonyter.el` 2.4.0 (this repo)
 **Verified against:** GNU Emacs 29.3 (`-Q --batch`), `jsonyter` bridge 2.1.0,
@@ -9,8 +10,8 @@
 `jsonyter-notebook-export-*` wrapper fail outright on any notebook whose stored
 outputs contain a figure
 **Tests added:** `test/jsonyter-tests.el`, sections "Export and the wire" and
-"Org results survive the trip into a notebook" (8 tests, all
-`:expected-result :failed`)
+"Org results survive the trip into a notebook" (8 tests, all originally
+`:expected-result :failed`; the marker is now removed from all 8 — see §6)
 
 ---
 
@@ -20,13 +21,13 @@ Five separate defects sit under the reported symptom. They are independent and
 can be fixed independently, but **defect 1 is the one that makes export fail**,
 and defect 2 is the one that makes an export come out with no images in it.
 
-| # | Defect | Effect | Severity |
-| --- | --- | --- | --- |
-| 1 | `jsonyter--nb-collect-cells` sends nbformat's list-of-lines values to `json-serialize` | export dies in Emacs, before the bridge | blocking |
-| 2 | `jsonyter--org-parse-results-drawer` returns nbformat-shaped outputs, `jsonyter--nb-output-to-spec` reads kernel-shaped ones | every Org result, images included, becomes `[jsonyter: unrecognized output type nil]` | high |
-| 3 | `--by-block` spans stop at `#+end_src` | a hand-written Org file's results are dropped entirely | high |
-| 4 | export sends `:cells`, never the notebook's `metadata` | nbconvert gets a notebook with no `kernelspec`/`language_info` | medium |
-| 5 | the bridge's toolchain hint is keyed on format, not on cause | every `pdf` failure reads as "no TeX environment" | medium (diagnostics) |
+| # | Defect | Effect | Severity | Status |
+| --- | --- | --- | --- | --- |
+| 1 | `jsonyter--nb-collect-cells` sends nbformat's list-of-lines values to `json-serialize` | export dies in Emacs, before the bridge | blocking | fixed |
+| 2 | `jsonyter--org-parse-results-drawer` returns nbformat-shaped outputs, `jsonyter--nb-output-to-spec` reads kernel-shaped ones | every Org result, images included, becomes `[jsonyter: unrecognized output type nil]` | high | fixed |
+| 3 | `--by-block` spans stop at `#+end_src` | a hand-written Org file's results are dropped entirely | high | fixed |
+| 4 | export sends `:cells`, never the notebook's `metadata` | nbconvert gets a notebook with no `kernelspec`/`language_info` | medium | fixed |
+| 5 | the bridge's toolchain hint is keyed on format, not on cause | every `pdf` failure reads as "no TeX environment" | medium (diagnostics) | open — bridge repo, out of scope |
 
 Defects 1–4 are in this repository. Defect 5 is in the `jsonyter` Python
 bridge, but `jsonyter.el` is where it surfaces, and it is what made the real
@@ -178,6 +179,12 @@ applied on **both** branches of `jsonyter--nb-collect-cells` and inside
 Whatever the shape of the fix, it must be covered by a test that actually calls
 `json-serialize` on the finished params, not one that inspects the plist.
 
+**Fixed:** `jsonyter--nb-outputs-for-wire`/`jsonyter--nb-output-for-wire`/
+`jsonyter--nb-data-for-wire` added exactly as sketched above, applied in
+`jsonyter--nb-collect-cells`'s ALL-OUTPUTS branch and inside
+`jsonyter--nb-output-to-spec` (both its `:data`/`:metadata` and its `stream`
+`:text`, which was also list-valued and unhandled).
+
 ### 1.7 Tests added
 
 ```
@@ -258,6 +265,11 @@ turn a caller's mistake into notebook content. Signalling, or at least
 including the whole output plist in the placeholder, would have made this
 visible immediately.
 
+**Fixed:** took candidate 2 — `jsonyter--org-notebook-cell-from-span` now
+uses the drawer parser's outputs directly (`(vconcat outputs)`), not run
+through `jsonyter--nb-output-to-spec`. The `_` fallback itself is
+unchanged; nothing in this repo still calls it with drawer-parser output.
+
 ### 2.5 Tests added
 
 ```
@@ -296,6 +308,12 @@ converts its results correctly.
 **Fix direction:** extend the code span to include the block's `#+RESULTS:`
 drawer, the way the `--by-drawer` path already does implicitly.
 
+**Fixed:** the `--by-block` loop now also locates the block's result via
+`org-babel-where-is-src-block-result` (the same idiom already used
+elsewhere in this file, e.g. `jsonyter--org-result-images`) and extends
+`block-end` to the end of that drawer's `org-element` when one immediately
+follows.
+
 **Test added:** `jsonyter-test-org-to-notebook-by-block-keeps-results`
 
 ---
@@ -325,6 +343,13 @@ fix.
 parameter, and normalizes a list-valued `source` on that path itself. Sending
 the document rather than bare cells fixes this defect and reduces the surface
 of defect 1 at the same time.
+
+**Fixed:** took the smaller of the two shapes the test itself accepts —
+`jsonyter-notebook-export` now sends `:metadata (or jsonyter--nb-metadata
+(list))` alongside `:cells`, rather than switching to the `:notebook`
+parameter. `jsonyter--nb-metadata` is read from the file at open time (see
+`jsonyter-notebook-open`), so it does not need defect 1's wire-reshaping —
+it holds `kernelspec`/`language_info`, not output data.
 
 **Test added:** `jsonyter-test-export-request-carries-notebook-metadata`
 

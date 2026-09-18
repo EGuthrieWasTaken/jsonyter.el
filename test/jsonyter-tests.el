@@ -806,19 +806,16 @@ isolation, the way the tests above do."
         (should (get-text-property (overlay-start cell) 'face))))))
 
 ;;;; Font lock: a cell's syntax must stop at the cell
-;;;; (bug report: BUG-REPORT-cell-syntax-bleed.md)
+;;;; (bug report: BUG-REPORT-cell-syntax-bleed.md -- fixed)
 
 ;; `jsonyter--nb-fontify-region' keeps the language's font-lock from
 ;; PAINTING rendered output, and `jsonyter-test-font-lock-leaves-output-alone'
-;; above proves it -- with output that happens to be balanced Python.  What
-;; nothing constrains is the SYNTAX side: the buffer has one syntax table
-;; and one `syntax-propertize-function', and `syntax-ppss' parses from
-;; `point-min' straight through prose and output alike.  One unbalanced
-;; string, comment or math delimiter anywhere therefore re-colours every
-;; cell after it.
-;;
-;; `:expected-result :failed' throughout, for the reason given above
-;; `jsonyter-tests--notebook-with-figure'.
+;; above proves it -- with output that happens to be balanced Python.  The
+;; SYNTAX side -- `syntax-ppss' parsing from `point-min' straight through
+;; prose and output alike, so one unbalanced string, comment or math
+;; delimiter anywhere re-colours every cell after it -- is handled by
+;; `jsonyter--nb-syntax-propertize', a `syntax-propertize-function' that
+;; blankets non-code text with inert syntax.
 
 (defconst jsonyter-tests--notebook-prose-apostrophe "\
 {
@@ -853,7 +850,6 @@ the end of the notebook -- is painted `font-lock-string-face'.  Any
 character the notebook language treats as a string, comment or math
 delimiter does this; which characters those are depends on the mode
 `jsonyter-notebook-language-modes' picks."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-apostrophe
     (font-lock-mode 1)
     (font-lock-ensure)
@@ -867,7 +863,6 @@ from painting it -- but `syntax-ppss' still reads it.  An apostrophe in
 something a cell printed (\"can't\", a quoted filename, a traceback)
 opens a string as far as the parser is concerned, and the next cell's
 source comes out entirely `font-lock-string-face'."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json "\
 {
  \"cells\": [
@@ -900,7 +895,6 @@ a design decision as much as a defect -- a fix may reasonably decide
 markdown cells get markdown highlighting rather than none -- but leaving
 them highlighted as the kernel language is the one answer that is
 certainly wrong."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json "\
 {
  \"cells\": [
@@ -1015,9 +1009,9 @@ of saved results comes out blank."
                 (should (= 1 (length outputs-0)))
                 (should (equal "stream" (plist-get (car outputs-0) :output_type)))
                 ;; Read straight from the file, nbformat's list-of-lines
-                ;; shape and all -- this is `jsonyter-file-outputs' passed
-                ;; through untouched, not run through any conversion.
-                (should (equal '("stored one\n" "stored two\n")
+                ;; shape joined into one string -- `jsonyter-file-outputs'
+                ;; reshaped for the wire, see `jsonyter--nb-outputs-for-wire'.
+                (should (equal "stored one\nstored two\n"
                                (plist-get (car outputs-0) :text))))
               (should (= 1 (plist-get (nth 0 cells) :execution_count)))
               (let ((outputs-1 (append (plist-get (nth 1 cells) :outputs) nil)))
@@ -1899,10 +1893,7 @@ whatever markdown span it falls in, same as any other text there."
 
 
 ;;;; Org results survive the trip into a notebook
-;;;; (bug report: BUG-REPORT-export-images.md, defects 2 and 3)
-
-;; `:expected-result :failed' throughout, for the reason given above
-;; `jsonyter-tests--notebook-with-figure'.
+;;;; (bug report: BUG-REPORT-export-images.md, defects 2 and 3 -- fixed)
 
 (ert-deftest jsonyter-test-org-cell-from-span-preserves-image-output ()
   "An Org results drawer's image must reach the notebook as an image.
@@ -1918,7 +1909,6 @@ Org route to a document, so this is where an Org user's images go.
 The two existing drawer tests check the parser alone and the spec
 converter alone; neither composes them, which is exactly where the two
 key names disagree."
-  :expected-result :failed
   (jsonyter-tests--with-org-file
       (concat ":PROPERTIES:\n:JSONYTER_CELL_ID: aaa\n:END:\n"
               "#+begin_src python :session jy:main\nplt.plot([1, 2])\n#+end_src\n\n"
@@ -1942,7 +1932,6 @@ key names disagree."
 (ert-deftest jsonyter-test-org-cell-from-span-preserves-stream-output ()
   "The same key mismatch swallows a drawer's plain text too: what should
 be the printed line comes back as the unrecognized-output placeholder."
-  :expected-result :failed
   (jsonyter-tests--with-org-file
       (concat ":PROPERTIES:\n:JSONYTER_CELL_ID: aaa\n:END:\n"
               "#+begin_src python :session jy:main\nprint(1)\n#+end_src\n\n"
@@ -1966,7 +1955,6 @@ code span stops at `#+end_src'.  The `#+RESULTS:' drawer therefore falls
 into the *next* prose span: the code cell is rebuilt with no outputs at
 all \(the temp buffer the span is re-parsed in has no drawer to find\),
 and the drawer's raw Org text becomes a markdown cell."
-  :expected-result :failed
   (jsonyter-tests--with-org-file
       (concat "#+begin_src python :session jy:main\nprint(1)\n#+end_src\n\n"
               "#+RESULTS:\n:results:\n: printed line\n:end:\n")
@@ -2195,13 +2183,7 @@ reachability up front, is treated the same as any other failure here."
 
 
 ;;;; Export and the wire: a notebook's stored outputs must survive
-;;;; `json-serialize' (bug report: BUG-REPORT-export-images.md)
-
-;; Every test in this block is `:expected-result :failed' on purpose: it
-;; pins a defect that is still open, so the suite stays green while the
-;; bug is documented rather than silently untested.  Fixing the bug turns
-;; these into *unexpected* passes, which fails the batch runner -- that is
-;; the signal to delete the marker, not to delete the test.
+;;;; `json-serialize' (bug report: BUG-REPORT-export-images.md -- fixed)
 
 (defconst jsonyter-tests--notebook-with-figure "\
 {
@@ -2249,7 +2231,6 @@ figure arrives as a Lisp list -- and `jsonyter--send' dies on it with
 \"Wrong type argument: consp, nil\" before a single byte reaches the
 bridge.  Every `jsonyter-notebook-export-*' command on a notebook with a
 figure in it fails this way."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-figure
     (let ((params (list :format "pdf"
                         :cells (vconcat (jsonyter--nb-collect-cells t t))
@@ -2262,7 +2243,6 @@ figure in it fails this way."
 the shape `jsonyter-tests--notebook-with-outputs' already carries, and
 which `jsonyter-test-collect-cells-all-outputs-carries-stored-results'
 already asserts is passed through untouched."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
     (let ((params (list :format "html"
                         :cells (vconcat (jsonyter--nb-collect-cells t t))
@@ -2279,7 +2259,6 @@ produces -- it joins the fragments before rendering -- but the save/export
 converter copies `:data' through as read, so the same output that renders
 fine cannot be sent.  This path feeds `jsonyter-notebook-save-with-outputs'
 \(\\[jsonyter-notebook-save-with-outputs]\) as well as export."
-  :expected-result :failed
   (let* ((output (list :type "display_data"
                        :data (list :image/png '("iVBORw0KGgoAAAANSUhEUg==")
                                    :text/plain '("<Figure size 640x480>"))
@@ -2291,7 +2270,6 @@ fine cannot be sent.  This path feeds `jsonyter-notebook-save-with-outputs'
   "An `error' output read from a file has a list-valued `traceback', and
 must not be sent as one either.  The kernel-shape branch already
 `vconcat's it; the ALL-OUTPUTS branch does not."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json "\
 {
  \"cells\": [
@@ -2320,7 +2298,6 @@ notebook with no `kernelspec' and no `language_info' -- losing the
 language a LaTeX or slides template highlights by.  The bridge's
 `notebook' parameter takes a whole nbformat document and exists for
 exactly this."
-  :expected-result :failed
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-figure
     (let (sent)
       (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
