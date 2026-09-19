@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.4.0
+;; Version: 2.4.1
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -105,6 +105,9 @@
 (require 'subr-x)
 (require 'ansi-color)
 (require 'iso8601)
+;; `syntax-ppss-flush-cache', `string-to-syntax' -- for keeping a cell's
+;; syntax from bleeding into the next; see `jsonyter--nb-syntax-propertize'.
+(require 'syntax)
 ;; `create-image', `image-size', `insert-sliced-image' and the
 ;; `image-property' place all live here.  A graphical Emacs has loaded
 ;; it long before this file, but a batch or terminal one has not, and
@@ -2798,6 +2801,46 @@ of lines depending on who wrote the file; both must read the same."
         ((listp value) (mapconcat #'identity value ""))
         (t (format "%s" value))))
 
+(defun jsonyter--nb-data-for-wire (data)
+  "Reshape mimebundle DATA (an output's `:data' or `:metadata' plist) so
+`json-serialize' can encode it.  nbformat allows any mimetype's value to
+be stored as a list of line fragments instead of one string --
+`jsonyter--mime' already documents this and joins it for rendering --
+but `json-serialize' cannot encode a Lisp list as a JSON array, so each
+list-valued entry is joined here too.  Values that are not lists pass
+through unchanged."
+  (cl-loop for (key val) on data by #'cddr
+           append (list key (if (listp val) (jsonyter--mime data key) val))))
+
+(defun jsonyter--nb-output-for-wire (output)
+  "Reshape nbformat-shape OUTPUT so `json-serialize' can encode it.
+nbformat permits a stream's `:text', an error's `:traceback', and any
+mimebundle value under an output's `:data'/`:metadata' to be stored as a
+list of line fragments rather than one string; `json-serialize' has no
+way to tell such a list from a malformed plist, and signals instead of
+encoding it.  OUTPUT is expected in nbformat shape (keyed by
+`:output_type') -- see `jsonyter--nb-collect-cells' for outputs read
+straight from a file, and `jsonyter--nb-output-to-spec' for outputs
+converted from the kernel protocol."
+  (pcase (plist-get output :output_type)
+    ("stream"
+     (plist-put (copy-sequence output) :text
+               (jsonyter--nb-text (plist-get output :text))))
+    ((or "display_data" "execute_result")
+     (let ((out (copy-sequence output)))
+       (setq out (plist-put out :data (jsonyter--nb-data-for-wire (plist-get output :data))))
+       (plist-put out :metadata (jsonyter--nb-data-for-wire (plist-get output :metadata)))))
+    ("error"
+     (plist-put (copy-sequence output) :traceback
+               (vconcat (plist-get output :traceback))))
+    (_ output)))
+
+(defun jsonyter--nb-outputs-for-wire (outputs)
+  "OUTPUTS (a list of nbformat-shape output plists, as read from a file)
+reshaped into a vector ready for `json-serialize' -- see
+`jsonyter--nb-output-for-wire'."
+  (vconcat (mapcar #'jsonyter--nb-output-for-wire outputs)))
+
 (defun jsonyter--nb-parse (&optional buffer)
   "Parse BUFFER (default current) as notebook JSON, returning a plist."
   (with-current-buffer (or buffer (current-buffer))
@@ -3033,7 +3076,11 @@ by the edit either way.
 and out of the buffer's modified flag — output is a result, not part of
 the document, exactly as it was when it lived in an overlay string — and
 stands `after-change-functions' down for the same reason
-`jsonyter--nb-cell-surgery' does."
+`jsonyter--nb-cell-surgery' does.  That also means Emacs's usual
+`syntax-ppss' cache invalidation (hung off `before-change-functions')
+never runs for this edit, so it is flushed explicitly from SRC-END: a
+cell re-run whose new output changes what `jsonyter--nb-syntax-propertize'
+blanks there would otherwise leave stale parse state behind."
   (let* ((body (jsonyter--nb-outputs-string
                 (overlay-get cell 'jsonyter-output-string)
                 (overlay-get cell 'jsonyter-output-stale)))
@@ -3071,6 +3118,7 @@ stands `after-change-functions' down for the same reason
               (point)))))
     (goto-char point-marker)
     (set-marker point-marker nil)
+    (syntax-ppss-flush-cache src-end)
     (unless (= new-end out-end)
       (jsonyter--forget-undo-after src-end))))
 
@@ -3175,11 +3223,45 @@ past its end; a cell showing no output contributes none."
                (overlays-in beg end)))
         #'car-less-than-car))
 
+(defun jsonyter--nb-prose-spans (beg end)
+  "Non-code (markdown/raw) cells' own source spans overlapping BEG..END,
+in buffer order.  A markdown or raw cell's source is prose or a raw
+payload, not this notebook's kernel language."
+  (sort (delq nil
+              (mapcar
+               (lambda (o)
+                 (let ((source-end (and (overlay-get o 'jsonyter-cell)
+                                        (not (equal (overlay-get o 'jsonyter-cell-type) "code"))
+                                        (overlay-get o 'jsonyter-source-end))))
+                   (and source-end
+                        (< (overlay-start o) (marker-position source-end))
+                        (cons (overlay-start o) (marker-position source-end)))))
+               (overlays-in beg end)))
+        #'car-less-than-car))
+
+(defun jsonyter--nb-non-code-spans (beg end)
+  "Spans within BEG..END that are not this notebook's kernel-language code:
+a cell's rendered output (`jsonyter--nb-output-spans') and a non-code
+cell's own source (`jsonyter--nb-prose-spans'), merged and in buffer
+order.
+
+Painting and parsing the buffer as one language are two faces of the
+same problem — the buffer holds three kinds of text under a single
+major mode and syntax table, and only a code cell's source is really
+that language — so both `jsonyter--nb-fontify-region'/
+`jsonyter--nb-unfontify-region' (what gets painted) and
+`jsonyter--nb-syntax-propertize' (what `syntax-ppss' is allowed to
+parse as a string/comment/paren delimiter) key off this same set of
+spans."
+  (sort (append (jsonyter--nb-output-spans beg end) (jsonyter--nb-prose-spans beg end))
+        #'car-less-than-car))
+
 (defun jsonyter--nb-map-source-runs (beg end fn)
-  "Call FN with the bounds of each run of source text between BEG and END.
-The rendered output spans in between are skipped."
+  "Call FN with the bounds of each run of code-cell source text between
+BEG and END.  Rendered output and non-code cell source in between are
+skipped — see `jsonyter--nb-non-code-spans'."
   (let ((pos beg))
-    (dolist (span (jsonyter--nb-output-spans beg end))
+    (dolist (span (jsonyter--nb-non-code-spans beg end))
       (when (< pos (car span))
         (funcall fn pos (min end (car span))))
       (setq pos (max pos (min end (cdr span)))))
@@ -3187,7 +3269,7 @@ The rendered output spans in between are skipped."
       (funcall fn pos end))))
 
 (defun jsonyter--nb-fontify-region (beg end loudly)
-  "Fontify BEG..END as source, leaving rendered cell output alone.
+  "Fontify BEG..END as code, leaving output and non-code source alone.
 LOUDLY is passed through to `font-lock-default-fontify-region'.
 
 On `font-lock-fontify-region-function' in notebook buffers.  A cell's
@@ -3195,7 +3277,11 @@ output is buffer text, so the notebook language's own font-lock would
 otherwise read a traceback or a printed string as code: it strips the
 `face' properties the renderer put there — the resolved ANSI colours,
 the stderr red, the frame around the block — and paints its own over
-what is left.  Only the source between the outputs is handed on.
+what is left.  A markdown/raw cell's source is buffer text too, and is
+not this notebook's kernel language either — highlighting \"and\" as a
+Python keyword because it happens to share the buffer with Python code
+is exactly as wrong as painting a traceback.  Only a code cell's own
+source is handed on.
 
 Nothing needs to hold `font-lock-extend-region-functions' back at the
 seams: a cell owns its trailing newline and an output block ends with
@@ -3204,22 +3290,58 @@ beginning of a line, and whole-line extension has nowhere to reach."
   (jsonyter--nb-map-source-runs
    beg end
    (lambda (from to) (font-lock-default-fontify-region from to loudly)))
-  ;; The output spans inside the region are finished, not pending, so
+  ;; The non-code spans inside the region are finished, not pending, so
   ;; report the whole of it as done rather than leaving jit-lock to come
   ;; back for them on every redisplay.
   `(jit-lock-bounds ,beg . ,end))
 
 (defun jsonyter--nb-unfontify-region (beg end)
-  "Strip font-lock's faces from BEG..END, leaving rendered cell output alone.
+  "Strip font-lock's faces from BEG..END, leaving output and non-code
+source alone.
 
 On `font-lock-unfontify-region-function' in notebook buffers, and the
-necessary other half of `jsonyter--nb-fontify-region': output text is
-not font-lock's to paint, so it is not font-lock's to strip either.
-Without this, anything that unfontifies wholesale — \\[font-lock-update],
-turning the mode off and on, a major-mode change — would take the
-renderer's own colours with it and never put them back, since
-refontifying deliberately skips the output."
+necessary other half of `jsonyter--nb-fontify-region': output text and
+a non-code cell's source are not font-lock's to paint, so they are not
+font-lock's to strip either.  Without this, anything that unfontifies
+wholesale — \\[font-lock-update], turning the mode off and on, a
+major-mode change — would take the renderer's own colours with it and
+never put them back, since refontifying deliberately skips both."
   (jsonyter--nb-map-source-runs beg end #'font-lock-default-unfontify-region))
+
+(defconst jsonyter--nb-inert-syntax (string-to-syntax ".")
+  "Punctuation syntax: cannot open or close a string, comment or pair.
+Applied as a `syntax-table' text property over text that is not this
+notebook's kernel-language code — see `jsonyter--nb-syntax-propertize'.")
+
+(defun jsonyter--nb-syntax-propertize (beg end)
+  "`syntax-propertize-function' for `jsonyter-notebook-mode'.
+
+The buffer holds three kinds of text under one major mode and therefore
+one syntax table: code-cell source, non-code-cell source, and rendered
+output.  `jsonyter--nb-fontify-region'/`jsonyter--nb-unfontify-region'
+already confine what gets *painted* to code-cell source, but nothing
+otherwise stops `font-lock-default-fontify-region' from resolving string
+and comment state through `syntax-ppss', which parses forward from
+`point-min' (or the last cached parse point) through every intervening
+character — prose and rendered output included.  So one unbalanced
+string, comment or paired delimiter anywhere in the buffer changes the
+fontification of everything after it, to the end of the buffer.
+
+Blankets every character of each `jsonyter--nb-non-code-spans' span with
+`jsonyter--nb-inert-syntax', so none of them can open or close anything.
+Blanketing rather than only neutralizing delimiters is simpler and
+cheap: an output span is already rewritten wholesale on every re-run
+\(`jsonyter--nb-show-output-as-text'\), and a markdown/raw cell's source
+is ordinarily short.
+
+`parse-sexp-lookup-properties' must be non-nil for a `syntax-table' text
+property to take effect at all; `jsonyter-notebook-mode' sets it
+buffer-locally rather than relying on the language mode to have done
+so."
+  (dolist (span (jsonyter--nb-non-code-spans beg end))
+    (let ((from (max beg (car span))) (to (min end (cdr span))))
+      (when (< from to)
+        (put-text-property from to 'syntax-table jsonyter--nb-inert-syntax)))))
 
 (defun jsonyter--source-hash (code)
   "Hash of CODE, as stored on an overlay to detect later source edits."
@@ -3352,7 +3474,7 @@ assignment."
                                           (overlay-get cell 'jsonyter-raw-outputs)))
                 :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))
          ((and include-outputs all-outputs code-p)
-          (list :outputs (vconcat (overlay-get cell 'jsonyter-file-outputs))
+          (list :outputs (jsonyter--nb-outputs-for-wire (overlay-get cell 'jsonyter-file-outputs))
                 :execution_count (or (overlay-get cell 'jsonyter-exec-count) :null)))))))
    (jsonyter--nb-cells)))
 
@@ -3515,22 +3637,23 @@ inverse of `jsonyter--nb-adapt-output', for an OUTPUT as delivered by
 to patch an existing `display_data' in place by display_id); stored as
 an ordinary `display_data' instead, a reasonable approximation for a
 plain saved file.  Rich mimetypes whose data is a flat set of strings —
-images, HTML, plain text, the common case for a matplotlib figure —
-round-trip correctly; a mimetype whose JSON value nests further arrays
-does not, since data/metadata are carried through as read, and this
-library parses JSON arrays as Lisp lists rather than vectors throughout.
-Not expected to matter for anything but exotic interactive-widget
-output."
+images, HTML, plain text, the common case for a matplotlib figure, and
+the list-of-line-fragments shape the kernel protocol really uses for
+many of them — round-trip correctly, reshaped for the wire the same way
+`jsonyter--mime' reshapes them for rendering; a mimetype whose JSON
+value nests further arrays does not, since this library parses JSON
+arrays as Lisp lists rather than vectors throughout.  Not expected to
+matter for anything but exotic interactive-widget output."
   (let ((type (plist-get output :type)))
     (pcase type
       ("stream" (list :output_type "stream"
                       :name (or (plist-get output :name) "stdout")
-                      :text (or (plist-get output :text) "")))
+                      :text (jsonyter--nb-text (plist-get output :text))))
       ((or "display_data" "execute_result" "update_display_data")
        (append (list :output_type (if (equal type "update_display_data")
                                       "display_data" type)
-                     :data (or (plist-get output :data) (list))
-                     :metadata (or (plist-get output :metadata) (list)))
+                     :data (jsonyter--nb-data-for-wire (plist-get output :data))
+                     :metadata (jsonyter--nb-data-for-wire (plist-get output :metadata)))
                (and (equal type "execute_result")
                     (list :execution_count (plist-get output :execution_count)))))
       ("error" (list :output_type "error"
@@ -4050,6 +4173,15 @@ font-lock, so undo and editing still see only the cell source.
                     #'jsonyter--nb-fontify-region)
         (setq-local font-lock-unfontify-region-function
                     #'jsonyter--nb-unfontify-region)
+        ;; Painting is only half of it: `syntax-ppss' parses straight
+        ;; through output and non-code source alike, so an unbalanced
+        ;; string/comment/paren delimiter in either re-colours every cell
+        ;; after it.  `syntax-table' text properties need this non-nil to
+        ;; take effect at all; do not rely on the language mode having set
+        ;; it.  See `jsonyter--nb-syntax-propertize'.
+        (setq-local parse-sexp-lookup-properties t)
+        (setq-local syntax-propertize-function #'jsonyter--nb-syntax-propertize)
+        (syntax-ppss-flush-cache (point-min))
         (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions
@@ -4058,6 +4190,8 @@ font-lock, so undo and editing still see only the cell source.
     (jsonyter--restore-line-spacing)
     (kill-local-variable 'font-lock-fontify-region-function)
     (kill-local-variable 'font-lock-unfontify-region-function)
+    (kill-local-variable 'parse-sexp-lookup-properties)
+    (kill-local-variable 'syntax-propertize-function)
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
@@ -7758,7 +7892,7 @@ Interactively, prompts for both file names."
 ;;; Org -> notebook
 
 (defun jsonyter--org-parse-results-drawer (info base-dir)
-  "Kernel-shape outputs for INFO's block's current `#+RESULTS:' drawer, or nil.
+  "nbformat-shape outputs for INFO's block's current `#+RESULTS:' drawer, or nil.
 
 Necessarily lossy: a `[[file:...]]' link becomes a `display_data' image,
 read back from disk relative to BASE-DIR, but every text line becomes
@@ -7893,7 +8027,25 @@ Scanning with `org-babel-src-block-regexp' directly has no such
                         (goto-char block-start)
                         (if (re-search-forward "^[ \t]*#\\+end_src.*\n" raw-end t)
                             (point)
-                          raw-end))))
+                          raw-end)))
+                     ;; Extend the span over the block's own `#+RESULTS:',
+                     ;; the way the `--by-drawer' path gets it for free by
+                     ;; splitting at the *next* drawer instead -- without
+                     ;; this, the results fall into the following prose
+                     ;; span, the code cell is rebuilt with no outputs at
+                     ;; all (nothing to find when the span is re-parsed in
+                     ;; its own temp buffer), and the drawer's raw text is
+                     ;; re-emitted as a markdown cell.
+                     (result-end
+                      (save-excursion
+                        (goto-char block-start)
+                        (let* ((info (org-babel-get-src-block-info 'light))
+                               (pos (and info (org-babel-where-is-src-block-result nil info))))
+                          (when pos
+                            (goto-char pos)
+                            (org-element-property :end (org-element-at-point)))))))
+                (when (and result-end (> result-end block-end))
+                  (setq block-end result-end))
                 (let ((prose (buffer-substring-no-properties start block-start)))
                   (unless (jsonyter--org-notebook-span-empty-p prose)
                     (push (cons nil prose) spans)))
@@ -7918,10 +8070,16 @@ Scanning with `org-babel-src-block-regexp' directly has no such
           (goto-char (point-min))
           (let* ((info (org-babel-get-src-block-info 'light))
                  (source (string-trim (or (nth 1 info) "")))
+                 ;; Already nbformat shape (`jsonyter--org-parse-results-drawer'
+                 ;; produces exactly what `write_notebook' wants) -- NOT run
+                 ;; through `jsonyter--nb-output-to-spec', which converts from
+                 ;; the kernel protocol's `:type'-keyed shape instead, and
+                 ;; would turn every one of these into an unrecognized-output
+                 ;; placeholder.
                  (outputs (and info (jsonyter--org-parse-results-drawer info base-dir))))
             (append (list :id (or id :null) :cell_type "code" :source source)
                     (and outputs
-                         (list :outputs (vconcat (mapcar #'jsonyter--nb-output-to-spec outputs))
+                         (list :outputs (vconcat outputs)
                                :execution_count :null)))))
       (list :id (or id :null) :cell_type "markdown"
             :source (jsonyter--org-markdown-convert trimmed 'to-markdown)))))
@@ -8123,7 +8281,11 @@ own `hint' and `available_formats'."
 Always includes this session's outputs and every cell's stored results
 \(see `jsonyter--nb-collect-cells''s ALL-OUTPUTS parameter\), so the
 export reflects the buffer as it stands right now -- unsaved edits
-included -- not merely what was last saved to disk.
+included -- not merely what was last saved to disk.  Also sends the
+notebook's own top-level metadata \(`jsonyter--nb-metadata'\), so
+nbconvert's templates still see a `kernelspec' and `language_info' --
+without it, `export_notebook' has only `:cells' to build a document
+from and has no language to highlight by.
 
 Runs on the bridge's REST pool, not a kernel worker: safe to run while a
 cell is executing, and not gated by a busy kernel the way running a cell
@@ -8165,6 +8327,7 @@ extension for FORMAT; see `jsonyter--export-format-guess-extension'."
     (jsonyter--export-run
      session
      (list :format format :cells (vconcat cells) :to_path path
+           :metadata (or jsonyter--nb-metadata (list))
            :include_outputs t :timeout (or timeout jsonyter-export-timeout))
      (lambda (result)
        (message "jsonyter: exported %s to %s (%s)%s"

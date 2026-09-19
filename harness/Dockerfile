@@ -22,7 +22,7 @@ FROM ${BASE}
 # Pinned: an unpinned bridge means a jsonyter.el CI run can go red
 # because somebody else released, which is a failure that teaches
 # nothing and blocks a pull request that changed none of it.
-ARG JSONYTER_VERSION=1.0.0
+ARG JSONYTER_VERSION=2.1.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \

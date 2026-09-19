@@ -25,6 +25,7 @@ on:
   pull_request:
     paths:
       - jsonyter.el
+      - README.md
 
 permissions:
   contents: read
@@ -77,3 +78,59 @@ jobs:
           fi
 
           echo "OK: $current has not been used before"
+
+  readme-versions-match:
+    # README.md pins jsonyter.el's own release tag in three install
+    # examples (the manual curl download, package-vc-install's :rev,
+    # elpaca's :ref) so a reader can copy-paste something that actually
+    # works. Nothing else keeps those in sync with a release -- this PR's
+    # own header bump is what makes the header the *next* tag, so that is
+    # what README.md is checked against here, not the latest tag already
+    # published (which would still be correct once this merges and gets
+    # tagged, but would falsely flag every version-bump PR in the window
+    # before that tagging happens).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the merged PR
+        uses: actions/checkout@v4
+
+      - name: "README.md's jsonyter.el release-tag references must match the ';; Version:' header"
+        run: |
+          set -euo pipefail
+
+          current="$(sed -n 's/^;;[[:space:]]*Version:[[:space:]]*//p' jsonyter.el | head -n1 | tr -d '[:space:]')"
+          if [ -z "$current" ]; then
+            echo "::error file=jsonyter.el::no ';; Version:' header found"
+            exit 1
+          fi
+          echo "jsonyter.el's own version: $current"
+
+          fail=0
+
+          check_pattern() {
+            label="$1" pattern="$2"
+            matches="$(grep -noE "$pattern" README.md || true)"
+            if [ -z "$matches" ]; then
+              echo "::warning file=README.md::no '$label' reference found to check -- has this section moved or been reworded?"
+              return
+            fi
+            while IFS= read -r m; do
+              line="${m%%:*}"
+              found="$(printf '%s' "$m" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+              if [ "$found" != "$current" ]; then
+                echo "::error file=README.md,line=$line::$label pins jsonyter.el to v$found, but the current ';; Version:' header is $current -- update this (and every other reference still reading v$found) to v$current."
+                fail=1
+              fi
+            done <<EOF
+          $matches
+          EOF
+          }
+
+          check_pattern "the curl download URL" 'EGuthrieWasTaken/jsonyter\.el/v[0-9]+\.[0-9]+\.[0-9]+/jsonyter\.el'
+          check_pattern "package-vc-install's :rev" ':rev "v[0-9]+\.[0-9]+\.[0-9]+"'
+          check_pattern "elpaca's :ref" ':ref "v[0-9]+\.[0-9]+\.[0-9]+"'
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "OK: every jsonyter.el release-tag reference in README.md matches v$current"

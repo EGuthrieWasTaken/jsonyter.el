@@ -12,6 +12,13 @@
 ;; server; they skip themselves when it is not installed.  Nothing here
 ;; ever starts a kernel: a cell's results are fed in directly, in the
 ;; shape the kernel would have sent them.
+;;
+;; Some tests here are marked `:expected-result :failed'.  Each one pins an
+;; open defect written up in a `BUG-REPORT-*.md' at the repository root, and
+;; names that report in its docstring.  They keep the suite green while a bug
+;; is documented rather than silently untested -- and when the bug is fixed
+;; they become *unexpected* passes, which fails the batch runner.  That is the
+;; signal to delete the marker from that test, not to delete the test.
 
 ;;; Code:
 
@@ -61,6 +68,21 @@ that a save can be judged against it byte for byte.")
      (unwind-protect
          (progn
            (jsonyter-tests--write-notebook path)
+           (setq buffer (find-file-noselect path))
+           (with-current-buffer buffer ,@body))
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer (set-buffer-modified-p nil))
+         (kill-buffer buffer))
+       (delete-file path))))
+
+(defmacro jsonyter-tests--with-notebook-json (json &rest body)
+  "Open JSON as a notebook in a temp file and run BODY in its buffer."
+  (declare (indent 1) (debug t))
+  `(let ((path (make-temp-file "jsonyter-test-" nil ".ipynb"))
+         (buffer nil))
+     (unwind-protect
+         (progn
+           (with-temp-file path (insert ,json))
            (setq buffer (find-file-noselect path))
            (with-current-buffer buffer ,@body))
        (when (buffer-live-p buffer)
@@ -783,6 +805,112 @@ isolation, the way the tests above do."
         ;; The source above it did get fontified.
         (should (get-text-property (overlay-start cell) 'face))))))
 
+;;;; Font lock: a cell's syntax must stop at the cell
+;;;; (bug report: BUG-REPORT-cell-syntax-bleed.md -- fixed)
+
+;; `jsonyter--nb-fontify-region' keeps the language's font-lock from
+;; PAINTING rendered output, and `jsonyter-test-font-lock-leaves-output-alone'
+;; above proves it -- with output that happens to be balanced Python.  The
+;; SYNTAX side -- `syntax-ppss' parsing from `point-min' straight through
+;; prose and output alike, so one unbalanced string, comment or math
+;; delimiter anywhere re-colours every cell after it -- is handled by
+;; `jsonyter--nb-syntax-propertize', a `syntax-propertize-function' that
+;; blankets non-code text with inert syntax.
+
+(defconst jsonyter-tests--notebook-prose-apostrophe "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"aaa\", \"metadata\": {},
+   \"source\": \"Here's the 50% discount.\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"import os\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "A markdown cell of ordinary English prose, then a code cell.
+The apostrophe in \"Here's\" is a string delimiter in Python.")
+
+(defun jsonyter-tests--face-at (string)
+  "The `face' property where STRING starts in this buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (should (search-forward string nil t))
+    (get-text-property (match-beginning 0) 'face)))
+
+(ert-deftest jsonyter-test-markdown-prose-does-not-bleed-into-next-cell ()
+  "Prose in a markdown cell must not change how the next cell is coloured.
+
+An apostrophe in a markdown cell opens a Python string that never closes,
+so `import os' in the following CODE cell -- and every cell after it, to
+the end of the notebook -- is painted `font-lock-string-face'.  Any
+character the notebook language treats as a string, comment or math
+delimiter does this; which characters those are depends on the mode
+`jsonyter-notebook-language-modes' picks."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-apostrophe
+    (font-lock-mode 1)
+    (font-lock-ensure)
+    (should-not (eq 'font-lock-string-face (jsonyter-tests--face-at "import os")))))
+
+(ert-deftest jsonyter-test-rendered-output-does-not-bleed-into-next-cell ()
+  "A cell's rendered output must not change how the next cell is coloured.
+
+Output is buffer text, and `jsonyter--nb-fontify-region' keeps font-lock
+from painting it -- but `syntax-ppss' still reads it.  An apostrophe in
+something a cell printed (\"can't\", a quoted filename, a traceback)
+opens a string as far as the parser is concerned, and the next cell's
+source comes out entirely `font-lock-string-face'."
+  (jsonyter-tests--with-notebook-json "\
+{
+ \"cells\": [
+  {\"cell_type\": \"code\", \"id\": \"aaa\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\",
+                \"text\": \"it can't be found\\n\"}],
+   \"source\": \"print(msg)\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"import os\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+    (font-lock-mode 1)
+    (font-lock-ensure)
+    (should-not (eq 'font-lock-string-face (jsonyter-tests--face-at "import os")))))
+
+(ert-deftest jsonyter-test-markdown-cell-source-is-not-fontified-as-code ()
+  "A markdown cell's own source should not be coloured as the kernel
+language.
+
+Prose is not code: in a Python notebook \"and\" comes out
+`font-lock-keyword-face' and \"%\" comes out `font-lock-operator-face',
+purely because the whole buffer shares one major mode.  This one encodes
+a design decision as much as a defect -- a fix may reasonably decide
+markdown cells get markdown highlighting rather than none -- but leaving
+them highlighted as the kernel language is the one answer that is
+certainly wrong."
+  (jsonyter-tests--with-notebook-json "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"aaa\", \"metadata\": {},
+   \"source\": \"Costs 5 dollars and is worth it.\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+    (font-lock-mode 1)
+    (font-lock-ensure)
+    (should-not (eq 'font-lock-keyword-face (jsonyter-tests--face-at "and")))))
+
 ;;;; Saving
 
 (ert-deftest jsonyter-test-save-writes-source-only ()
@@ -881,9 +1009,9 @@ of saved results comes out blank."
                 (should (= 1 (length outputs-0)))
                 (should (equal "stream" (plist-get (car outputs-0) :output_type)))
                 ;; Read straight from the file, nbformat's list-of-lines
-                ;; shape and all -- this is `jsonyter-file-outputs' passed
-                ;; through untouched, not run through any conversion.
-                (should (equal '("stored one\n" "stored two\n")
+                ;; shape joined into one string -- `jsonyter-file-outputs'
+                ;; reshaped for the wire, see `jsonyter--nb-outputs-for-wire'.
+                (should (equal "stored one\nstored two\n"
                                (plist-get (car outputs-0) :text))))
               (should (= 1 (plist-get (nth 0 cells) :execution_count)))
               (let ((outputs-1 (append (plist-get (nth 1 cells) :outputs) nil)))
@@ -1763,6 +1891,84 @@ whatever markdown span it falls in, same as any other text there."
       (dolist (f (list ipynb org)) (when (file-exists-p f) (delete-file f)))
       (let ((buf (find-buffer-visiting org))) (when buf (kill-buffer buf))))))
 
+
+;;;; Org results survive the trip into a notebook
+;;;; (bug report: BUG-REPORT-export-images.md, defects 2 and 3 -- fixed)
+
+(ert-deftest jsonyter-test-org-cell-from-span-preserves-image-output ()
+  "An Org results drawer's image must reach the notebook as an image.
+
+`jsonyter--org-parse-results-drawer' returns outputs keyed by
+`:output_type' \(nbformat\), but its only caller runs them through
+`jsonyter--nb-output-to-spec', which dispatches on `:type' \(the kernel
+protocol\).  Nothing matches, so every result -- the figure included --
+is replaced by the literal text \"[jsonyter: unrecognized output type
+nil]\".  Exporting the notebook afterwards is what the README calls the
+Org route to a document, so this is where an Org user's images go.
+
+The two existing drawer tests check the parser alone and the spec
+converter alone; neither composes them, which is exactly where the two
+key names disagree."
+  (jsonyter-tests--with-org-file
+      (concat ":PROPERTIES:\n:JSONYTER_CELL_ID: aaa\n:END:\n"
+              "#+begin_src python :session jy:main\nplt.plot([1, 2])\n#+end_src\n\n"
+              "#+RESULTS:\n:results:\n[[file:plot.png]]\n:end:\n")
+    (let* ((dir (file-name-directory buffer-file-name))
+           (img (expand-file-name "plot.png" dir)))
+      (unwind-protect
+          (progn
+            (let ((coding-system-for-write 'binary))
+              (with-temp-file img (set-buffer-multibyte nil) (insert "fake-bytes")))
+            (let* ((cells (jsonyter--org-to-notebook-cells))
+                   (code (seq-find (lambda (c) (equal "code" (plist-get c :cell_type)))
+                                   cells))
+                   (outputs (append (plist-get code :outputs) nil)))
+              (should code)
+              (should (= 1 (length outputs)))
+              (should (equal "display_data" (plist-get (car outputs) :output_type)))
+              (should (plist-get (plist-get (car outputs) :data) :image/png))))
+        (when (file-exists-p img) (delete-file img))))))
+
+(ert-deftest jsonyter-test-org-cell-from-span-preserves-stream-output ()
+  "The same key mismatch swallows a drawer's plain text too: what should
+be the printed line comes back as the unrecognized-output placeholder."
+  (jsonyter-tests--with-org-file
+      (concat ":PROPERTIES:\n:JSONYTER_CELL_ID: aaa\n:END:\n"
+              "#+begin_src python :session jy:main\nprint(1)\n#+end_src\n\n"
+              "#+RESULTS:\n:results:\n: printed line\n:end:\n")
+    (let* ((cells (jsonyter--org-to-notebook-cells))
+           (code (seq-find (lambda (c) (equal "code" (plist-get c :cell_type))) cells))
+           (outputs (append (plist-get code :outputs) nil)))
+      (should code)
+      (should (= 1 (length outputs)))
+      (should (equal "stream" (plist-get (car outputs) :output_type)))
+      (should (equal "printed line\n" (plist-get (car outputs) :text)))
+      (should-not (string-match-p "unrecognized output type"
+                                  (plist-get (car outputs) :text))))))
+
+(ert-deftest jsonyter-test-org-to-notebook-by-block-keeps-results ()
+  "A hand-written Org file's results must not be dropped outright.
+
+With no `:JSONYTER_CELL_ID:' drawer anywhere,
+`jsonyter--org-notebook-cell-spans' takes the `--by-block' path, whose
+code span stops at `#+end_src'.  The `#+RESULTS:' drawer therefore falls
+into the *next* prose span: the code cell is rebuilt with no outputs at
+all \(the temp buffer the span is re-parsed in has no drawer to find\),
+and the drawer's raw Org text becomes a markdown cell."
+  (jsonyter-tests--with-org-file
+      (concat "#+begin_src python :session jy:main\nprint(1)\n#+end_src\n\n"
+              "#+RESULTS:\n:results:\n: printed line\n:end:\n")
+    (let* ((cells (jsonyter--org-to-notebook-cells))
+           (code (seq-find (lambda (c) (equal "code" (plist-get c :cell_type))) cells)))
+      (should code)
+      (should (plist-get code :outputs))
+      ;; ...and the drawer must not have been left behind as prose.
+      (should-not (seq-find (lambda (c)
+                              (and (equal "markdown" (plist-get c :cell_type))
+                                   (string-match-p "#\\+RESULTS:"
+                                                   (or (plist-get c :source) ""))))
+                            cells)))))
+
 ;;;; Notebook document export (§4.1-4.9)
 
 (ert-deftest jsonyter-test-build-command-omits-export-timeout-flag ()
@@ -1947,10 +2153,21 @@ to the on-success handler, without a real bridge in the loop."
 
 (ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
   "Exporting the fixture notebook to html via `to_path' produces a
-non-empty file mentioning a cell's source.  Needs both the bridge and a
-reachable Jupyter server; skips like the other bridge-dependent tests in
-this file when either is missing -- which, absent a way to probe server
-reachability up front, is treated the same as any other failure here."
+non-empty file carrying the markdown cell's rendered heading.  Needs
+both the bridge and a reachable Jupyter server; skips like the other
+bridge-dependent tests in this file when either is missing -- which,
+absent a way to probe server reachability up front, is treated the
+same as any other failure here.
+
+Checked against the markdown cell's \"heading\", not a code cell's
+source: nbconvert's HTML exporter runs the source through Pygments, so
+a code cell's `x = 1' comes back as separate `<span>' elements per
+token (`<span class=\"n\">x</span> <span class=\"o\">=</span>
+<span class=\"mi\">1</span>...') and never appears as that literal
+substring again -- confirmed against a real bridge and server; the
+original assertion looked for exactly that substring and so could
+never actually pass, only skip, hiding a real bridge/server pair
+behind the same outcome as a missing one."
   (skip-unless (jsonyter-tests--bridge-available-p))
   (jsonyter-tests--with-notebook
     (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
@@ -1967,13 +2184,140 @@ reachability up front, is treated the same as any other failure here."
                    jsonyter-export-timeout))
                 (should (file-exists-p out))
                 (should (> (file-attribute-size (file-attributes out)) 0))
-                (should (string-match-p "x = 1"
+                (should (string-match-p "heading"
                                        (with-temp-buffer
                                          (insert-file-contents out)
                                          (buffer-string)))))
             (error (ert-skip (format "export_notebook unavailable: %s"
                                      (error-message-string err)))))
         (when (file-exists-p out) (delete-file out))))))
+
+
+;;;; Export and the wire: a notebook's stored outputs must survive
+;;;; `json-serialize' (bug report: BUG-REPORT-export-images.md -- fixed)
+
+(defconst jsonyter-tests--notebook-with-figure "\
+{
+ \"cells\": [
+  {\"cell_type\": \"code\", \"id\": \"aaa\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"display_data\",
+                \"data\": {\"image/png\": \"iVBORw0KGgoAAAANSUhEUg==\",
+                          \"text/plain\": [\"<Figure size 640x480 with 1 Axes>\"]},
+                \"metadata\": {\"needs_background\": \"light\"}}],
+   \"source\": \"plt.plot([1, 2, 3])\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"},
+              \"language_info\": {\"name\": \"python\",
+                                \"file_extension\": \".py\",
+                                \"pygments_lexer\": \"ipython3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "One code cell holding a matplotlib figure, exactly as Jupyter saves one.
+The `text/plain' companion of an `image/png' is stored as an ARRAY of
+lines -- nbformat's multiline-string representation, and what every
+notebook with a figure in it actually looks like on disk.")
+
+(defun jsonyter-tests--wire-error (params)
+  "Nil if PARAMS can go on the wire, else the error `json-serialize' gives.
+`jsonyter--send' encodes a request with `json-serialize', which has no
+way to tell a Lisp list meant as a JSON array from a malformed plist --
+so anything the reply parser produced with `:array-type \\='list' has to
+be reshaped before it is sent back.  This is the check the export tests
+below stop one step short of."
+  (condition-case err
+      (ignore (json-serialize params))
+    (error (error-message-string err))))
+
+(ert-deftest jsonyter-test-export-params-serialize-with-stored-figure ()
+  "Exporting a notebook holding a matplotlib figure must produce a
+request `json-serialize' can encode.
+
+`jsonyter--nb-collect-cells' with ALL-OUTPUTS passes `jsonyter-file-outputs'
+through verbatim, so the `text/plain' array Jupyter stores beside every
+figure arrives as a Lisp list -- and `jsonyter--send' dies on it with
+\"Wrong type argument: consp, nil\" before a single byte reaches the
+bridge.  Every `jsonyter-notebook-export-*' command on a notebook with a
+figure in it fails this way."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-figure
+    (let ((params (list :format "pdf"
+                        :cells (vconcat (jsonyter--nb-collect-cells t t))
+                        :to_path "/tmp/out.pdf"
+                        :include_outputs t :timeout 120)))
+      (should-not (jsonyter-tests--wire-error params)))))
+
+(ert-deftest jsonyter-test-export-params-serialize-with-stored-stream-lines ()
+  "The same for a stream output stored as nbformat's array of lines --
+the shape `jsonyter-tests--notebook-with-outputs' already carries, and
+which `jsonyter-test-collect-cells-all-outputs-carries-stored-results'
+already asserts is passed through untouched."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+    (let ((params (list :format "html"
+                        :cells (vconcat (jsonyter--nb-collect-cells t t))
+                        :to_path "/tmp/out.html"
+                        :include_outputs t :timeout 120)))
+      (should-not (jsonyter-tests--wire-error params)))))
+
+(ert-deftest jsonyter-test-output-to-spec-serializes-split-mime-value ()
+  "`jsonyter--nb-output-to-spec' must reshape a mimebundle value that
+arrives as a list of line fragments.
+
+`jsonyter--mime' documents that shape as one the kernel side really
+produces -- it joins the fragments before rendering -- but the save/export
+converter copies `:data' through as read, so the same output that renders
+fine cannot be sent.  This path feeds `jsonyter-notebook-save-with-outputs'
+\(\\[jsonyter-notebook-save-with-outputs]\) as well as export."
+  (let* ((output (list :type "display_data"
+                       :data (list :image/png '("iVBORw0KGgoAAAANSUhEUg==")
+                                   :text/plain '("<Figure size 640x480>"))
+                       :metadata nil))
+         (spec (jsonyter--nb-output-to-spec output)))
+    (should-not (jsonyter-tests--wire-error (list :outputs (vector spec))))))
+
+(ert-deftest jsonyter-test-output-to-spec-serializes-file-error-traceback ()
+  "An `error' output read from a file has a list-valued `traceback', and
+must not be sent as one either.  The kernel-shape branch already
+`vconcat's it; the ALL-OUTPUTS branch does not."
+  (jsonyter-tests--with-notebook-json "\
+{
+ \"cells\": [
+  {\"cell_type\": \"code\", \"id\": \"aaa\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"error\", \"ename\": \"ValueError\",
+                \"evalue\": \"boom\",
+                \"traceback\": [\"Traceback...\", \"ValueError: boom\"]}],
+   \"source\": \"raise ValueError('boom')\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+    (let ((params (list :cells (vconcat (jsonyter--nb-collect-cells t t)))))
+      (should-not (jsonyter-tests--wire-error params)))))
+
+(ert-deftest jsonyter-test-export-request-carries-notebook-metadata ()
+  "An export must carry the notebook's own top-level metadata.
+
+`export_notebook' builds its notebook from `nbformat.v4.new_notebook()'
+when given only `cells', so a request with no metadata hands nbconvert a
+notebook with no `kernelspec' and no `language_info' -- losing the
+language a LaTeX or slides template highlights by.  The bridge's
+`notebook' parameter takes a whole nbformat document and exists for
+exactly this."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-figure
+    (let (sent)
+      (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                ((symbol-function 'jsonyter--export-run)
+                 (lambda (_session params _on-success) (setq sent params))))
+        (jsonyter-notebook-export "latex" "/tmp/out.tex"))
+      ;; Either shape is fine: a `notebook' document, or `cells' plus an
+      ;; explicit `metadata'.  What must not happen is neither.
+      (should (or (plist-get sent :notebook) (plist-get sent :metadata))))))
 
 ;;;; Script export (§4.10)
 

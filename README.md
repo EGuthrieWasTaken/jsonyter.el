@@ -30,7 +30,8 @@ through the bridge (`jsonyter-notebook-export`), or to a plain
 - Emacs 27.1+ (images need a graphical Emacs built with image support)
 - Org 9.4+ (bundled with Emacs 27.1+); only loaded when `jsonyter-org-mode` is used, or Org Babel itself is
 - The [jsonyter](https://github.com/EGuthrieWasTaken/jsonyter) Python
-  package, 2.0.0 or newer:
+  package, 2.0.0 or newer — plain `pip install` always grabs the latest
+  release, which is what this project's own CI tests against:
   ```bash
   pip install jsonyter
   ```
@@ -48,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.2.0/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.4.1/jsonyter.el
 ```
 
 ```elisp
@@ -60,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.2.0/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.2.0"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.4.1"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -68,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.2.0"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.4.1"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
