@@ -53,7 +53,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends emacs-nox lcov
-          pip install "jsonyter==1.0.0"
+          pip install "jsonyter==2.1.1"
 
       - name: Install undercover.el
         # A test-only dependency pulled from MELPA at run time, not added

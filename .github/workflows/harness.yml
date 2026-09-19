@@ -165,7 +165,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends emacs-nox
-          pip install "jsonyter==1.0.0"
+          pip install "jsonyter==2.1.1"
 
       - name: test/jsonyter-tests.el
         run: |
