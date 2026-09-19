@@ -49,11 +49,49 @@ jobs:
         # The bridge is what the tests that save a notebook drive for
         # real (test/jsonyter-tests.el's Commentary, harness/README.md);
         # without it they skip themselves, and skipped lines cannot be
-        # covered.
+        # covered. jupyter-server and nbconvert are for the one test that
+        # needs more than the bridge package alone -- see the next step.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends emacs-nox lcov
-          pip install "jsonyter==2.1.1"
+          pip install "jsonyter==2.1.1" jupyter-server nbconvert
+
+      - name: Start a local Jupyter server for export_notebook
+        # jsonyter-test-notebook-export-round-trips-with-bridge is the one
+        # test in the suite that needs a real, reachable Jupyter server:
+        # export_notebook asks the SERVER to run nbconvert over its own
+        # REST API (a POST to /nbconvert/<format>) rather than importing
+        # nbconvert itself, so installing the package above is necessary
+        # but not sufficient -- a server has to be listening too. Without
+        # this step that test skips itself rather than running, the same
+        # way it does for a developer with no server up; see its own
+        # docstring.
+        #
+        # jsonyter-server-url defaults to http://localhost:8888, which is
+        # what this binds. jsonyter.el's jsonyter--token falls back to
+        # whatever JUPYTER_TOKEN the bridge process inherits when neither
+        # jsonyter-server-token nor -token-file is set (the default), so
+        # exporting it here to $GITHUB_ENV is all the later test step
+        # needs to authenticate.
+        run: |
+          TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "JUPYTER_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          nohup jupyter server \
+            --ServerApp.ip=127.0.0.1 --ServerApp.port=8888 \
+            --IdentityProvider.token="$TOKEN" --no-browser --allow-root \
+            > jupyter-server.log 2>&1 &
+          echo $! > jupyter-server.pid
+          for _ in $(seq 1 30); do
+            if curl -sf -H "Authorization: token $TOKEN" \
+                 http://127.0.0.1:8888/api/status >/dev/null; then
+              echo "jupyter server is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::jupyter server did not come up within 30s"
+          cat jupyter-server.log
+          exit 1
 
       - name: Install undercover.el
         # A test-only dependency pulled from MELPA at run time, not added
@@ -79,6 +117,10 @@ jobs:
             --eval "(undercover \"jsonyter.el\" (:report-format 'lcov) (:report-file \"coverage/lcov.info\") (:send-report nil))" \
             -l test/jsonyter-tests.el \
             -f ert-run-tests-batch-and-exit
+
+      - name: Stop the local Jupyter server
+        if: always()
+        run: kill "$(cat jupyter-server.pid)" 2>/dev/null || true
 
       - name: Check out emacs-harness
         uses: actions/checkout@v4

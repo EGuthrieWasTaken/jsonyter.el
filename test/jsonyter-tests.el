@@ -2153,10 +2153,21 @@ to the on-success handler, without a real bridge in the loop."
 
 (ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
   "Exporting the fixture notebook to html via `to_path' produces a
-non-empty file mentioning a cell's source.  Needs both the bridge and a
-reachable Jupyter server; skips like the other bridge-dependent tests in
-this file when either is missing -- which, absent a way to probe server
-reachability up front, is treated the same as any other failure here."
+non-empty file carrying the markdown cell's rendered heading.  Needs
+both the bridge and a reachable Jupyter server; skips like the other
+bridge-dependent tests in this file when either is missing -- which,
+absent a way to probe server reachability up front, is treated the
+same as any other failure here.
+
+Checked against the markdown cell's \"heading\", not a code cell's
+source: nbconvert's HTML exporter runs the source through Pygments, so
+a code cell's `x = 1' comes back as separate `<span>' elements per
+token (`<span class=\"n\">x</span> <span class=\"o\">=</span>
+<span class=\"mi\">1</span>...') and never appears as that literal
+substring again -- confirmed against a real bridge and server; the
+original assertion looked for exactly that substring and so could
+never actually pass, only skip, hiding a real bridge/server pair
+behind the same outcome as a missing one."
   (skip-unless (jsonyter-tests--bridge-available-p))
   (jsonyter-tests--with-notebook
     (let* ((jsonyter-command '("python3" "-m" "jsonyter"))
@@ -2173,7 +2184,7 @@ reachability up front, is treated the same as any other failure here."
                    jsonyter-export-timeout))
                 (should (file-exists-p out))
                 (should (> (file-attribute-size (file-attributes out)) 0))
-                (should (string-match-p "x = 1"
+                (should (string-match-p "heading"
                                        (with-temp-buffer
                                          (insert-file-contents out)
                                          (buffer-string)))))

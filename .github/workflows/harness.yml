@@ -162,15 +162,48 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Emacs and the jsonyter bridge
+        # jupyter-server and nbconvert are for the one test that needs
+        # more than the bridge package alone -- see the next step.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends emacs-nox
-          pip install "jsonyter==2.1.1"
+          pip install "jsonyter==2.1.1" jupyter-server nbconvert
+
+      - name: Start a local Jupyter server for export_notebook
+        # See coverage.yml's step of the same name for why this is
+        # needed: export_notebook drives the SERVER's own nbconvert REST
+        # endpoint rather than importing nbconvert itself, and
+        # jsonyter-test-notebook-export-round-trips-with-bridge skips
+        # itself without one -- same as it does for a developer with no
+        # server running locally.
+        run: |
+          TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          echo "JUPYTER_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          nohup jupyter server \
+            --ServerApp.ip=127.0.0.1 --ServerApp.port=8888 \
+            --IdentityProvider.token="$TOKEN" --no-browser --allow-root \
+            > jupyter-server.log 2>&1 &
+          echo $! > jupyter-server.pid
+          for _ in $(seq 1 30); do
+            if curl -sf -H "Authorization: token $TOKEN" \
+                 http://127.0.0.1:8888/api/status >/dev/null; then
+              echo "jupyter server is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::jupyter server did not come up within 30s"
+          cat jupyter-server.log
+          exit 1
 
       - name: test/jsonyter-tests.el
         run: |
           emacs -Q --batch -L . -l test/jsonyter-tests.el \
             -f ert-run-tests-batch-and-exit
+
+      - name: Stop the local Jupyter server
+        if: always()
+        run: kill "$(cat jupyter-server.pid)" 2>/dev/null || true
 
       - name: Check out emacs-harness
         # Deliberately after the suite above: those 400 tests need none of
