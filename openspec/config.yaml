@@ -1,0 +1,55 @@
+schema: spec-driven
+
+# Project context -- shown to the AI when it drafts OpenSpec artifacts.
+context: |
+  jsonyter.el: Jupyter REPLs, rendered .ipynb notebooks, `# %%` script
+  cells and Org `jy:` source blocks in Emacs, driving Python, Julia, R and
+  SAS kernels through the jsonyter Python package's JSON-over-stdio bridge
+  (https://github.com/EGuthrieWasTaken/jsonyter).
+
+  Tech stack:
+  - Emacs Lisp, single-file package: jsonyter.el (lexical-binding).
+  - Minimum supported: Emacs 27.1, Org 9.4 (Package-Requires header).
+    Don't use APIs newer than those without a fboundp/version guard.
+  - Runtime dependency: the jsonyter bridge, 2.0.0 or newer.
+
+  Testing:
+  - ERT suite in test/jsonyter-tests.el, run headless with
+    `emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit`.
+    Tests that need the bridge or a Jupyter server skip themselves when
+    those aren't available.
+  - harness/ is an emacs-harness profile: scenarios that drive a real
+    graphical Emacs (harness/run.sh) or its batch tier (harness/run-batch.sh).
+    Behavior that is about what appears on screen belongs there.
+  - CI gates on combined line coverage of both headless suites
+    (COVERAGE_THRESHOLD in .github/workflows/coverage.yml, currently 90%).
+    New behavior needs tests.
+
+  Conventions:
+  - Every PR that touches jsonyter.el must bump the `;; Version:` header
+    to a never-before-used version (enforced by version-check.yml);
+    release tags are vX.Y.Z and must match that header.
+  - README.md is the user-facing manual; keep it in sync with behavior
+    and with the version numbers it quotes.
+  - Notebook saves are lossless and byte-identical: never rewrite stored
+    outputs or formatting unless the user asked for it.
+
+# Per-artifact rules
+rules:
+  proposal:
+    - State which surfaces are affected -- REPL, notebook (.ipynb), script cells, Org/Babel -- and which kernel languages.
+    - Call out any change to the bridge protocol or to the minimum jsonyter bridge version.
+  tasks:
+    - Include tasks for ERT tests, for harness scenarios when the change is visible on screen, for README.md updates, and for the `;; Version:` bump.
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
