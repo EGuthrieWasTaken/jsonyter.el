@@ -4339,6 +4339,7 @@ position the rearranged text starts at, for `jsonyter--forget-undo-after'."
     (define-key map (kbd "C-x C-s") #'jsonyter-notebook-save-buffer)
     (define-key map (kbd "C-c C-s") #'jsonyter-notebook-save-with-outputs)
     (define-key map (kbd "C-c C-x") #'jsonyter-notebook-export)
+    (define-key map (kbd "C-c C-v") #'jsonyter-notebook-latex-preview-toggle)
     (define-key map (kbd "C-c C-y") #'jsonyter-sync)
     map)
   "Keymap for `jsonyter-notebook-mode'.")
