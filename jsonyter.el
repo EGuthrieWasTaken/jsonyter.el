@@ -4133,7 +4133,7 @@ point\") when there is none), change it with `jsonyter--nb-set-type', and
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
     (jsonyter--nb-set-type cell type)
-    (message "jsonyter: cell is now %s" type))
+    (message "jsonyter: cell is now %s" type)))
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
