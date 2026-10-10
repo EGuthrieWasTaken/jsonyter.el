@@ -2853,7 +2853,7 @@ way to tell such a list from a malformed plist, and signals instead of
 encoding it.  OUTPUT is expected in nbformat shape (keyed by
 `:output_type') -- see `jsonyter--nb-collect-cells' for outputs read
 straight from a file, and `jsonyter--nb-output-to-spec' for outputs
-converted from the kernel protocol."
+converted from the kernel protocol. Metadata is converted as structured JSON, never joined as text."
   (pcase (plist-get output :output_type)
     ("stream"
      (plist-put (copy-sequence output) :text
@@ -2861,7 +2861,7 @@ converted from the kernel protocol."
     ((or "display_data" "execute_result")
      (let ((out (copy-sequence output)))
        (setq out (plist-put out :data (jsonyter--nb-data-for-wire (plist-get output :data))))
-       (plist-put out :metadata (jsonyter--nb-data-for-wire (plist-get output :metadata)))))
+       (plist-put out :metadata (jsonyter--nb-json-for-wire (plist-get output :metadata)))))
     ("error"
      (plist-put (copy-sequence output) :traceback
                (vconcat (plist-get output :traceback))))
