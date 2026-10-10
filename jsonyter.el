@@ -6241,6 +6241,24 @@ one, and re-running resumes naturally."
       (with-current-buffer buffer (jsonyter--send "cancel_sync" (list :request_id id)))
       (message "jsonyter: sync-abort requested -- it will stop after the current file"))))
 
+(defun jsonyter--sync-ensure-local-dir (dir)
+  "Create the local directory DIR, parents included, if it is missing.
+Return t when it was created, nil when it already existed."
+  (ignore dir)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--sync-ensure-remote-dir (buffer remote)
+  "Create each missing level of REMOTE on BUFFER's server, outermost first.
+REMOTE is a Contents-API directory path such as \"work/new/deep\";
+surrounding slashes are ignored (see `jsonyter--sync-clean-remote').
+The server's `make_directory' makes exactly one level, so every
+cumulative prefix (\"work\", \"work/new\", \"work/new/deep\") is probed
+with `list_contents' first.  Signals a `user-error' when a level exists
+but is not a directory.  Returns the list of paths created, in order,
+or nil when everything already existed or REMOTE is empty."
+  (ignore buffer remote)
+  (error "jsonyter: not implemented"))
+
 ;;;###autoload
 (defun jsonyter-sync-add-pair (local remote &optional server persist)
   "Define a sync pair between LOCAL and REMOTE, added to `jsonyter-sync-pairs'.
