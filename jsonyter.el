@@ -4494,6 +4494,8 @@ Interactively, prompts for the language and the file name."
      language)
     (current-buffer)))
 
+(defvar jsonyter-notebook-latex-preview-on-open)
+
 ;;;###autoload
 (defun jsonyter-notebook-open ()
   "Render the current buffer's .ipynb content as a notebook.
@@ -4866,7 +4868,8 @@ the placeholder string (format \"[math: %s]\" (file-name-nondirectory FILE))."
 Without `latex' (`executable-find') signal
 \(user-error \"jsonyter: LaTeX preview needs `latex\\=' on the exec-path\").
 Without a converter (`jsonyter--latex-converter') signal
-\(user-error \"jsonyter: LaTeX preview needs `dvipng\\=' or `dvisvgm\\=' on the exec-path\")."
+\(user-error \"jsonyter: LaTeX preview needs `dvipng\\='
+or `dvisvgm\\=' on the exec-path\")."
   (unless (executable-find "latex")
     (user-error "jsonyter: LaTeX preview needs `latex' on the exec-path"))
   (unless (jsonyter--latex-converter)
@@ -4901,7 +4904,8 @@ where CONVERTER is (jsonyter--latex-converter) and FG is
 fragment's text -- offsets are relative to the cell's source, which
 starts at (overlay-start CELL).  Put on it: `jsonyter-latex-preview' t,
 `display' (jsonyter--latex-image FILE), `evaporate' t, `help-echo' the
-fragment's BODY, `modification-hooks' (list \\='jsonyter--nb-latex-overlay-modified).
+fragment's BODY, `modification-hooks'
+\(list \\='jsonyter--nb-latex-overlay-modified).
 A `user-error' from rendering is caught per fragment: say
 \(message \"jsonyter: LaTeX preview skipped -- %s\" MESSAGE) and go on.
 Count only the fragments that got an overlay."
