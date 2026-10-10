@@ -4973,8 +4973,15 @@ with ALL, else just the cell at point (none if there is no cell).  Clear
 each cell's span with `jsonyter--nb-latex-clear', `message' \"jsonyter:
 removed N LaTeX preview(s)\" (\"preview\" when N is 1) and return N."
   (interactive "P")
-  (ignore all)
-  (error "jsonyter: not implemented"))
+  (jsonyter--nb-ensure-notebook)
+  (let ((n 0))
+    (dolist (cell (if all
+                      (jsonyter--nb-cells)
+                    (let ((c (jsonyter--nb-cell-at))) (and c (list c)))))
+      (setq n (+ n (jsonyter--nb-latex-clear (overlay-start cell)
+                                             (overlay-end cell)))))
+    (message "jsonyter: removed %d LaTeX preview%s" n (if (= n 1) "" "s"))
+    n))
 
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview-toggle (&optional all)
