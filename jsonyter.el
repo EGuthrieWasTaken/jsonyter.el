@@ -4993,8 +4993,18 @@ cells: `jsonyter--nb-cells' with ALL, else just the cell at point.  If
 showing, call `jsonyter-notebook-latex-preview-clear' with ALL; else
 call `jsonyter-notebook-latex-preview' with ALL."
   (interactive "P")
-  (ignore all)
-  (error "jsonyter: not implemented"))
+  (jsonyter--nb-ensure-notebook)
+  (let* ((cells (if all
+                    (jsonyter--nb-cells)
+                  (let ((c (jsonyter--nb-cell-at))) (and c (list c)))))
+         (showing (seq-some
+                   (lambda (c)
+                     (seq-some (lambda (ov) (overlay-get ov 'jsonyter-latex-preview))
+                               (overlays-in (overlay-start c) (overlay-end c))))
+                   cells)))
+    (if showing
+        (jsonyter-notebook-latex-preview-clear all)
+      (jsonyter-notebook-latex-preview all))))
 
 
 ;;;; File transfer
