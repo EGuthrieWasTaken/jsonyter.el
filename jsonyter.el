@@ -3419,7 +3419,24 @@ Otherwise, with `jsonyter--nb-cell-surgery' bound to t:
                             (list :id nil :cell_type \"code\" :outputs nil))
    where START is the old end of the last cell's overlay.
 Bind `inhibit-read-only' to t while doing this."
-  (error "jsonyter: not implemented"))
+  (let* ((cells (jsonyter--nb-cells))
+         (last (if (null cells) nil (car (last cells))))
+         (start (if last (overlay-end last) nil)))
+    (if (or (null last) (not (< (overlay-end last) (point-max))))
+        nil
+      (let ((jsonyter--nb-cell-surgery t)
+            (inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-max))
+          (unless (bolp)
+            (insert "\n")))
+        (if (< (marker-position (overlay-get last 'jsonyter-source-end))
+             (overlay-end last))
+            (jsonyter--nb-make-cell start (point-max)
+                                   (list :id nil :cell_type "code" :outputs nil))
+            (move-overlay last (overlay-start last) (point-max))
+            (set-marker (overlay-get last 'jsonyter-source-end) (point-max)))
+        t))))
 
 (defun jsonyter--nb-empty-cell-p (cell)
   "Non-nil when CELL has blank source and shows no output.
