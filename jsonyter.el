@@ -4889,7 +4889,7 @@ those, else signal (user-error \"jsonyter: not a markdown cell\")."
     (let ((cell (jsonyter--nb-cell-at)))
       (if (and cell (memq cell (jsonyter--nb-latex-markdown-cells)))
           (list cell)
-        (user-error "jsonyter: not a markdown cell")))))))
+        (user-error "jsonyter: not a markdown cell")))))
 
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview (&optional all)
