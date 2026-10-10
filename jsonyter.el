@@ -6335,8 +6335,21 @@ cumulative prefix (\"work\", \"work/new\", \"work/new/deep\") is probed
 with `list_contents' first.  Signals a `user-error' when a level exists
 but is not a directory.  Returns the list of paths created, in order,
 or nil when everything already existed or REMOTE is empty."
-  (ignore buffer remote)
-  (error "jsonyter: not implemented"))
+  (let ((prefix nil) (created nil))
+    (dolist (part (split-string (jsonyter--sync-clean-remote remote) "/" t))
+      (setq prefix (if prefix (concat prefix "/" part) part))
+      (let ((model (condition-case nil
+                       (with-current-buffer buffer
+                         (jsonyter--request-sync "list_contents" (list :path prefix)))
+                       (error 'missing))))
+        (cond
+         ((eq model 'missing)
+          (with-current-buffer buffer
+            (jsonyter--request-sync "make_directory" (list :path prefix)))
+          (push prefix created))
+         ((not (equal (plist-get model :type) "directory"))
+          (user-error "jsonyter: %s exists on the server and is not a directory" prefix)))))
+    (nreverse created)))
 
 ;;;###autoload
 (defun jsonyter-sync-add-pair (local remote &optional server persist)
