@@ -4061,8 +4061,10 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
   "The cell type that follows TYPE when cycling: code, markdown, raw, code.
 TYPE is \"code\", \"markdown\" or \"raw\"; anything else (including nil)
 is treated like \"raw\" and gives \"code\"."
-  (ignore type)
-  (error "jsonyter: not implemented"))
+  (cond ((equal type "code") "markdown")
+        ((equal type "markdown") "raw")
+        ((equal type "raw") "code")
+        (t "code")))
 
 (defun jsonyter--nb-type-from-prefix (arg)
   "The cell type a cell-inserting command's argument ARG asks for.
