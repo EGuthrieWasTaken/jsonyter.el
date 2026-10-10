@@ -4141,19 +4141,16 @@ point\") when there is none), change it with `jsonyter--nb-set-type', and
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
-  "Toggle the cell at point between code and markdown.
-A cell turned into markdown loses its output, since markdown cells
-cannot carry any — the same rule the bridge applies when writing."
+  "Cycle the cell at point through code, markdown and raw.
+A cell turned into markdown or raw loses its output, since only
+code cells can carry any."
   (interactive)
   (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (unless cell (user-error "No cell at point"))
-    (let ((new (if (equal (overlay-get cell 'jsonyter-cell-type) "code")
-                   "markdown" "code")))
-      (overlay-put cell 'jsonyter-cell-type new)
-      (overlay-put cell 'jsonyter-exec-count nil)
-      (jsonyter--nb-set-output cell "")
-      (jsonyter--nb-refresh-prompt cell)
+    (let ((new (jsonyter--nb-next-cell-type
+                (overlay-get cell 'jsonyter-cell-type))))
+      (jsonyter--nb-set-type cell new)
       (message "jsonyter: cell is now %s" new))))
 
 (defconst jsonyter--nb-cell-props
