@@ -4705,10 +4705,9 @@ Every line is newline-terminated."
          (concat (mapconcat #'identity jsonyter-notebook-latex-macros "\n")
                    (if jsonyter-notebook-latex-macros "\n" ""))
          "\\pagestyle{empty}\n\\begin{document}\n"
-         (pcase kind
-                ('inline (concat "$" body "$"))
-                ('display (concat "\\[" body "\\]"))
-                (otherwise body))
+         (cond ((eq kind 'inline) (concat "$" body "$"))
+               ((eq kind 'display) (concat "\\[" body "\\]"))
+               (t body)))
          "\n\\end{document}\n"))
 
 (defun jsonyter--latex-converter ()
