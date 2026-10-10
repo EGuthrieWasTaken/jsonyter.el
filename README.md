@@ -1335,7 +1335,7 @@ base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
 you think it is.
 
-[`harness/`](harness/) is the other half: 51 scenarios that run in a
+[`harness/`](harness/) is the other half: 56 scenarios that run in a
 **real graphical Emacs on an X server in a container**, driven through
 the actual command loop, using
 [emacs-harness](https://github.com/EGuthrieWasTaken/emacs-harness).

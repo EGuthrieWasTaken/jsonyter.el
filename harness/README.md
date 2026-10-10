@@ -15,8 +15,8 @@ which runs a **real graphical Emacs on an X server in a container** and
 lets a test — or an agent — drive it through the actual command loop and
 read back exactly what is on screen.
 
-**51 scenarios.** 42 assert things a batch Emacs can also check and run
-either way; 9 need a frame and skip without one.
+**56 scenarios.** 46 assert things a batch Emacs can also check and run
+either way; 10 need a frame and skip without one.
 
 ---
 

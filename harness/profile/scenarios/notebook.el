@@ -249,3 +249,76 @@
   (eh-expect-equal (overlay-get (jy-cell 1) 'jsonyter-cell-type) "markdown")
   (eh-expect-equal (jy-cell-output-string 1) ""
                    "a markdown cell must not keep the output it had as code"))
+
+;;; Line numbers
+
+(eh-scenario jsonyter/notebook-numbers-its-lines-within-each-cell
+  :doc "With line numbers on -- here by the `prog-mode-hook' line most
+        configs have -- a notebook numbers each cell's source lines from
+        1 within the cell, and turns Emacs's own numbers off, which
+        would count output and image rows and put a cell's first number
+        on the blank row above its prompt.  Rendered output must carry
+        no number at all."
+  :tags (jsonyter notebook line-numbers)
+
+  (jy-with-line-numbers "demo.ipynb"
+    (eh-expect (and display-line-numbers-mode jsonyter--nb-numbers-active)
+               "line numbers were not on, or per-cell numbers did not start")
+    (eh-expect (null display-line-numbers)
+               "Emacs's own numbers must be off while per-cell numbers show")
+    (dotimes (n (length (jy-cells)))
+      (let ((numbers (jy-cell-numbers n))
+            (lines (count-lines (nth 0 (jy-cell-source-region n))
+                                (nth 1 (jy-cell-source-region n)))))
+        (eh-expect-equal numbers (number-sequence 1 (max 1 lines))
+                         (format "cell %d's lines must be numbered from 1" n))))
+    (dotimes (n (length (jy-cells)))
+      (when-let ((region (jy-cell-output-region n)))
+        (eh-expect-equal (text-property-not-all (nth 0 region) (nth 1 region) 'line-prefix nil)
+                         nil
+                         (format "cell %d's output must carry no number" n))))
+    (eh-expect-equal (buffer-modified-p) nil
+                     "showing numbers must not modify the buffer")
+    (eh-expect-equal buffer-undo-list nil
+                     "showing numbers must not push undo entries")))
+
+(eh-scenario jsonyter/notebook-line-numbers-follow-a-newline-and-stay-out-of-copies
+  :doc "RET at the top of a code cell shifts every later line of that
+        cell by one and nothing else.  The first line must not keep the
+        prefix it inherits from the cell above (a stale number drawn on
+        the prompt's spacer row), and text killed from the cell must
+        not carry its numbers into the kill ring."
+  :tags (jsonyter notebook line-numbers)
+
+  (jy-with-line-numbers "demo.ipynb"
+    (let ((before-other (jy-cell-numbers 3)))
+      (jy-goto-cell 1)
+      (execute-kbd-macro (kbd "RET"))
+      (eh-expect-equal (jy-cell-numbers 1) '(1 2)
+                       "a newline at the top of the cell must renumber its lines")
+      (eh-expect-equal (get-text-property (overlay-start (jy-cell 1)) 'line-prefix) nil
+                       "the cell's first line must carry no prefix of its own")
+      (eh-expect-equal (jy-cell-numbers 3) before-other
+                       "another cell's numbers must not change"))
+    (let ((region (jy-cell-source-region 1)))
+      (copy-region-as-kill (nth 0 region) (nth 1 region))
+      (eh-expect-equal (text-property-not-all 0 (length (car kill-ring)) 'line-prefix nil
+                                              (car kill-ring))
+                       nil
+                       "copied source must not carry its numbers"))))
+
+(eh-scenario jsonyter/notebook-keeps-emacs-numbers-when-asked
+  :doc "`jsonyter-notebook-line-numbers' set to `buffer' leaves Emacs's own
+        numbering exactly as the user configured it: no per-cell
+        numbers, no suppression, prompts unchanged."
+  :tags (jsonyter notebook line-numbers)
+
+  (setq jsonyter-notebook-line-numbers 'buffer)
+  (jy-with-line-numbers "demo.ipynb"
+    (eh-expect-equal jsonyter--nb-numbers-active nil)
+    (eh-expect (eq display-line-numbers t)
+               "Emacs's own numbers must stay on")
+    (eh-expect-equal (text-property-not-all (point-min) (point-max) 'line-prefix nil) nil
+                     "no cell text may carry a per-cell number")
+    (eh-expect (seq-every-p #'null (jy-cell-numbers 1))
+               "no line may show a per-cell number")))
