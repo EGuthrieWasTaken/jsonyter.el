@@ -4884,8 +4884,12 @@ returns (the managed LaTeX-macros cell)."
 With ALL non-nil, `jsonyter--nb-latex-markdown-cells'.  Otherwise a list
 of just the cell at point (`jsonyter--nb-cell-at') when it is one of
 those, else signal (user-error \"jsonyter: not a markdown cell\")."
-  (ignore all)
-  (error "jsonyter: not implemented"))
+  (if all
+      (jsonyter--nb-latex-markdown-cells)
+    (let ((cell (jsonyter--nb-cell-at)))
+      (if (and cell (memq cell (jsonyter--nb-latex-markdown-cells)))
+          (list cell)
+        (user-error "jsonyter: not a markdown cell")))))
 
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview (&optional all)
