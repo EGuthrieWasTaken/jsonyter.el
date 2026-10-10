@@ -4750,8 +4750,15 @@ otherwise return \"rgb 0.000 0.000 0.000\"."
 (defun jsonyter--latex-first-error (log-file)
   "Return the first line of LOG-FILE that starts with \"! \", else \"unknown error\".
 \"unknown error\" is also the answer when LOG-FILE is not readable."
-  (ignore log-file)
-  (error "jsonyter: not implemented"))
+  (or (and (file-readable-p log-file)
+           (with-temp-buffer
+             (insert-file-contents log-file)
+             (goto-char (point-min))
+             (let ((match (re-search-forward "^! .*$" nil t)))
+               (if match
+                   (match-string 0)
+                   nil))))
+       "unknown error"))
 
 (defun jsonyter--latex-render (document converter dpi fg)
   "Typeset DOCUMENT into an image file and return its path, using a cache.
