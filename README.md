@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.4.1/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.0/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.4.1/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.4.1"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.0"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.4.1"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.0"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -1294,7 +1294,7 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 116 tests under `emacs -Q --batch`, where there is no frame, no
+That runs over 550 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
