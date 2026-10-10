@@ -3386,6 +3386,7 @@ property is a marker, to be detached with (set-marker MARKER nil)."
       (when (markerp marker)
         (set-marker marker nil))
       (delete-overlay cell)))
+    )
 
 (defun jsonyter--nb-drop-empty-cells ()
   "Delete every cell overlay that covers no text, and return how many.
