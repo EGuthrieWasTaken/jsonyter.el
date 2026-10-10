@@ -4873,7 +4873,11 @@ Count only the fragments that got an overlay."
 Filter `jsonyter--nb-cells' to those whose `jsonyter-cell-type' property
 is \"markdown\" and that are not the cell `jsonyter--nb-latex-cell'
 returns (the managed LaTeX-macros cell)."
-  (error "jsonyter: not implemented"))
+  (let ((macros (jsonyter--nb-latex-cell)))
+    (seq-filter (lambda (c)
+                  (and (equal (overlay-get c 'jsonyter-cell-type) "markdown")
+                       (not (eq c macros))))
+                (jsonyter--nb-cells))))
 
 (defun jsonyter--nb-latex-target-cells (all)
   "Return the cells a preview command acts on.
