@@ -3459,7 +3459,21 @@ cells.  When it is above zero, mark the buffer modified with
 \(set-buffer-modified-p t).  Always `message' the result, \"jsonyter:
 removed N empty cell(s)\" or \"jsonyter: no empty cells\"."
   (interactive)
-  (error "jsonyter: not implemented"))
+  (jsonyter--nb-ensure-notebook)
+  (let ((removed (jsonyter--nb-drop-empty-cells)))
+    (dolist (cell (jsonyter--nb-cells))
+      (when (and (jsonyter--nb-empty-cell-p cell)
+                   (not (null (cdr (jsonyter--nb-cells)))))
+        (jsonyter--nb-excise-cell cell)
+        (setq removed (1+ removed))))
+    (when (> removed 0)
+      (set-buffer-modified-p t)
+      (message "jsonyter: removed %d empty cell%s"
+                 removed
+                 (if (= removed 1) "" "s")))
+    (when (<= removed 0)
+      (message "jsonyter: no empty cells"))
+    removed))
 
 (defun jsonyter--nb-stale-after-change (beg end _len)
   "After an edit from BEG to END, re-judge the affected cells' outputs.
