@@ -4611,22 +4611,44 @@ each match end, then sort the combined list by BEG."
   (ignore text)
   (error "jsonyter: not implemented"))
 
+(defun jsonyter--latex-inline-open-p (text pos)
+  "Non-nil when the dollar sign at offset POS of TEXT may open `$...$'.
+It may not when the character before it is a backslash (an escaped
+dollar), or when the character after it is missing, a dollar sign, a
+space, a tab or a newline."
+  (ignore text pos)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-inline-close-p (text pos)
+  "Non-nil when the dollar sign at offset POS of TEXT may close `$...$'.
+It may not when the character before it is a space, a tab, a newline or
+a backslash, or when the character after it is a digit (which is how
+\"costs $5 and $6\" is told from math)."
+  (ignore text pos)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-inline-find-close (text open)
+  "Return the offset of the dollar sign closing the one opened at OPEN, or nil.
+Look at each dollar sign after OPEN in turn (`string-match' on \"\\\\$\"
+from OPEN plus one, continuing from just past each candidate): when the
+text between OPEN plus one and the candidate contains a blank line (a
+newline, optional spaces or tabs, a newline: test it with
+`string-match-p' on \"\\n[ \\t]*\\n\"), give up and return nil; when
+`jsonyter--latex-inline-close-p' accepts the candidate, return its
+offset; otherwise go on to the next.  Return nil when none is left."
+  (ignore text open)
+  (error "jsonyter: not implemented"))
+
 (defun jsonyter--latex-find-inline-dollars (text)
   "Return the inline `$...$' fragments in TEXT, as (BEG END inline BODY).
 BEG is the offset of the opening dollar, END is one past the closing
-dollar, BODY is the TeX between them.  Rules (Pandoc and Jupyter's):
-- an opening dollar is skipped when the character before it is a
-  backslash, or the character after it is missing, `$', a space, a tab
-  or a newline;
-- a closing dollar is the first later dollar whose previous character is
-  not a space, tab, newline or backslash, and which is not followed by a
-  digit; dollars failing that are stepped over;
-- the search for a closing dollar gives up when the text between the
-  opening dollar and a candidate contains a blank line (a newline, then
-  optional spaces or tabs, then a newline);
-- with no closing dollar the opening one is skipped.
-After a fragment, scanning resumes just past its closing dollar; after a
-skipped dollar, just past that dollar.  Text order; nil when none."
+dollar, BODY is the TeX between them.  Scan TEXT from offset 0 with
+`string-match' on a literal dollar sign.  For each dollar at OPEN: when
+`jsonyter--latex-inline-open-p' accepts it and
+`jsonyter--latex-inline-find-close' returns a CLOSE, collect
+\(OPEN (1+ CLOSE) \\='inline (substring text (1+ OPEN) CLOSE)) and resume
+scanning at (1+ CLOSE); otherwise resume at (1+ OPEN).  Text order; nil
+when there are none."
   (ignore text)
   (error "jsonyter: not implemented"))
 
