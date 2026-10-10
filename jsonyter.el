@@ -4586,8 +4586,9 @@ result has TEXT's length and line structure, and an offset found in it
 is an offset in TEXT.  Mask fences first, then spans, each with
 `replace-regexp-in-string' and a function that returns its match with
 every character except newline replaced by a space."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((blank (lambda (match) (replace-regexp-in-string "[^\n]" " " match))))
+    (let ((text (replace-regexp-in-string jsonyter--latex-fence-regexp blank text)))
+      (replace-regexp-in-string jsonyter--latex-code-span-regexp blank text))))
 
 (defun jsonyter--latex-find-envs (text)
   "Return the math environments in TEXT, as (BEG END env BODY) lists.
