@@ -4648,8 +4648,11 @@ space, a tab or a newline."
 It may not when the character before it is a space, a tab, a newline or
 a backslash, or when the character after it is a digit (which is how
 \"costs $5 and $6\" is told from math)."
-  (ignore text pos)
-  (error "jsonyter: not implemented"))
+  (let ((before (and (> pos 0) (aref text (1- pos))))
+        (after (and (< (1+ pos) (length text)) (aref text (1+ pos)))))
+    (not (or (null before)
+               (memq before '(?\s ?\t ?\n ?\\))
+               (and after (<= ?0 after ?9))))))
 
 (defun jsonyter--latex-inline-find-close (text open)
   "Return the offset of the dollar sign closing the one opened at OPEN, or nil.
