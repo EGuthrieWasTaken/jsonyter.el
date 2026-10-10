@@ -4788,8 +4788,10 @@ The type is `svg' when FILE ends in \".svg\", else `png'.  When
 \(display-images-p) and (image-type-available-p TYPE) are both true,
 return (create-image FILE TYPE nil :ascent \\='center); otherwise return
 the placeholder string (format \"[math: %s]\" (file-name-nondirectory FILE))."
-  (ignore file)
-  (error "jsonyter: not implemented"))
+  (let ((type (if (string-suffix-p ".svg" file) 'svg 'png)))
+    (if (and (display-images-p) (image-type-available-p type))
+        (create-image file type nil :ascent 'center)
+      (format "[math: %s]" (file-name-nondirectory file)))))
 
 (defun jsonyter--latex-check-tools ()
   "Signal a `user-error' unless LaTeX preview can run; return nil if it can.
