@@ -4030,14 +4030,16 @@ the strings code, markdown or raw; see `jsonyter--nb-type-from-prefix'."
                               (jsonyter--nb-type-from-prefix arg))))
 
 ;;;###autoload
-(defun jsonyter-insert-cell-above (&optional markdown)
-  "Insert an empty code cell above the cell at point.
-With a prefix argument (MARKDOWN), insert a markdown cell instead."
+(defun jsonyter-insert-cell-above (&optional arg)
+  "Insert an empty cell above the cell at point.
+With no prefix argument the cell is a code cell; `C-u' makes it
+markdown and `C-u C-u' makes it raw.  A Lisp caller may pass one of
+the strings code, markdown or raw; see `jsonyter--nb-type-from-prefix'."
   (interactive "P")
   (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
     (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
-                              (if markdown "markdown" "code"))))
+                              (jsonyter--nb-type-from-prefix arg))))
 
 (defun jsonyter--nb-excise-cell (cell)
   "Remove CELL from the buffer — source and output together — no questions asked."
