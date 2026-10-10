@@ -1068,11 +1068,12 @@ through `write_notebook''s own id assignment."
                    '("x = 1" "print(x)" "# heading")))))
 
 (ert-deftest jsonyter-test-toggle-back-to-code ()
-  "A cell toggled to markdown and back is a code cell with no output."
+  "A cell toggled round markdown and raw and back is a code cell with no output."
   (jsonyter-tests--with-notebook
     (let ((cell (jsonyter-tests--cell 0)))
       (jsonyter--nb-set-output cell "results\n" nil t)
       (goto-char (overlay-start cell))
+      (jsonyter-toggle-cell-type)
       (jsonyter-toggle-cell-type)
       (jsonyter-toggle-cell-type)
       (should (equal (overlay-get cell 'jsonyter-cell-type) "code"))
