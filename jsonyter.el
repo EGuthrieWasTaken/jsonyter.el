@@ -2842,7 +2842,7 @@ strings, is kept as structured JSON instead."
                             ((string-match-p "json" (symbol-name key))
                              (jsonyter--nb-json-for-wire val))
                             ((cl-every #'stringp val) (jsonyter--mime data key))
-                            (t (jsonyter--nb-json-for-wire val)))))
+                            (t (jsonyter--nb-json-for-wire val))))))
 
 (defun jsonyter--nb-output-for-wire (output)
   "Reshape nbformat-shape OUTPUT so `json-serialize' can encode it.
