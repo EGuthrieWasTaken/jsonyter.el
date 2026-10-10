@@ -4129,8 +4129,11 @@ the cell with `jsonyter--nb-cell-at' (signal (user-error \"No cell at
 point\") when there is none), change it with `jsonyter--nb-set-type', and
 `message' \"jsonyter: cell is now TYPE\"."
   (interactive (list (completing-read "Cell type: " '("code" "markdown" "raw") nil t)))
-  (ignore type)
-  (error "jsonyter: not implemented"))
+  (jsonyter--nb-ensure-notebook)
+  (let ((cell (jsonyter--nb-cell-at)))
+    (unless cell (user-error "No cell at point"))
+    (jsonyter--nb-set-type cell type)
+    (message "jsonyter: cell is now %s" type))
 
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
