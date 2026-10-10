@@ -4700,8 +4700,16 @@ there are any), the lines \\pagestyle{empty} and \\begin{document}, the
 fragment, and \\end{document} with a final newline.  The fragment is $BODY$
 for `inline', \\[BODY\\] for `display', and BODY unchanged for `env'.
 Every line is newline-terminated."
-  (ignore body kind)
-  (error "jsonyter: not implemented"))
+  (concat "\\documentclass[12pt]{article}\n"
+         (concat jsonyter-latex-preview-preamble "\n")
+         (concat (mapconcat #'identity jsonyter-notebook-latex-macros "\n")
+                   (if jsonyter-notebook-latex-macros "\n" ""))
+         "\\pagestyle{empty}\n\\begin{document}\n"
+         (pcase kind
+                ('inline (concat "$" body "$"))
+                ('display (concat "\\[" body "\\]"))
+                (otherwise body))
+         "\n\\end{document}\n"))
 
 (defun jsonyter--latex-converter ()
   "Return `dvipng', `dvisvgm' or nil: the program to turn DVI into an image.
