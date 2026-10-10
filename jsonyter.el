@@ -3491,6 +3491,7 @@ intermediate states are not edits to any cell's source."
   "Replace the current buffer with a rendered view of NOTEBOOK."
   (let ((inhibit-read-only t)
         (jsonyter--nb-cell-surgery t))
+    (jsonyter--nb-forget-cells)
     (erase-buffer)
     (dolist (cell (plist-get notebook :cells))
       (let ((start (point)))
