@@ -4707,7 +4707,7 @@ Every line is newline-terminated."
          "\\pagestyle{empty}\n\\begin{document}\n"
          (cond ((eq kind 'inline) (concat "$" body "$"))
                ((eq kind 'display) (concat "\\[" body "\\]"))
-               (t body)))
+               (t body))
          "\n\\end{document}\n"))
 
 (defun jsonyter--latex-converter ()
