@@ -3421,8 +3421,9 @@ Bind `inhibit-read-only' to t while doing this."
 Blank means `string-blank-p' of (jsonyter--nb-cell-source CELL).  A cell
 shows output when its `jsonyter-source-end' marker is before its overlay
 end."
-  (ignore cell)
-  (error "jsonyter: not implemented"))
+  (and (string-blank-p (jsonyter--nb-cell-source cell))
+        (>= (marker-position (overlay-get cell 'jsonyter-source-end))
+            (overlay-end cell))))
 
 ;;;###autoload
 (defun jsonyter-notebook-prune ()
