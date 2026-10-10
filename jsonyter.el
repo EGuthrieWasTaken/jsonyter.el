@@ -4693,8 +4693,19 @@ dollar, BODY is the TeX between them.  Scan TEXT from offset 0 with
 \(OPEN (1+ CLOSE) \\='inline (substring text (1+ OPEN) CLOSE)) and resume
 scanning at (1+ CLOSE); otherwise resume at (1+ OPEN).  Text order; nil
 when there are none."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((pos 0) (n (length text)) out)
+    (while (and (< pos n) (string-match "\\$" text pos))
+      (let* ((open (match-beginning 0))
+             (close (and (jsonyter--latex-inline-open-p text open)
+                         (jsonyter--latex-inline-find-close text open))))
+        (if close
+            (progn
+              (push (list open (1+ close) 'inline
+                          (substring text (1+ open) close))
+                    out)
+              (setq pos (1+ close)))
+          (setq pos (1+ open)))))
+    (nreverse out)))
 
 (defun jsonyter--latex-fragments (text)
   "Return every math fragment in TEXT as (BEG END KIND BODY), in text order.
