@@ -2811,8 +2811,21 @@ are told apart by whether the car is a keyword.  Returns VALUE with:
 - any other non-nil list turned into a vector of its converted elements;
 - a vector turned into a vector of its converted elements;
 - anything else (string, number, nil, t, :null, :false) returned as is."
-  (ignore value)
-  (error "jsonyter: not implemented"))
+  (cond
+   ((null value) nil)
+   ((vectorp value)
+    (vconcat (mapcar #'jsonyter--nb-json-for-wire value)))
+   ((and (consp value) (keywordp (car value)))
+    (let ((out nil)
+           (rest value))
+      (while rest
+        (push (car rest) out)
+        (push (jsonyter--nb-json-for-wire (cadr rest)) out)
+        (setq rest (cddr rest)))
+      (nreverse out)))
+   ((consp value)
+    (vconcat (mapcar #'jsonyter--nb-json-for-wire value)))
+   (t value)))
 
 (defun jsonyter--nb-data-for-wire (data)
   "Reshape mimebundle DATA (an output's `:data' or `:metadata' plist) so
