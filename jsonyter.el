@@ -3395,6 +3395,7 @@ left alone.  Uses `jsonyter--nb-cells'."
         (let ((marker (overlay-get cell 'jsonyter-source-end)))
           (when (markerp marker)
             (set-marker marker nil))
+        )
         (delete-overlay cell)
         (setq count (1+ count))))
     count))
