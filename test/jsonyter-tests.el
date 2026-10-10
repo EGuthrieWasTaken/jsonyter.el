@@ -6648,5 +6648,68 @@ table lists for the language wins -- `matches' is built by `push', so
                  (lambda (_prompt _table &optional _pred _req _init _hist default) default)))
         (should (equal "last-kid" (jsonyter--read-kernel "Pick: ")))))))
 
+;;;; sync-add-pair creates missing directories
+;; Spec: openspec/changes/sync-add-pair-creates-dirs
+
+(defvar jsonyter-tests--server-dirs nil
+  "Directories (Contents-API paths, no slashes at the ends) the fake server holds.")
+(defvar jsonyter-tests--server-files nil
+  "Files the fake server holds.")
+(defvar jsonyter-tests--server-calls nil
+  "Requests the fake server received, newest first, as (METHOD . PATH).")
+
+(defun jsonyter-tests--fake-request-sync (method params &optional _timeout)
+  "Stand-in for `jsonyter--request-sync' over a tiny in-memory Contents API.
+`make_directory' creates exactly one level and fails if the parent is
+missing, like the real thing."
+  (let ((path (plist-get params :path)))
+    (push (cons method path) jsonyter-tests--server-calls)
+    (pcase method
+      ("list_contents"
+       (cond ((member path jsonyter-tests--server-dirs)
+              (list :type "directory" :path path :content nil))
+             ((member path jsonyter-tests--server-files)
+              (list :type "file" :path path :content "x"))
+             (t (error "jsonyter: 404 not found: %s" path))))
+      ("make_directory"
+       (let ((parent (if (string-match "/[^/]*\\'" path)
+                         (substring path 0 (match-beginning 0))
+                       "")))
+         (unless (member parent jsonyter-tests--server-dirs)
+           (error "jsonyter: 404 parent missing: %s" parent))
+         (push path jsonyter-tests--server-dirs)
+         (list :type "directory" :path path)))
+      (_ (error "unexpected method %s" method)))))
+
+(defmacro jsonyter-tests--with-fake-server (dirs files &rest body)
+  "Run BODY against a fake server holding DIRS and FILES."
+  (declare (indent 2) (debug t))
+  `(let ((jsonyter-tests--server-dirs (cons "" ,dirs))
+         (jsonyter-tests--server-files ,files)
+         (jsonyter-tests--server-calls nil))
+     (cl-letf (((symbol-function 'jsonyter--request-sync)
+                #'jsonyter-tests--fake-request-sync)
+               ((symbol-function 'jsonyter--resolve-transfer-context)
+                (lambda () (cons (current-buffer) nil))))
+       ,@body)))
+
+(defmacro jsonyter-tests--with-temp-root (var &rest body)
+  "Bind VAR to a fresh temporary directory for BODY, then delete it."
+  (declare (indent 1) (debug t))
+  `(let ((,var (make-temp-file "jsonyter-sync-" t)))
+     (unwind-protect (progn ,@body)
+       (delete-directory ,var t))))
+
+(defun jsonyter-tests--server-mkdirs ()
+  "The `make_directory' paths the fake server received, oldest first."
+  (mapcar #'cdr (seq-filter (lambda (c) (equal (car c) "make_directory"))
+                            (reverse jsonyter-tests--server-calls))))
+
+(ert-deftest jsonyter-test-sync-ensure-local-dir-creates-with-parents ()
+  (jsonyter-tests--with-temp-root root
+    (let ((dir (expand-file-name "a/b/c" root)))
+      (should (jsonyter--sync-ensure-local-dir dir))
+      (should (file-directory-p dir))
+      (should-not (jsonyter--sync-ensure-local-dir dir)))))
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
