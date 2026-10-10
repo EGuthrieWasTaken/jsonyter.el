@@ -4612,8 +4612,16 @@ end.  The result is in text order, nil when there are none."
 BODY is the TeX between the dollars (group 1 of
 `jsonyter--latex-display-dollars-regexp').  Search with `string-match'
 from offset 0, continuing from each match end.  Text order, nil if none."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((pos 0)
+        (out nil))
+    (while (string-match jsonyter--latex-display-dollars-regexp text pos)
+      (push (list (match-beginning 0)
+                   (match-end 0)
+                   'display
+                   (match-string 1 text))
+            out)
+      (setq pos (match-end 0)))
+    (nreverse out)))
 
 (defun jsonyter--latex-find-brackets (text)
   "Return the `\\[...\\]' and `\\(...\\)' fragments in TEXT.
