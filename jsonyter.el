@@ -4816,7 +4816,10 @@ Without `latex' (`executable-find') signal
 \(user-error \"jsonyter: LaTeX preview needs `latex\\=' on the exec-path\").
 Without a converter (`jsonyter--latex-converter') signal
 \(user-error \"jsonyter: LaTeX preview needs `dvipng\\=' or `dvisvgm\\=' on the exec-path\")."
-  (error "jsonyter: not implemented"))
+  (unless (executable-find "latex")
+    (user-error "jsonyter: LaTeX preview needs `latex' on the exec-path"))
+  (unless (jsonyter--latex-converter)
+    (user-error "jsonyter: LaTeX preview needs `dvipng' or `dvisvgm' on the exec-path")))
 
 (defun jsonyter--nb-latex-clear (beg end)
   "Delete every LaTeX preview overlay between BEG and END; return how many.
