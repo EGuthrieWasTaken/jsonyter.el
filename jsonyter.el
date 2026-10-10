@@ -4716,7 +4716,13 @@ With `jsonyter-latex-preview-converter' set to `auto', prefer dvipng if
 `executable-find' finds it, else dvisvgm if found, else nil.  With an
 explicit choice, return it only if `executable-find' finds a program of
 that name, else nil."
-  (error "jsonyter: not implemented"))
+  (let ((choice jsonyter-latex-preview-converter))
+    (if (eq choice 'auto)
+        (cond ((executable-find "dvipng") 'dvipng)
+              ((executable-find "dvisvgm") 'dvisvgm)
+              (t nil))
+      (and (executable-find (symbol-name choice))
+           choice))))
 
 (defun jsonyter--latex-cache-file (document converter dpi fg)
   "Return the cache path of the image for DOCUMENT rendered by CONVERTER.
