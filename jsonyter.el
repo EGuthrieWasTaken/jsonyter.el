@@ -6244,8 +6244,11 @@ one, and re-running resumes naturally."
 (defun jsonyter--sync-ensure-local-dir (dir)
   "Create the local directory DIR, parents included, if it is missing.
 Return t when it was created, nil when it already existed."
-  (ignore dir)
-  (error "jsonyter: not implemented"))
+  (if (file-directory-p dir)
+      nil
+    (progn
+      (make-directory dir t)
+      t)))
 
 (defun jsonyter--sync-ensure-remote-dir (buffer remote)
   "Create each missing level of REMOTE on BUFFER's server, outermost first.
