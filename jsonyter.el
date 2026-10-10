@@ -4521,6 +4521,10 @@ Intended for `auto-mode-alist':
     (jsonyter--nb-render notebook)
     (set-buffer-modified-p nil)
     (setq buffer-undo-list nil)
+    (when jsonyter-notebook-latex-preview-on-open
+      (condition-case err
+          (jsonyter-notebook-latex-preview t)
+        (user-error (message "%s" (cadr err)))))
     (message
      "jsonyter: %d cells, %s kernel — C-RET run · S-RET run+advance · C-c C-b run all%s"
      (length (plist-get notebook :cells)) language
