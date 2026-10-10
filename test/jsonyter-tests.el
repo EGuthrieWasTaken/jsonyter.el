@@ -7701,5 +7701,376 @@ Each program writes the files the real one would into `default-directory'."
         (should-not (jsonyter-tests--previews))
         (should (= (length (jsonyter--nb-cells)) 3))))))
 
+;;; Per-cell line numbers
+
+(defmacro jsonyter-tests--with-numbered-notebook (cells &rest body)
+  "Open a notebook of CELLS with line numbers on, then run BODY in its buffer.
+CELLS is as for `jsonyter-tests--nb-json'.  Line numbers are switched on
+with `display-line-numbers-mode' once the notebook is open, the way a
+user toggles them, so the first redisplay has not happened yet."
+  (declare (indent 1) (debug t))
+  `(jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json ,cells)
+     (display-line-numbers-mode 1)
+     ,@body))
+
+(defun jsonyter-tests--cell-numbers (cell)
+  "The numbers shown beside CELL's source lines, as a list of integers.
+The first line's number is the tail of the cell's prompt string; the
+others are the `line-prefix' text properties.  An unnumbered line is nil."
+  (jit-lock-fontify-now (point-min) (point-max))
+  (let ((tail (car (last (split-string (overlay-get cell 'before-string) "\n"))))
+        nums first)
+    (save-excursion
+      (goto-char (overlay-start cell))
+      (setq first t)
+      (while (< (point) (jsonyter--nb-source-end cell))
+        (push (if first
+                  (and (not (string-empty-p tail)) (string-to-number tail))
+                (let ((prefix (get-text-property (point) 'line-prefix)))
+                  (and prefix (string-to-number prefix))))
+              nums)
+        (setq first nil)
+        (forward-line 1)))
+    (nreverse nums)))
+
+(defun jsonyter-tests--all-numbers ()
+  "`jsonyter-tests--cell-numbers' for every cell, in order."
+  (mapcar #'jsonyter-tests--cell-numbers (jsonyter--nb-cells)))
+
+(defun jsonyter-tests--numbers-run-from-one-p ()
+  "Non-nil when every cell's numbers are exactly 1 through its line count."
+  (cl-every (lambda (cell)
+              (equal (jsonyter-tests--cell-numbers cell)
+                     (number-sequence 1 (jsonyter--nb-line-count cell))))
+            (jsonyter--nb-cells)))
+
+(defun jsonyter-tests--number-props-anywhere-p ()
+  "Non-nil when any text in the buffer carries a line-prefix or wrap-prefix."
+  (or (text-property-not-all (point-min) (point-max) 'line-prefix nil)
+      (text-property-not-all (point-min) (point-max) 'wrap-prefix nil)))
+
+(defun jsonyter-tests--lines (n)
+  "A source of N lines: \"l1\\nl2\\n...\"."
+  (mapconcat (lambda (i) (format "l%d\n" i)) (number-sequence 1 n) ""))
+
+(ert-deftest jsonyter-test-nb-number-helpers ()
+  (should (= (jsonyter--nb-number-digits 1) 2))
+  (should (= (jsonyter--nb-number-digits 99) 2))
+  (should (= (jsonyter--nb-number-digits 100) 3))
+  (should (= (jsonyter--nb-number-digits 12345) 5))
+  (should (equal (substring-no-properties (jsonyter--nb-number-string 3 2)) " 3 "))
+  (should (equal (substring-no-properties (jsonyter--nb-number-string 100 3)) "100 "))
+  (should (eq (get-text-property 0 'face (jsonyter--nb-number-string 1 2))
+              'line-number)))
+
+(ert-deftest jsonyter-test-nb-prompt-ends-with-its-gutter-only-when-given-one ()
+  (let ((plain (jsonyter--nb-prompt "code" 1)))
+    (should (string-suffix-p "\n" plain))
+    (should (equal (jsonyter--nb-prompt "code" 1 nil "  1 ") (concat plain "  1 ")))
+    (should (equal (jsonyter--nb-prompt "raw" nil nil nil)
+                   (jsonyter--nb-prompt "raw" nil)))))
+
+(ert-deftest jsonyter-test-nb-line-count-ignores-output ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       `(("code" "a\nb\n" (,(list :output_type "stream" :name "stdout"
+                                  :text "o1\no2\no3\n")))
+         ("code" "" nil)))
+    (should (equal (mapcar #'jsonyter--nb-line-count (jsonyter--nb-cells)) '(2 1)))))
+
+(ert-deftest jsonyter-test-nb-numbers-restart-in-every-cell ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "a\nb\nc\n" nil) ("code" "d\ne\n" nil))
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3) (1 2))))))
+
+(ert-deftest jsonyter-test-nb-numbers-cover-markdown-and-raw-cells ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("markdown" "m1\nm2\n" nil) ("raw" "r1\nr2\nr3\n" nil) ("code" "c\n" nil))
+    (should (equal (jsonyter-tests--all-numbers) '((1 2) (1 2 3) (1))))))
+
+(ert-deftest jsonyter-test-nb-numbers-an-empty-cell-is-line-one ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "" nil) ("code" "x\n" nil))
+    (should (equal (jsonyter-tests--all-numbers) '((1) (1))))))
+
+(ert-deftest jsonyter-test-nb-numbers-first-line-is-in-the-prompt-not-a-prefix ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let* ((cell (car (jsonyter--nb-cells)))
+           (start (overlay-start cell)))
+      (should (string-suffix-p " 1 " (substring-no-properties
+                                      (overlay-get cell 'before-string))))
+      (should-not (get-text-property start 'line-prefix))
+      (should (equal (substring-no-properties (get-text-property (+ start 2) 'line-prefix))
+                     " 2 ")))))
+
+(ert-deftest jsonyter-test-nb-numbers-wrapped-rows-are-indented-by-the-gutter ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let ((start (overlay-start (car (jsonyter--nb-cells)))))
+      (dolist (offset '(0 2 4))
+        (should (equal (get-text-property (+ start offset) 'wrap-prefix) "   "))))))
+
+(ert-deftest jsonyter-test-nb-numbers-leave-output-rows-alone ()
+  (jsonyter-tests--with-numbered-notebook
+      `(("code" "a\nb\n" (,(list :output_type "stream" :name "stdout"
+                                 :text "o1\no2\n")))
+        ("code" "c\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let* ((cell (car (jsonyter--nb-cells)))
+           (from (jsonyter--nb-source-end cell)))
+      (should (< from (overlay-end cell)))
+      (should-not (text-property-not-all from (overlay-end cell) 'line-prefix nil))
+      (should-not (text-property-not-all from (overlay-end cell) 'wrap-prefix nil)))))
+
+(ert-deftest jsonyter-test-nb-numbers-share-one-column-per-cell ()
+  (jsonyter-tests--with-numbered-notebook
+      `(("code" ,(jsonyter-tests--lines 9) nil) ("code" ,(jsonyter-tests--lines 100) nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let ((small (nth 0 (jsonyter--nb-cells))) (big (nth 1 (jsonyter--nb-cells))))
+      (should (equal (list (overlay-get small 'jsonyter-number-digits)
+                           (overlay-get big 'jsonyter-number-digits))
+                     '(2 3)))
+      (dolist (spec (list (cons small 3) (cons big 4)))
+        (let ((cell (car spec)) (width (cdr spec)))
+          (save-excursion
+            (goto-char (overlay-start cell))
+            (should (= (length (car (last (split-string
+                                          (overlay-get cell 'before-string) "\n"))))
+                       width))
+            (forward-line 1)
+            (while (< (point) (jsonyter--nb-source-end cell))
+              (should (= (length (get-text-property (point) 'line-prefix)) width))
+              (should (= (length (get-text-property (point) 'wrap-prefix)) width))
+              (forward-line 1))))))))
+
+(ert-deftest jsonyter-test-nb-numbers-follow-a-newline-at-the-start ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "a\nb\nc\n" nil) ("code" "d\ne\n" nil))
+    (goto-char (point-min))
+    (insert "\n")
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3 4) (1 2))))))
+
+(ert-deftest jsonyter-test-nb-numbers-follow-a-newline-in-the-middle ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "a\nb\nc\n" nil) ("code" "d\ne\n" nil))
+    (goto-char (point-min))
+    (forward-line 1)
+    (end-of-line)
+    (insert "\n")
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3 4) (1 2))))))
+
+(ert-deftest jsonyter-test-nb-numbers-follow-a-deleted-newline ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "a\nb\nc\n" nil) ("code" "d\ne\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (goto-char (point-min))
+    (end-of-line)
+    (delete-char 1)
+    (should (equal (jsonyter-tests--all-numbers) '((1 2) (1 2))))))
+
+(ert-deftest jsonyter-test-nb-numbers-follow-text-typed-at-the-bottom ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (goto-char (point-max))
+    (insert "tail")
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3))))
+    (should (jsonyter-tests--numbers-run-from-one-p))))
+
+(ert-deftest jsonyter-test-nb-numbers-widen-and-narrow-the-whole-column ()
+  (jsonyter-tests--with-numbered-notebook
+      `(("code" ,(jsonyter-tests--lines 99) nil) ("code" "z\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let ((cell (car (jsonyter--nb-cells))))
+      (should (= (overlay-get cell 'jsonyter-number-digits) 2))
+      (goto-char (point-min))
+      (insert "\n")
+      (should (= (overlay-get cell 'jsonyter-number-digits) 3))
+      (should (equal (jsonyter-tests--cell-numbers cell) (number-sequence 1 100)))
+      (should (= (length (car (last (split-string
+                                     (overlay-get cell 'before-string) "\n"))))
+                 4))
+      (save-excursion
+        (goto-char (overlay-start cell))
+        (forward-line 1)
+        (while (< (point) (jsonyter--nb-source-end cell))
+          (should (= (length (get-text-property (point) 'line-prefix)) 4))
+          (forward-line 1)))
+      (goto-char (point-min))
+      (delete-char 1)
+      (should (= (overlay-get cell 'jsonyter-number-digits) 2))
+      (should (equal (jsonyter-tests--cell-numbers cell) (number-sequence 1 99)))
+      (save-excursion
+        (goto-char (overlay-start cell))
+        (forward-line 1)
+        (while (< (point) (jsonyter--nb-source-end cell))
+          (should (= (length (get-text-property (point) 'line-prefix)) 3))
+          (forward-line 1))))))
+
+(ert-deftest jsonyter-test-nb-numbers-off-screen-lines-wait-to-be-shown ()
+  (jsonyter-tests--with-numbered-notebook
+      `(("code" ,(jsonyter-tests--lines 2000) nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (let* ((cell (car (jsonyter--nb-cells)))
+           (far (save-excursion (goto-char (point-min)) (forward-line 1500) (point))))
+      (should (get-text-property far 'fontified))
+      (goto-char (point-min))
+      (insert "\n")
+      (setq far (1+ far))
+      (should-not (get-text-property far 'fontified))
+      ;; Still the old number until the line is shown...
+      (should (= (string-to-number (get-text-property far 'line-prefix)) 1501))
+      (jit-lock-fontify-now far (1+ far))
+      ;; ...and the new one once it is.
+      (should (= (string-to-number (get-text-property far 'line-prefix)) 1502))
+      (should (equal (last (jsonyter-tests--cell-numbers cell)) '(2001))))))
+
+(ert-deftest jsonyter-test-nb-numbers-survive-cell-operations ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "a\nb\nc\n" nil) ("markdown" "d\ne\n" nil) ("code" "f\n" nil))
+    (should (jsonyter-tests--numbers-run-from-one-p))
+    (goto-char (overlay-start (nth 0 (jsonyter--nb-cells))))
+    (jsonyter-move-cell-down)
+    (should (jsonyter-tests--numbers-run-from-one-p))
+    (should (equal (mapcar #'jsonyter--nb-line-count (jsonyter--nb-cells)) '(2 3 1)))
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (jsonyter-insert-cell-below)
+    (should (jsonyter-tests--numbers-run-from-one-p))
+    (goto-char (overlay-start (nth 0 (jsonyter--nb-cells))))
+    (jsonyter-toggle-cell-type)
+    (should (jsonyter-tests--numbers-run-from-one-p))
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t)))
+      (jsonyter-delete-cell))
+    (should (jsonyter-tests--numbers-run-from-one-p))))
+
+(ert-deftest jsonyter-test-nb-numbers-replace-emacs-own-numbers ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
+    (should jsonyter--nb-numbers-active)
+    (should display-line-numbers-mode)
+    (should-not display-line-numbers)))
+
+(ert-deftest jsonyter-test-nb-numbers-follow-the-line-number-mode-off-and-on ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (display-line-numbers-mode -1)
+    (should-not jsonyter--nb-numbers-active)
+    (should-not display-line-numbers)
+    (should-not (jsonyter-tests--number-props-anywhere-p))
+    (should (equal (overlay-get (car (jsonyter--nb-cells)) 'before-string)
+                   (jsonyter--nb-prompt "code" nil nil nil)))
+    (display-line-numbers-mode 1)
+    (should jsonyter--nb-numbers-active)
+    (should-not display-line-numbers)
+    (should (equal (jsonyter-tests--all-numbers) '((1 2))))))
+
+(ert-deftest jsonyter-test-nb-numbers-are-on-when-line-numbers-are-global ()
+  (unwind-protect
+      (progn
+        (global-display-line-numbers-mode 1)
+        (jsonyter-tests--with-notebook-json
+            (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+          (should jsonyter--nb-numbers-active)
+          (should-not display-line-numbers)
+          (should (equal (jsonyter-tests--all-numbers) '((1 2))))))
+    (global-display-line-numbers-mode -1)))
+
+(ert-deftest jsonyter-test-nb-numbers-absent-when-the-user-has-no-line-numbers ()
+  (jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+    (should-not jsonyter--nb-numbers-active)
+    (should-not display-line-numbers)
+    (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+    (should-not (jsonyter-tests--number-props-anywhere-p))))
+
+(ert-deftest jsonyter-test-nb-numbers-leave-relative-numbering-to-emacs ()
+  (jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+    (setq-local display-line-numbers-type 'relative)
+    (display-line-numbers-mode 1)
+    (should-not jsonyter--nb-numbers-active)
+    (should (eq display-line-numbers 'relative))
+    (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+    (should-not (jsonyter-tests--number-props-anywhere-p))))
+
+(ert-deftest jsonyter-test-nb-numbers-read-the-option-when-toggled ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
+    (should jsonyter--nb-numbers-active)
+    (let ((jsonyter-notebook-line-numbers 'buffer))
+      (display-line-numbers-mode -1)
+      (display-line-numbers-mode 1)
+      (should-not jsonyter--nb-numbers-active)
+      (should (eq display-line-numbers t)))
+    (display-line-numbers-mode -1)
+    (display-line-numbers-mode 1)
+    (should jsonyter--nb-numbers-active)
+    (should-not display-line-numbers)))
+
+(ert-deftest jsonyter-test-nb-numbers-buffer-setting-leaves-everything-alone ()
+  (let ((jsonyter-notebook-line-numbers 'buffer))
+    (jsonyter-tests--with-notebook-json
+        (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+      (display-line-numbers-mode 1)
+      (should-not jsonyter--nb-numbers-active)
+      (should (eq display-line-numbers t))
+      (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+      (should-not (jsonyter-tests--number-props-anywhere-p))
+      (should (equal (overlay-get (car (jsonyter--nb-cells)) 'before-string)
+                     (jsonyter--nb-prompt "code" nil nil nil))))))
+
+(ert-deftest jsonyter-test-nb-numbers-are-display-only ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("code" "alpha\nbeta\ngamma" nil) ("code" "delta\n" nil))
+    (let ((sources (jsonyter-tests--cell-sources))
+          (undo buffer-undo-list))
+      (jit-lock-fontify-now (point-min) (point-max))
+      (should (equal sources '("alpha\nbeta\ngamma" "delta")))
+      (should-not (buffer-modified-p))
+      (should (eq undo buffer-undo-list))
+      (should (equal (mapcar (lambda (c) (plist-get c :source))
+                             (jsonyter--nb-collect-cells))
+                     '("alpha\nbeta\ngamma" "delta"))))))
+
+(ert-deftest jsonyter-test-nb-numbers-are-not-copied ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "alpha\nbeta\ngamma\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (should (get-text-property (+ (point-min) 6) 'line-prefix))
+    (copy-region-as-kill (point-min) (point-max))
+    (let ((copied (car kill-ring)))
+      (should (equal (substring-no-properties copied) "alpha\nbeta\ngamma\n"))
+      (should-not (text-property-not-all 0 (length copied) 'line-prefix nil copied))
+      (should-not (text-property-not-all 0 (length copied) 'wrap-prefix nil copied)))))
+
+(ert-deftest jsonyter-test-nb-numbers-do-not-need-font-lock ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\n" nil))
+    (font-lock-mode -1)
+    (jit-lock-refontify (point-min) (point-max))
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3))))
+    (goto-char (point-min))
+    (insert "\n")
+    (should (equal (jsonyter-tests--all-numbers) '((1 2 3 4))))))
+
+(ert-deftest jsonyter-test-nb-numbers-leave-other-buffers-alone ()
+  (with-temp-buffer
+    (insert "# %%\nx = 1\n")
+    (python-mode)
+    (display-line-numbers-mode 1)
+    (jsonyter-script-mode 1)
+    (should (eq display-line-numbers t))
+    (should-not jsonyter--nb-numbers-active)))
+
+(ert-deftest jsonyter-test-nb-numbers-go-when-the-notebook-mode-goes ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil) ("code" "c\n" nil))
+    (jit-lock-fontify-now (point-min) (point-max))
+    (should (jsonyter-tests--number-props-anywhere-p))
+    (jsonyter-notebook-mode -1)
+    (should-not jsonyter--nb-numbers-active)
+    (should-not (jsonyter-tests--number-props-anywhere-p))
+    (should (eq display-line-numbers t))
+    (should-not (memq #'jsonyter--nb-line-numbers-sync
+                      (buffer-local-value 'display-line-numbers-mode-hook
+                                          (current-buffer))))
+    (dolist (cell (jsonyter--nb-cells))
+      (should (equal (overlay-get cell 'before-string)
+                     (jsonyter--nb-prompt "code" nil nil nil))))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
