@@ -3375,6 +3375,61 @@ marked stale."
           (overlay-put ov 'jsonyter-output-stale stale)
           (jsonyter--nb-refresh-output ov))))))
 
+(defun jsonyter--nb-forget-cells ()
+  "Delete every cell overlay in this buffer, and each one's source-end marker.
+Overlays outlive `erase-buffer' (they collapse to empty ones at the top),
+so a re-render must forget the cells it is replacing.  Uses
+`jsonyter--nb-cells' to find them; each cell's `jsonyter-source-end'
+property is a marker, to be detached with (set-marker MARKER nil)."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-drop-empty-cells ()
+  "Delete every cell overlay that covers no text, and return how many.
+A cell is empty here when its overlay start equals its overlay end.
+Also detach its `jsonyter-source-end' marker.  Cells that cover text are
+left alone.  Uses `jsonyter--nb-cells'."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-adopt-stray-text ()
+  "Bring text after the last cell into a cell; return t if there was any.
+Stray text is any text between the end of the last cell's overlay and
+`point-max' (for example what the user types after the final newline).
+Returns nil, doing nothing, when there is none or there are no cells.
+Otherwise, with `jsonyter--nb-cell-surgery' bound to t:
+1. If the buffer text does not end in a newline, insert one at
+   `point-max', keeping point where it was (use `save-excursion').
+2. If the last cell shows no output (its `jsonyter-source-end' marker is
+   at or past its overlay end), extend its overlay to `point-max' with
+   `move-overlay' and move its source-end marker there too.
+3. Otherwise create a new code cell over the stray text with
+   (jsonyter--nb-make-cell START (point-max)
+                            (list :id nil :cell_type \"code\" :outputs nil))
+   where START is the old end of the last cell's overlay.
+Bind `inhibit-read-only' to t while doing this."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-empty-cell-p (cell)
+  "Non-nil when CELL has blank source and shows no output.
+Blank means `string-blank-p' of (jsonyter--nb-cell-source CELL).  A cell
+shows output when its `jsonyter-source-end' marker is before its overlay
+end."
+  (ignore cell)
+  (error "jsonyter: not implemented"))
+
+;;;###autoload
+(defun jsonyter-notebook-prune ()
+  "Delete every empty cell in this notebook; return how many were removed.
+First call `jsonyter--nb-ensure-notebook'.  Then drop zero-length cells
+\(`jsonyter--nb-drop-empty-cells'), and delete each cell for which
+`jsonyter--nb-empty-cell-p' is true with `jsonyter--nb-excise-cell' --
+but never the notebook's last remaining cell (stop excising when only
+one cell is left).  The count removed includes the dropped zero-length
+cells.  When it is above zero, mark the buffer modified with
+\(set-buffer-modified-p t).  Always `message' the result, \"jsonyter:
+removed N empty cell(s)\" or \"jsonyter: no empty cells\"."
+  (interactive)
+  (error "jsonyter: not implemented"))
+
 (defun jsonyter--nb-stale-after-change (beg end _len)
   "After an edit from BEG to END, re-judge the affected cells' outputs.
 On `after-change-functions' in notebook buffers.  Stands down during
