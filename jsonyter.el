@@ -4019,10 +4019,10 @@ keymap they were reached through."
 
 ;;;###autoload
 (defun jsonyter-insert-cell-below (&optional arg)
-  "Insert an empty cell below the cell at point.\
-With no prefix argument the cell is a code cell; `C-u' makes it markdown\
-and `C-u C-u' makes it raw.  A Lisp caller may pass \"code\", \"markdown\"\
-or \"raw\" instead; see `jsonyter--nb-type-from-prefix'."
+  "Insert an empty cell below the cell at point.
+With no prefix argument the cell is a code cell; `C-u' makes it
+markdown and `C-u C-u' makes it raw.  A Lisp caller may pass one of
+the strings code, markdown or raw; see `jsonyter--nb-type-from-prefix'."
   (interactive "P")
   (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
