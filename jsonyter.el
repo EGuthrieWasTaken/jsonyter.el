@@ -3481,6 +3481,8 @@ On `after-change-functions' in notebook buffers.  Stands down during
 cell surgery (see `jsonyter--nb-cell-surgery'), whose transient
 intermediate states are not edits to any cell's source."
   (unless jsonyter--nb-cell-surgery
+    (jsonyter--nb-drop-empty-cells)
+    (jsonyter--nb-adopt-stray-text)
     (dolist (cell (delete-dups (delq nil (list (jsonyter--nb-cell-at beg)
                                                (jsonyter--nb-cell-at end)))))
       (jsonyter--output-update-stale cell (jsonyter--nb-cell-source cell)))))
