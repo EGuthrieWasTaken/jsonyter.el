@@ -2834,9 +2834,15 @@ be stored as a list of line fragments instead of one string --
 `jsonyter--mime' already documents this and joins it for rendering --
 but `json-serialize' cannot encode a Lisp list as a JSON array, so each
 list-valued entry is joined here too.  Values that are not lists pass
-through unchanged."
+through unchanged. A value under a JSON mimetype, or a list that is not all
+strings, is kept as structured JSON instead."
   (cl-loop for (key val) on data by #'cddr
-           append (list key (if (listp val) (jsonyter--mime data key) val))))
+           append (list key (cond
+                            ((not (listp val)) val)
+                            ((string-match-p "json" (symbol-name key))
+                             (jsonyter--nb-json-for-wire val))
+                            ((cl-every #'stringp val) (jsonyter--mime data key))
+                            (t (jsonyter--nb-json-for-wire val)))))
 
 (defun jsonyter--nb-output-for-wire (output)
   "Reshape nbformat-shape OUTPUT so `json-serialize' can encode it.
