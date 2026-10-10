@@ -4901,8 +4901,29 @@ fragment's BODY, `modification-hooks' (list \\='jsonyter--nb-latex-overlay-modif
 A `user-error' from rendering is caught per fragment: say
 \(message \"jsonyter: LaTeX preview skipped -- %s\" MESSAGE) and go on.
 Count only the fragments that got an overlay."
-  (ignore cell)
-  (error "jsonyter: not implemented"))
+  (let* ((start (overlay-start cell))
+         (source (jsonyter--nb-cell-source cell))
+         (fg (jsonyter--latex-fg))
+         (converter (jsonyter--latex-converter))
+         (count 0))
+    (jsonyter--nb-latex-clear start (overlay-end cell))
+    (dolist (frag (jsonyter--latex-fragments source))
+      (condition-case err
+          (let* ((doc (jsonyter--latex-document (nth 3 frag) (nth 2 frag)))
+                 (file (jsonyter--latex-render doc converter
+                                               jsonyter-latex-preview-dpi fg))
+                 (ov (make-overlay (+ start (nth 0 frag))
+                                   (+ start (nth 1 frag)))))
+            (overlay-put ov 'jsonyter-latex-preview t)
+            (overlay-put ov 'display (jsonyter--latex-image file))
+            (overlay-put ov 'evaporate t)
+            (overlay-put ov 'help-echo (nth 3 frag))
+            (overlay-put ov 'modification-hooks
+                         '(jsonyter--nb-latex-overlay-modified))
+            (setq count (1+ count)))
+        (user-error
+         (message "jsonyter: LaTeX preview skipped -- %s" (cadr err)))))
+    count))
 
 (defun jsonyter--nb-latex-markdown-cells ()
   "Return the cells that can be previewed: markdown, not the macros cell.
