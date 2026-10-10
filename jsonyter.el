@@ -4730,8 +4730,10 @@ The name is the SHA-1 (`secure-hash') of the string made by
 \(format \"%s\\n%s\\n%s\\n%s\" DOCUMENT CONVERTER DPI FG), then \".svg\" when
 CONVERTER is `dvisvgm' and \".png\" otherwise, expanded in
 `jsonyter-latex-preview-cache-directory'."
-  (ignore document converter dpi fg)
-  (error "jsonyter: not implemented"))
+  (expand-file-name
+   (concat (secure-hash 'sha1 (format "%s\n%s\n%s\n%s" document converter dpi fg))
+             (if (eq converter 'dvisvgm) ".svg" ".png"))
+   jsonyter-latex-preview-cache-directory))
 
 (defun jsonyter--latex-fg (&optional face)
   "Return FACE's foreground (default: `default') as a dvipng colour string.
