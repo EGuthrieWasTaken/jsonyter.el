@@ -4819,8 +4819,31 @@ with `default-directory' bound to it:
 4. create the cache directory (`make-directory' with PARENTS t) and
    `copy-file' the image there, overwriting.
 Always delete the temporary directory afterwards (`unwind-protect')."
-  (ignore document converter dpi fg)
-  (error "jsonyter: not implemented"))
+  (let ((out (jsonyter--latex-cache-file document converter dpi fg)))
+    (unless (file-exists-p out)
+      (let* ((dir (make-temp-file "jsonyter-latex-" t))
+             (default-directory (file-name-as-directory dir))
+             (image (if (eq converter 'dvisvgm) "doc.svg" "doc.png")))
+        (unwind-protect
+            (progn
+              (with-temp-file (expand-file-name "doc.tex" dir) (insert document))
+              (unless (eq 0 (call-process "latex" nil nil nil "-interaction=nonstopmode"
+                                          "-halt-on-error" "doc.tex"))
+                (user-error "jsonyter: LaTeX failed: %s"
+                            (jsonyter--latex-first-error
+                             (expand-file-name "doc.log" dir))))
+              (unless (eq 0 (if (eq converter 'dvisvgm)
+                                (call-process "dvisvgm" nil nil nil "--no-fonts" "--exact"
+                                              "-o" image "doc.dvi")
+                              (call-process "dvipng" nil nil nil "-T" "tight"
+                                            "-D" (number-to-string dpi)
+                                            "-bg" "Transparent" "-fg" fg
+                                            "-o" image "doc.dvi")))
+                (user-error "jsonyter: %s failed" converter))
+              (make-directory (file-name-directory out) t)
+              (copy-file (expand-file-name image dir) out t))
+          (delete-directory dir t))))
+    out))
 
 (defun jsonyter--latex-image (file)
   "Return a `display' value showing the image FILE.
