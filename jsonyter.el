@@ -4626,8 +4626,15 @@ Each is (BEG END KIND BODY): KIND is `display' for `\\[' and `inline' for
 `\\(', BODY is the TeX inside.  Use each (REGEXP . KIND) of
 `jsonyter--latex-bracket-regexps' with `string-match', continuing from
 each match end, then sort the combined list by BEG."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((out nil))
+    (dolist (spec jsonyter--latex-bracket-regexps)
+      (let ((pos 0))
+        (while (string-match (car spec) text pos)
+          (push (list (match-beginning 0) (match-end 0)
+                      (cdr spec) (match-string 1 text))
+                out)
+          (setq pos (match-end 0)))))
+    (sort out (lambda (a b) (< (car a) (car b))))))
 
 (defun jsonyter--latex-inline-open-p (text pos)
   "Non-nil when the dollar sign at offset POS of TEXT may open `$...$'.
