@@ -4805,8 +4805,12 @@ Without a converter (`jsonyter--latex-converter') signal
   "Delete every LaTeX preview overlay between BEG and END; return how many.
 A preview overlay has a non-nil `jsonyter-latex-preview' property.  Other
 overlays are left alone."
-  (ignore beg end)
-  (error "jsonyter: not implemented"))
+  (let ((n 0))
+    (dolist (ov (overlays-in beg end))
+      (when (overlay-get ov 'jsonyter-latex-preview)
+        (delete-overlay ov)
+        (setq n (1+ n))))
+    n))
 
 (defun jsonyter--nb-latex-overlay-modified (ov after _beg _end &optional _len)
   "Delete preview overlay OV when the text under it is about to change.
