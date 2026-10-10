@@ -3388,7 +3388,16 @@ property is a marker, to be detached with (set-marker MARKER nil)."
 A cell is empty here when its overlay start equals its overlay end.
 Also detach its `jsonyter-source-end' marker.  Cells that cover text are
 left alone.  Uses `jsonyter--nb-cells'."
-  (error "jsonyter: not implemented"))
+  (let ((count 0))
+    (dolist (cell (jsonyter--nb-cells))
+      (when (and (= (overlay-start cell) (overlay-end cell))
+                 (not (overlay-done cell)))
+        (let ((marker (overlay-get cell 'jsonyter-source-end)))
+          (when (markerp marker)
+            (set-marker marker nil))
+        (delete-overlay cell)
+        (setq count (1+ count))))
+    count))
 
 (defun jsonyter--nb-adopt-stray-text ()
   "Bring text after the last cell into a cell; return t if there was any.
