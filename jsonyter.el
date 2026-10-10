@@ -4741,8 +4741,11 @@ Take (face-foreground (or FACE \\='default) nil \\='default); when that is a
 string `color-name-to-rgb' understands, format it as
 \"rgb R G B\" with three-decimal components, e.g. \"rgb 1.000 0.000 0.000\";
 otherwise return \"rgb 0.000 0.000 0.000\"."
-  (ignore face)
-  (error "jsonyter: not implemented"))
+  (let* ((color (face-foreground (or face 'default) nil 'default))
+         (rgb (and (stringp color) (color-name-to-rgb color))))
+    (if rgb
+        (format "rgb %.3f %.3f %.3f" (nth 0 rgb) (nth 1 rgb) (nth 2 rgb))
+      "rgb 0.000 0.000 0.000")))
 
 (defun jsonyter--latex-first-error (log-file)
   "Return the first line of LOG-FILE that starts with \"! \", else \"unknown error\".
