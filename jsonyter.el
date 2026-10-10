@@ -6434,12 +6434,16 @@ or nil when everything already existed or REMOTE is empty."
     (nreverse created)))
 
 ;;;###autoload
-(defun jsonyter-sync-add-pair (local remote &optional server persist)
+(defun jsonyter-sync-add-pair (local remote &optional server persist create-dirs)
   "Define a sync pair between LOCAL and REMOTE, added to `jsonyter-sync-pairs'.
 Interactively, REMOTE defaults to this session's current browser
 directory (the same kernel-cwd probe transfer commands use) and PERSIST
 asks whether to save it now via `customize-save-variable'; a Lisp caller
-gets a session-local pair unless PERSIST is non-nil."
+gets a session-local pair unless PERSIST is non-nil.
+
+With CREATE-DIRS (always when called interactively) a missing LOCAL or REMOTE
+directory is created before the pair is recorded, and a REMOTE path blocked by
+a file signals a `user-error`."
   (interactive
    (let* ((context (jsonyter--resolve-transfer-context))
           (buffer (car context))
@@ -6453,8 +6457,16 @@ gets a session-local pair unless PERSIST is non-nil."
                    buffer "Remote (contents) directory" remote-default t)))
      (list local (jsonyter--sync-clean-remote remote)
            (buffer-local-value 'jsonyter--url buffer)
-           (y-or-n-p "Persist to `jsonyter-sync-pairs' via customize-save-variable? "))))
+           (y-or-n-p "Persist to `jsonyter-sync-pairs' via customize-save-variable? ")
+           t)))
   (let ((pair (list :local local :remote remote :server server)))
+    (when create-dirs
+      (when (jsonyter--sync-ensure-local-dir local)
+        (message "jsonyter: created local directory %s" local))
+      (unless (string-empty-p (jsonyter--sync-clean-remote remote))
+        (dolist (path (jsonyter--sync-ensure-remote-dir
+                       (car (jsonyter--resolve-transfer-context)) remote))
+          (message "jsonyter: created remote directory %s" path))))
     (push pair jsonyter-sync-pairs)
     (when persist (customize-save-variable 'jsonyter-sync-pairs jsonyter-sync-pairs))
     (message "jsonyter: added sync pair %s <-> %s%s" local remote
