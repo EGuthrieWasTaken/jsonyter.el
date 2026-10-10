@@ -3381,7 +3381,11 @@ Overlays outlive `erase-buffer' (they collapse to empty ones at the top),
 so a re-render must forget the cells it is replacing.  Uses
 `jsonyter--nb-cells' to find them; each cell's `jsonyter-source-end'
 property is a marker, to be detached with (set-marker MARKER nil)."
-  (error "jsonyter: not implemented"))
+  (dolist (cell (jsonyter--nb-cells))
+    (let ((marker (overlay-get cell 'jsonyter-source-end)))
+      (when (markerp marker)
+        (set-marker marker nil))
+      (delete-overlay cell)))
 
 (defun jsonyter--nb-drop-empty-cells ()
   "Delete every cell overlay that covers no text, and return how many.
