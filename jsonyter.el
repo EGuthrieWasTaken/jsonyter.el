@@ -4075,8 +4075,14 @@ ARG is the raw prefix argument or a Lisp caller's value:
   other string signals (user-error \"jsonyter: unknown cell type %s\" ARG);
 - any other non-nil value (t, (4), a number) gives \"markdown\", which is
   what a bare prefix argument always meant."
-  (ignore arg)
-  (error "jsonyter: not implemented"))
+  (cond
+   ((null arg) "code")
+   ((stringp arg)
+    (if (member arg '("code" "markdown" "raw"))
+        arg
+      (user-error "jsonyter: unknown cell type %s" arg)))
+   ((equal arg '(16)) "raw")
+   (t "markdown")))
 
 (defun jsonyter--nb-set-type (cell type)
   "Change cell overlay CELL to TYPE, one of \"code\", \"markdown\", \"raw\".
