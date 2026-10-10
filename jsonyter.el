@@ -4816,8 +4816,7 @@ overlays are left alone."
   "Delete preview overlay OV when the text under it is about to change.
 Used in the overlay's `modification-hooks': it is called before (AFTER
 nil) and after (AFTER non-nil) a change.  Delete OV only before."
-  (ignore ov after)
-  (error "jsonyter: not implemented"))
+  (unless after (delete-overlay ov)))
 
 (defun jsonyter--nb-latex-preview-cell (cell)
   "Show the math in markdown cell overlay CELL as images; return the count.
