@@ -4020,6 +4020,51 @@ With a prefix argument (MARKDOWN), insert a markdown cell instead."
               (yes-or-no-p "Delete this cell? "))
       (jsonyter--nb-excise-cell cell))))
 
+(defun jsonyter--nb-next-cell-type (type)
+  "The cell type that follows TYPE when cycling: code, markdown, raw, code.
+TYPE is \"code\", \"markdown\" or \"raw\"; anything else (including nil)
+is treated like \"raw\" and gives \"code\"."
+  (ignore type)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-type-from-prefix (arg)
+  "The cell type a cell-inserting command's argument ARG asks for.
+ARG is the raw prefix argument or a Lisp caller's value:
+- nil gives \"code\";
+- the list (16), i.e. `C-u C-u', gives \"raw\";
+- a string \"code\", \"markdown\" or \"raw\" is returned as is, and any
+  other string signals (user-error \"jsonyter: unknown cell type %s\" ARG);
+- any other non-nil value (t, (4), a number) gives \"markdown\", which is
+  what a bare prefix argument always meant."
+  (ignore arg)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-set-type (cell type)
+  "Change cell overlay CELL to TYPE, one of \"code\", \"markdown\", \"raw\".
+Any other TYPE signals (user-error \"jsonyter: unknown cell type %s\" TYPE)
+before anything is changed.  Otherwise, in order:
+1. store TYPE in the overlay property `jsonyter-cell-type';
+2. clear the overlay property `jsonyter-exec-count' (set it to nil);
+3. clear the cell's output with (jsonyter--nb-set-output CELL \"\");
+4. redraw the prompt with (jsonyter--nb-refresh-prompt CELL);
+5. flush syntax and font-lock state for the cell's span:
+   (syntax-ppss-flush-cache (overlay-start CELL)) and
+   (font-lock-flush (overlay-start CELL) (overlay-end CELL))."
+  (ignore cell type)
+  (error "jsonyter: not implemented"))
+
+;;;###autoload
+(defun jsonyter-set-cell-type (type)
+  "Set the cell at point to TYPE: \"code\", \"markdown\" or \"raw\".
+Interactively, read TYPE with `completing-read' over those three names,
+requiring a match.  Call `jsonyter--nb-ensure-notebook' first, then find
+the cell with `jsonyter--nb-cell-at' (signal (user-error \"No cell at
+point\") when there is none), change it with `jsonyter--nb-set-type', and
+`message' \"jsonyter: cell is now TYPE\"."
+  (interactive (list (completing-read "Cell type: " '("code" "markdown" "raw") nil t)))
+  (ignore type)
+  (error "jsonyter: not implemented"))
+
 ;;;###autoload
 (defun jsonyter-toggle-cell-type ()
   "Toggle the cell at point between code and markdown.
