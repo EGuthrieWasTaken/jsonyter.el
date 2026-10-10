@@ -4717,8 +4717,15 @@ order: `jsonyter--latex-find-envs', `jsonyter--latex-find-display-dollars',
 After each finder, collect its fragments and blank their spans in WORK
 \(every character except newline becomes a space) before the next finder
 runs, so no span is found twice.  Sort the collected fragments by BEG."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((work (jsonyter--latex-mask-code text))
+        (found nil))
+    (dolist (finder '(jsonyter--latex-find-envs jsonyter--latex-find-display-dollars jsonyter--latex-find-brackets jsonyter--latex-find-inline-dollars))
+      (dolist (f (funcall finder work))
+        (push f found)
+        (setq work (concat (substring work 0 (nth 0 f))
+                            (replace-regexp-in-string "[^\n]" " " (substring work (nth 0 f) (nth 1 f)))
+                            (substring work (nth 1 f)))))
+    (sort found (lambda (a b) (< (car a) (car b)))))
 
 (defun jsonyter--latex-document (body kind)
   "Return a complete LaTeX document that typesets fragment BODY.
