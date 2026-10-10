@@ -2801,6 +2801,19 @@ of lines depending on who wrote the file; both must read the same."
         ((listp value) (mapconcat #'identity value ""))
         (t (format "%s" value))))
 
+(defun jsonyter--nb-json-for-wire (value)
+  "Reshape parsed-JSON VALUE so `json-serialize' can encode it.
+VALUE comes from `json-parse-buffer' with `:object-type' plist and
+`:array-type' list, so an object and an array are both Lisp lists; they
+are told apart by whether the car is a keyword.  Returns VALUE with:
+- a plist (a non-nil list whose car is a keyword) kept as a plist, every
+  value converted the same way;
+- any other non-nil list turned into a vector of its converted elements;
+- a vector turned into a vector of its converted elements;
+- anything else (string, number, nil, t, :null, :false) returned as is."
+  (ignore value)
+  (error "jsonyter: not implemented"))
+
 (defun jsonyter--nb-data-for-wire (data)
   "Reshape mimebundle DATA (an output's `:data' or `:metadata' plist) so
 `json-serialize' can encode it.  nbformat allows any mimetype's value to
