@@ -4957,8 +4957,13 @@ and `dvipng' or `dvisvgm'.  Call `jsonyter--nb-ensure-notebook', then
 each of `jsonyter--nb-latex-target-cells'.  `message' \"jsonyter:
 previewed N LaTeX fragment(s)\" (\"fragment\" when N is 1) and return N."
   (interactive "P")
-  (ignore all)
-  (error "jsonyter: not implemented"))
+  (jsonyter--nb-ensure-notebook)
+  (jsonyter--latex-check-tools)
+  (let ((n 0))
+    (dolist (cell (jsonyter--nb-latex-target-cells all))
+      (setq n (+ n (jsonyter--nb-latex-preview-cell cell))))
+    (message "jsonyter: previewed %d LaTeX fragment%s" n (if (= n 1) "" "s"))
+    n))
 
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview-clear (&optional all)
