@@ -4637,8 +4637,11 @@ each match end, then sort the combined list by BEG."
 It may not when the character before it is a backslash (an escaped
 dollar), or when the character after it is missing, a dollar sign, a
 space, a tab or a newline."
-  (ignore text pos)
-  (error "jsonyter: not implemented"))
+  (let ((prev (and (> pos 0) (aref text (1- pos))))
+        (next (and (< (1+ pos) (length text)) (aref text (1+ pos)))))
+    (not (or (eq prev ?\\)
+               (null next)
+               (memq next '(?$ ?\s ?\t ?\n))))))
 
 (defun jsonyter--latex-inline-close-p (text pos)
   "Non-nil when the dollar sign at offset POS of TEXT may close `$...$'.
