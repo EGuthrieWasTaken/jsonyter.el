@@ -4596,8 +4596,16 @@ BEG and END are string offsets, END exclusive, and BODY is the whole
 matched text, \\begin and \\end included.  Search with `string-match' on
 `jsonyter--latex-env-regexp' from offset 0, continuing from each match
 end.  The result is in text order, nil when there are none."
-  (ignore text)
-  (error "jsonyter: not implemented"))
+  (let ((pos 0)
+        (out nil))
+    (while (string-match jsonyter--latex-env-regexp text pos)
+      (push (list (match-beginning 0)
+                   (match-end 0)
+                   'env
+                   (match-string 0 text))
+            out)
+      (setq pos (match-end 0)))
+    (nreverse out)))
 
 (defun jsonyter--latex-find-display-dollars (text)
   "Return the `$$...$$' fragments in TEXT, as (BEG END display BODY).
