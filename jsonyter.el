@@ -4515,6 +4515,298 @@ Intended for `auto-mode-alist':
      (if (display-images-p) "" " (no image display: text output only)"))))
 
 
+;;;; LaTeX preview
+
+;; Math in a markdown cell is raw TeX in this buffer.  The commands below
+;; typeset each fragment with the user's own `latex' and `dvipng' (or
+;; `dvisvgm') and lay the result over the fragment's text as an overlay
+;; `display' image, so the cell's source -- and the saved file -- never
+;; change.  Org's own preview code is deliberately not used: it finds
+;; fragments with `org-element', which means nothing in a notebook buffer.
+
+(defcustom jsonyter-latex-preview-dpi 140
+  "Resolution, in dots per inch, of a LaTeX preview image (dvipng only)."
+  :type 'integer)
+
+(defcustom jsonyter-latex-preview-converter 'auto
+  "Program that turns the DVI file `latex' writes into an image.
+`auto' uses dvipng when it is installed, else dvisvgm."
+  :type '(choice (const :tag "Whichever is installed" auto)
+                 (const dvipng)
+                 (const dvisvgm)))
+
+(defcustom jsonyter-latex-preview-preamble
+  "\\usepackage{amsmath}\n\\usepackage{amssymb}"
+  "LaTeX lines placed before every previewed fragment's `\\begin{document}'.
+The lines of `jsonyter-notebook-latex-macros' follow them."
+  :type 'string)
+
+(defcustom jsonyter-latex-preview-cache-directory
+  (expand-file-name "jsonyter-latex" temporary-file-directory)
+  "Directory holding rendered LaTeX preview images, named by content hash."
+  :type 'directory)
+
+(defcustom jsonyter-notebook-latex-preview-on-open nil
+  "Non-nil means preview the math in every markdown cell when a notebook opens."
+  :type 'boolean)
+
+(defconst jsonyter--latex-fence-regexp
+  "^[ \t]*```[^\n]*\\(?:.\\|\n\\)*?\n[ \t]*```[ \t]*$"
+  "Matches a fenced code block (the fences included) in markdown text.")
+
+(defconst jsonyter--latex-code-span-regexp "`[^`\n]*`"
+  "Matches an inline code span, backticks included.")
+
+(defconst jsonyter--latex-env-regexp
+  (concat "\\\\begin{\\(equation\\|align\\|gather\\|multline\\|eqnarray\\|flalign\\)"
+          "\\(\\*?\\)}\\(?:.\\|\n\\)*?\\\\end{\\1\\2}")
+  "Matches a display-math environment, starred or not, whole.")
+
+(defconst jsonyter--latex-display-dollars-regexp
+  "\\$\\$\\(\\(?:.\\|\n\\)*?\\)\\$\\$"
+  "Matches `$$...$$'; group 1 is the TeX between the dollars.")
+
+(defconst jsonyter--latex-bracket-regexps
+  '(("\\\\\\[\\(\\(?:.\\|\n\\)*?\\)\\\\\\]" . display)
+    ("\\\\(\\(\\(?:.\\|\n\\)*?\\)\\\\)" . inline))
+  "Alist of (REGEXP . KIND) for `\\[...\\]' and `\\(...\\)'; group 1 is the TeX.")
+
+(defun jsonyter--latex-mask-code (text)
+  "Return TEXT with every character inside code replaced by a space.
+Code means a fenced block (`jsonyter--latex-fence-regexp') or an inline
+span (`jsonyter--latex-code-span-regexp').  Newlines are kept, so the
+result has TEXT's length and line structure, and an offset found in it
+is an offset in TEXT.  Mask fences first, then spans, each with
+`replace-regexp-in-string' and a function that returns its match with
+every character except newline replaced by a space."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-find-envs (text)
+  "Return the math environments in TEXT, as (BEG END env BODY) lists.
+BEG and END are string offsets, END exclusive, and BODY is the whole
+matched text, \\begin and \\end included.  Search with `string-match' on
+`jsonyter--latex-env-regexp' from offset 0, continuing from each match
+end.  The result is in text order, nil when there are none."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-find-display-dollars (text)
+  "Return the `$$...$$' fragments in TEXT, as (BEG END display BODY).
+BODY is the TeX between the dollars (group 1 of
+`jsonyter--latex-display-dollars-regexp').  Search with `string-match'
+from offset 0, continuing from each match end.  Text order, nil if none."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-find-brackets (text)
+  "Return the `\\[...\\]' and `\\(...\\)' fragments in TEXT.
+Each is (BEG END KIND BODY): KIND is `display' for `\\[' and `inline' for
+`\\(', BODY is the TeX inside.  Use each (REGEXP . KIND) of
+`jsonyter--latex-bracket-regexps' with `string-match', continuing from
+each match end, then sort the combined list by BEG."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-find-inline-dollars (text)
+  "Return the inline `$...$' fragments in TEXT, as (BEG END inline BODY).
+BEG is the offset of the opening dollar, END is one past the closing
+dollar, BODY is the TeX between them.  Rules (Pandoc and Jupyter's):
+- an opening dollar is skipped when the character before it is a
+  backslash, or the character after it is missing, `$', a space, a tab
+  or a newline;
+- a closing dollar is the first later dollar whose previous character is
+  not a space, tab, newline or backslash, and which is not followed by a
+  digit; dollars failing that are stepped over;
+- the search for a closing dollar gives up when the text between the
+  opening dollar and a candidate contains a blank line (a newline, then
+  optional spaces or tabs, then a newline);
+- with no closing dollar the opening one is skipped.
+After a fragment, scanning resumes just past its closing dollar; after a
+skipped dollar, just past that dollar.  Text order; nil when none."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-fragments (text)
+  "Return every math fragment in TEXT as (BEG END KIND BODY), in text order.
+KIND is `inline', `display' or `env'.  Start with WORK, the result of
+`jsonyter--latex-mask-code' on TEXT.  Run these finders on WORK in this
+order: `jsonyter--latex-find-envs', `jsonyter--latex-find-display-dollars',
+`jsonyter--latex-find-brackets', `jsonyter--latex-find-inline-dollars'.
+After each finder, collect its fragments and blank their spans in WORK
+\(every character except newline becomes a space) before the next finder
+runs, so no span is found twice.  Sort the collected fragments by BEG."
+  (ignore text)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-document (body kind)
+  "Return a complete LaTeX document that typesets fragment BODY.
+KIND is `inline', `display' or `env'.  The document is, in order: the
+line \\documentclass[12pt]{article}, `jsonyter-latex-preview-preamble',
+the lines of `jsonyter-notebook-latex-macros' (each on its own line, if
+there are any), the lines \\pagestyle{empty} and \\begin{document}, the
+fragment, and \\end{document} with a final newline.  The fragment is $BODY$
+for `inline', \\[BODY\\] for `display', and BODY unchanged for `env'.
+Every line is newline-terminated."
+  (ignore body kind)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-converter ()
+  "Return `dvipng', `dvisvgm' or nil: the program to turn DVI into an image.
+With `jsonyter-latex-preview-converter' set to `auto', prefer dvipng if
+`executable-find' finds it, else dvisvgm if found, else nil.  With an
+explicit choice, return it only if `executable-find' finds a program of
+that name, else nil."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-cache-file (document converter dpi fg)
+  "Return the cache path of the image for DOCUMENT rendered by CONVERTER.
+The name is the SHA-1 (`secure-hash') of the string made by
+\(format \"%s\\n%s\\n%s\\n%s\" DOCUMENT CONVERTER DPI FG), then \".svg\" when
+CONVERTER is `dvisvgm' and \".png\" otherwise, expanded in
+`jsonyter-latex-preview-cache-directory'."
+  (ignore document converter dpi fg)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-fg (&optional face)
+  "Return FACE's foreground (default: `default') as a dvipng colour string.
+Take (face-foreground (or FACE \\='default) nil \\='default); when that is a
+string `color-name-to-rgb' understands, format it as
+\"rgb R G B\" with three-decimal components, e.g. \"rgb 1.000 0.000 0.000\";
+otherwise return \"rgb 0.000 0.000 0.000\"."
+  (ignore face)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-first-error (log-file)
+  "Return the first line of LOG-FILE that starts with \"! \", else \"unknown error\".
+\"unknown error\" is also the answer when LOG-FILE is not readable."
+  (ignore log-file)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-render (document converter dpi fg)
+  "Typeset DOCUMENT into an image file and return its path, using a cache.
+The path is `jsonyter--latex-cache-file' for the same arguments; when
+that file exists return it without running anything.  Otherwise, in a
+fresh temporary directory (`make-temp-file' with a non-nil DIR-FLAG),
+with `default-directory' bound to it:
+1. write DOCUMENT to doc.tex there;
+2. run (call-process \"latex\" nil nil nil \"-interaction=nonstopmode\"
+   \"-halt-on-error\" \"doc.tex\"); a result other than 0 signals
+   (user-error \"jsonyter: LaTeX failed: %s\" ERROR-LINE) where ERROR-LINE
+   is `jsonyter--latex-first-error' of doc.log in that directory;
+3. for `dvisvgm' run (call-process \"dvisvgm\" nil nil nil \"--no-fonts\"
+   \"--exact\" \"-o\" \"doc.svg\" \"doc.dvi\"); otherwise run
+   (call-process \"dvipng\" nil nil nil \"-T\" \"tight\" \"-D\" DPI-AS-STRING
+   \"-bg\" \"Transparent\" \"-fg\" FG \"-o\" \"doc.png\" \"doc.dvi\"); a result
+   other than 0 signals (user-error \"jsonyter: %s failed\" CONVERTER);
+4. create the cache directory (`make-directory' with PARENTS t) and
+   `copy-file' the image there, overwriting.
+Always delete the temporary directory afterwards (`unwind-protect')."
+  (ignore document converter dpi fg)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-image (file)
+  "Return a `display' value showing the image FILE.
+The type is `svg' when FILE ends in \".svg\", else `png'.  When
+\(display-images-p) and (image-type-available-p TYPE) are both true,
+return (create-image FILE TYPE nil :ascent \\='center); otherwise return
+the placeholder string (format \"[math: %s]\" (file-name-nondirectory FILE))."
+  (ignore file)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--latex-check-tools ()
+  "Signal a `user-error' unless LaTeX preview can run; return nil if it can.
+Without `latex' (`executable-find') signal
+\(user-error \"jsonyter: LaTeX preview needs `latex\\=' on the exec-path\").
+Without a converter (`jsonyter--latex-converter') signal
+\(user-error \"jsonyter: LaTeX preview needs `dvipng\\=' or `dvisvgm\\=' on the exec-path\")."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-latex-clear (beg end)
+  "Delete every LaTeX preview overlay between BEG and END; return how many.
+A preview overlay has a non-nil `jsonyter-latex-preview' property.  Other
+overlays are left alone."
+  (ignore beg end)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-latex-overlay-modified (ov after _beg _end &optional _len)
+  "Delete preview overlay OV when the text under it is about to change.
+Used in the overlay's `modification-hooks': it is called before (AFTER
+nil) and after (AFTER non-nil) a change.  Delete OV only before."
+  (ignore ov after)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-latex-preview-cell (cell)
+  "Show the math in markdown cell overlay CELL as images; return the count.
+First delete the cell's old previews (`jsonyter--nb-latex-clear' over the
+cell).  Then for each fragment of `jsonyter--latex-fragments' applied to
+\(jsonyter--nb-cell-source CELL): build the document
+\(`jsonyter--latex-document' with the fragment's BODY and KIND), render it
+with (jsonyter--latex-render DOC CONVERTER jsonyter-latex-preview-dpi FG)
+where CONVERTER is (jsonyter--latex-converter) and FG is
+\(jsonyter--latex-fg) computed once, and make an overlay over the
+fragment's text -- offsets are relative to the cell's source, which
+starts at (overlay-start CELL).  Put on it: `jsonyter-latex-preview' t,
+`display' (jsonyter--latex-image FILE), `evaporate' t, `help-echo' the
+fragment's BODY, `modification-hooks' (list \\='jsonyter--nb-latex-overlay-modified).
+A `user-error' from rendering is caught per fragment: say
+\(message \"jsonyter: LaTeX preview skipped -- %s\" MESSAGE) and go on.
+Count only the fragments that got an overlay."
+  (ignore cell)
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-latex-markdown-cells ()
+  "Return the cells that can be previewed: markdown, not the macros cell.
+Filter `jsonyter--nb-cells' to those whose `jsonyter-cell-type' property
+is \"markdown\" and that are not the cell `jsonyter--nb-latex-cell'
+returns (the managed LaTeX-macros cell)."
+  (error "jsonyter: not implemented"))
+
+(defun jsonyter--nb-latex-target-cells (all)
+  "Return the cells a preview command acts on.
+With ALL non-nil, `jsonyter--nb-latex-markdown-cells'.  Otherwise a list
+of just the cell at point (`jsonyter--nb-cell-at') when it is one of
+those, else signal (user-error \"jsonyter: not a markdown cell\")."
+  (ignore all)
+  (error "jsonyter: not implemented"))
+
+;;;###autoload
+(defun jsonyter-notebook-latex-preview (&optional all)
+  "Show the math in the markdown cell at point as images.
+With a prefix argument ALL, do it for every markdown cell.  Needs `latex'
+and `dvipng' or `dvisvgm'.  Call `jsonyter--nb-ensure-notebook', then
+`jsonyter--latex-check-tools', then `jsonyter--nb-latex-preview-cell' on
+each of `jsonyter--nb-latex-target-cells'.  `message' \"jsonyter:
+previewed N LaTeX fragment(s)\" (\"fragment\" when N is 1) and return N."
+  (interactive "P")
+  (ignore all)
+  (error "jsonyter: not implemented"))
+
+;;;###autoload
+(defun jsonyter-notebook-latex-preview-clear (&optional all)
+  "Remove LaTeX preview images from the cell at point; with ALL, every cell.
+Call `jsonyter--nb-ensure-notebook'.  The cells are `jsonyter--nb-cells'
+with ALL, else just the cell at point (none if there is no cell).  Clear
+each cell's span with `jsonyter--nb-latex-clear', `message' \"jsonyter:
+removed N LaTeX preview(s)\" (\"preview\" when N is 1) and return N."
+  (interactive "P")
+  (ignore all)
+  (error "jsonyter: not implemented"))
+
+;;;###autoload
+(defun jsonyter-notebook-latex-preview-toggle (&optional all)
+  "Preview the markdown cell at point, or clear it if previews are showing.
+With ALL, act on every cell.  Call `jsonyter--nb-ensure-notebook'.  The
+previews are showing when any preview overlay (a non-nil
+`jsonyter-latex-preview' property) lies within the span of any of the
+cells: `jsonyter--nb-cells' with ALL, else just the cell at point.  If
+showing, call `jsonyter-notebook-latex-preview-clear' with ALL; else
+call `jsonyter-notebook-latex-preview' with ALL."
+  (interactive "P")
+  (ignore all)
+  (error "jsonyter: not implemented"))
+
+
 ;;;; File transfer
 
 ;; The pipeline `jupyter server <-> jsonyter <-> Emacs' moves code and
