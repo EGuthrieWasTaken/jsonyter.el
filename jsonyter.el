@@ -4098,8 +4098,14 @@ before anything is changed.  Otherwise, in order:
 5. flush syntax and font-lock state for the cell's span:
    (syntax-ppss-flush-cache (overlay-start CELL)) and
    (font-lock-flush (overlay-start CELL) (overlay-end CELL))."
-  (ignore cell type)
-  (error "jsonyter: not implemented"))
+  (if (not (member type '("code" "markdown" "raw")))
+      (user-error "jsonyter: unknown cell type %s" type)
+    (overlay-put cell 'jsonyter-cell-type type)
+    (overlay-put cell 'jsonyter-exec-count nil)
+    (jsonyter--nb-set-output cell "")
+    (jsonyter--nb-refresh-prompt cell)
+    (syntax-ppss-flush-cache (overlay-start cell))
+    (font-lock-flush (overlay-start cell) (overlay-end cell))))
 
 ;;;###autoload
 (defun jsonyter-set-cell-type (type)
