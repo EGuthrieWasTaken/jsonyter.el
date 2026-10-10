@@ -52,10 +52,11 @@ not be reproduced and needs a backtrace from an affected setup.
 ## Impact
 
 - `jsonyter.el`: one defcustom, a small "per-cell line numbers" section (a
-  `jit-lock` function, an edit tracker, a sync function on
+  numbering function, an edit tracker, a sync function on
   `display-line-numbers-mode-hook`, a copy filter), an optional gutter argument
   on `jsonyter--nb-prompt`, and hooks from `jsonyter--nb-refresh-prompt`,
-  `jsonyter--nb-stale-after-change` and `jsonyter-notebook-mode`.
+  `jsonyter--nb-make-cell`, `jsonyter--nb-stale-after-change` and
+  `jsonyter-notebook-mode`.
 - `test/jsonyter-tests.el`: new headless tests.
 - `harness/`: a graphical scenario for what appears on screen.
 - `README.md`: a "Line numbers" section and the option.

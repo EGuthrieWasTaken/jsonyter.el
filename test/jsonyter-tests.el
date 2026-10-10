@@ -7716,8 +7716,9 @@ user toggles them, so the first redisplay has not happened yet."
 (defun jsonyter-tests--cell-numbers (cell)
   "The numbers shown beside CELL's source lines, as a list of integers.
 The first line's number is the tail of the cell's prompt string; the
-others are the `line-prefix' text properties.  An unnumbered line is nil."
-  (jit-lock-fontify-now (point-min) (point-max))
+others are the `line-prefix' text properties, read as they are with no
+fontification run first, since a number must be right before redisplay.
+An unnumbered line is nil."
   (let ((tail (car (last (split-string (overlay-get cell 'before-string) "\n"))))
         nums first)
     (save-excursion
@@ -7794,7 +7795,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-first-line-is-in-the-prompt-not-a-prefix ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (let* ((cell (car (jsonyter--nb-cells)))
            (start (overlay-start cell)))
       (should (string-suffix-p " 1 " (substring-no-properties
@@ -7805,7 +7805,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-wrapped-rows-are-indented-by-the-gutter ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (let ((start (overlay-start (car (jsonyter--nb-cells)))))
       (dolist (offset '(0 2 4))
         (should (equal (get-text-property (+ start offset) 'wrap-prefix) "   "))))))
@@ -7815,7 +7814,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
       `(("code" "a\nb\n" (,(list :output_type "stream" :name "stdout"
                                  :text "o1\no2\n")))
         ("code" "c\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (let* ((cell (car (jsonyter--nb-cells)))
            (from (jsonyter--nb-source-end cell)))
       (should (< from (overlay-end cell)))
@@ -7825,7 +7823,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 (ert-deftest jsonyter-test-nb-numbers-share-one-column-per-cell ()
   (jsonyter-tests--with-numbered-notebook
       `(("code" ,(jsonyter-tests--lines 9) nil) ("code" ,(jsonyter-tests--lines 100) nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (let ((small (nth 0 (jsonyter--nb-cells))) (big (nth 1 (jsonyter--nb-cells))))
       (should (equal (list (overlay-get small 'jsonyter-number-digits)
                            (overlay-get big 'jsonyter-number-digits))
@@ -7862,7 +7859,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 (ert-deftest jsonyter-test-nb-numbers-follow-a-deleted-newline ()
   (jsonyter-tests--with-numbered-notebook
       '(("code" "a\nb\nc\n" nil) ("code" "d\ne\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (goto-char (point-min))
     (end-of-line)
     (delete-char 1)
@@ -7870,7 +7866,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-follow-text-typed-at-the-bottom ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (goto-char (point-max))
     (insert "tail")
     (should (equal (jsonyter-tests--all-numbers) '((1 2 3))))
@@ -7879,7 +7874,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 (ert-deftest jsonyter-test-nb-numbers-widen-and-narrow-the-whole-column ()
   (jsonyter-tests--with-numbered-notebook
       `(("code" ,(jsonyter-tests--lines 99) nil) ("code" "z\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (let ((cell (car (jsonyter--nb-cells))))
       (should (= (overlay-get cell 'jsonyter-number-digits) 2))
       (goto-char (point-min))
@@ -7906,23 +7900,58 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
           (should (= (length (get-text-property (point) 'line-prefix)) 3))
           (forward-line 1))))))
 
-(ert-deftest jsonyter-test-nb-numbers-off-screen-lines-wait-to-be-shown ()
+(ert-deftest jsonyter-test-nb-numbers-are-right-before-any-fontification ()
+  ;; Emacs reads a row's line-prefix before jit-lock has fontified the
+  ;; text there, so every edit must leave the properties final.
   (jsonyter-tests--with-numbered-notebook
-      `(("code" ,(jsonyter-tests--lines 2000) nil))
-    (jit-lock-fontify-now (point-min) (point-max))
-    (let* ((cell (car (jsonyter--nb-cells)))
-           (far (save-excursion (goto-char (point-min)) (forward-line 1500) (point))))
-      (should (get-text-property far 'fontified))
+      `(("code" ,(jsonyter-tests--lines 500) nil))
+    (let ((cell (car (jsonyter--nb-cells))))
       (goto-char (point-min))
       (insert "\n")
-      (setq far (1+ far))
-      (should-not (get-text-property far 'fontified))
-      ;; Still the old number until the line is shown...
-      (should (= (string-to-number (get-text-property far 'line-prefix)) 1501))
-      (jit-lock-fontify-now far (1+ far))
-      ;; ...and the new one once it is.
-      (should (= (string-to-number (get-text-property far 'line-prefix)) 1502))
-      (should (equal (last (jsonyter-tests--cell-numbers cell)) '(2001))))))
+      (should (equal (jsonyter-tests--cell-numbers cell) (number-sequence 1 501)))
+      (goto-char (point-min))
+      (forward-line 250)
+      (end-of-line)
+      (delete-char 1)
+      (should (equal (jsonyter-tests--cell-numbers cell) (number-sequence 1 500))))))
+
+(ert-deftest jsonyter-test-nb-numbers-first-line-never-keeps-a-stale-prefix ()
+  (jsonyter-tests--with-numbered-notebook
+      '(("markdown" "m1\nm2\n" nil) ("code" "a\nb\nc\n" nil))
+    (let* ((cell (nth 1 (jsonyter--nb-cells))))
+      ;; RET at the start of the cell: the new empty line inherits the
+      ;; previous cell's last prefix.
+      (goto-char (overlay-start cell))
+      (insert "\n")
+      (should-not (get-text-property (overlay-start cell) 'line-prefix))
+      ;; Backspace joining the new empty line to "a": "a" carried line 2's prefix.
+      (goto-char (1+ (overlay-start cell)))
+      (delete-char -1)
+      (should-not (get-text-property (overlay-start cell) 'line-prefix))
+      (should (equal (jsonyter-tests--cell-numbers cell) '(1 2 3))))))
+
+(ert-deftest jsonyter-test-nb-numbers-text-pasted-at-a-line-start-keeps-its-number ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\n" nil))
+    (let ((cell (car (jsonyter--nb-cells))))
+      ;; A plain insert does not inherit properties from its neighbours.
+      (goto-char (overlay-start cell))
+      (forward-line 2)
+      (insert "pasted ")
+      (should (equal (jsonyter-tests--cell-numbers cell) '(1 2 3)))
+      (should (get-text-property (point) 'line-prefix)))))
+
+(ert-deftest jsonyter-test-nb-numbers-survive-undo ()
+  (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\nd\n" nil))
+    (let ((cell (car (jsonyter--nb-cells))))
+      (buffer-enable-undo)
+      (undo-boundary)
+      (goto-char (overlay-start cell))
+      (forward-line 1)
+      (delete-region (point) (progn (forward-line 2) (point)))
+      (should (equal (jsonyter-tests--cell-numbers cell) '(1 2)))
+      (undo-boundary)
+      (undo)
+      (should (equal (jsonyter-tests--cell-numbers cell) '(1 2 3 4))))))
 
 (ert-deftest jsonyter-test-nb-numbers-survive-cell-operations ()
   (jsonyter-tests--with-numbered-notebook
@@ -7952,7 +7981,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-follow-the-line-number-mode-off-and-on ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (display-line-numbers-mode -1)
     (should-not jsonyter--nb-numbers-active)
     (should-not display-line-numbers)
@@ -7979,7 +8007,7 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
   (jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
     (should-not jsonyter--nb-numbers-active)
     (should-not display-line-numbers)
-    (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+    
     (should-not (jsonyter-tests--number-props-anywhere-p))))
 
 (ert-deftest jsonyter-test-nb-numbers-leave-relative-numbering-to-emacs ()
@@ -7988,7 +8016,7 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
     (display-line-numbers-mode 1)
     (should-not jsonyter--nb-numbers-active)
     (should (eq display-line-numbers 'relative))
-    (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+    
     (should-not (jsonyter-tests--number-props-anywhere-p))))
 
 (ert-deftest jsonyter-test-nb-numbers-read-the-option-when-toggled ()
@@ -8011,7 +8039,7 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
       (display-line-numbers-mode 1)
       (should-not jsonyter--nb-numbers-active)
       (should (eq display-line-numbers t))
-      (when jit-lock-mode (jit-lock-fontify-now (point-min) (point-max)))
+      
       (should-not (jsonyter-tests--number-props-anywhere-p))
       (should (equal (overlay-get (car (jsonyter--nb-cells)) 'before-string)
                      (jsonyter--nb-prompt "code" nil nil nil))))))
@@ -8021,7 +8049,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
       '(("code" "alpha\nbeta\ngamma" nil) ("code" "delta\n" nil))
     (let ((sources (jsonyter-tests--cell-sources))
           (undo buffer-undo-list))
-      (jit-lock-fontify-now (point-min) (point-max))
       (should (equal sources '("alpha\nbeta\ngamma" "delta")))
       (should-not (buffer-modified-p))
       (should (eq undo buffer-undo-list))
@@ -8031,7 +8058,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-are-not-copied ()
   (jsonyter-tests--with-numbered-notebook '(("code" "alpha\nbeta\ngamma\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (should (get-text-property (+ (point-min) 6) 'line-prefix))
     (copy-region-as-kill (point-min) (point-max))
     (let ((copied (car kill-ring)))
@@ -8042,7 +8068,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 (ert-deftest jsonyter-test-nb-numbers-do-not-need-font-lock ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\nc\n" nil))
     (font-lock-mode -1)
-    (jit-lock-refontify (point-min) (point-max))
     (should (equal (jsonyter-tests--all-numbers) '((1 2 3))))
     (goto-char (point-min))
     (insert "\n")
@@ -8059,7 +8084,6 @@ others are the `line-prefix' text properties.  An unnumbered line is nil."
 
 (ert-deftest jsonyter-test-nb-numbers-go-when-the-notebook-mode-goes ()
   (jsonyter-tests--with-numbered-notebook '(("code" "a\nb\n" nil) ("code" "c\n" nil))
-    (jit-lock-fontify-now (point-min) (point-max))
     (should (jsonyter-tests--number-props-anywhere-p))
     (jsonyter-notebook-mode -1)
     (should-not jsonyter--nb-numbers-active)

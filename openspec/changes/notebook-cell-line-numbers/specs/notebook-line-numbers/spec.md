@@ -105,13 +105,32 @@ included.
 - **WHEN** an edit takes a cell from 100 to 99 lines
 - **THEN** every line of that cell, the first included, is displayed with a two-digit column
 
-### Requirement: Off-screen lines are numbered when displayed
-Renumbering after an edit SHALL NOT compute numbers for lines that are not on
-screen; those lines SHALL be marked and numbered when they are first displayed.
+### Requirement: Numbers are final before they are drawn
+The numbers of a cell's lines SHALL be correct as soon as the command that
+changed the cell returns, so that the very first redisplay draws every row with
+its right number, whether or not fontification has run. In particular no row
+SHALL be drawn with a number it had before the edit, including the first row of
+the changed region and the prompt's spacer row.
 
-#### Scenario: Newline at the top of a very long cell
-- **WHEN** a newline is inserted at the top of a cell of ten thousand lines
-- **THEN** the lines far below the edit are marked as needing numbers and none of them is renumbered until it is displayed
+#### Scenario: No fontification needed
+- **WHEN** a newline is inserted at the top of a cell of five hundred lines and nothing is fontified or redisplayed
+- **THEN** every line of the cell already has its new number
+
+#### Scenario: Newline at the start of a cell
+- **WHEN** a newline is inserted at the start of a cell and inherits a number from the end of the cell above
+- **THEN** the cell's first line carries no number of its own, only the one in its prompt
+
+#### Scenario: Line joined to the first line
+- **WHEN** the newline after an empty first line is deleted so that the second line becomes the first
+- **THEN** the joined first line carries no number of its own, only the one in its prompt
+
+#### Scenario: Text pasted at the start of a line
+- **WHEN** text that does not inherit properties is inserted at the start of a line
+- **THEN** that line still shows its number
+
+#### Scenario: Undo
+- **WHEN** an edit that removed lines is undone
+- **THEN** the cell's numbers run from 1 through its line count again
 
 ### Requirement: Per-cell numbers replace Emacs's own numbers
 While per-cell numbers are shown, the notebook buffer SHALL NOT also display
@@ -172,7 +191,8 @@ SHALL NOT be carried along when text is copied or killed.
 - **THEN** the text in the kill ring carries no line-prefix or wrap-prefix property
 
 ### Requirement: Numbers do not depend on font-lock
-Per-cell numbers SHALL be shown whether or not `font-lock-mode` is on.
+Per-cell numbers SHALL be shown, and kept right through edits, whether or not
+`font-lock-mode` is on.
 
 #### Scenario: Font-lock off
 - **WHEN** `font-lock-mode` is turned off in a notebook with per-cell numbers

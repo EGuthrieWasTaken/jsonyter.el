@@ -3031,8 +3031,8 @@ string there is nothing to protect, and as buffer text the whole span
 ;; so Emacs's own numbers land on the prompt's spacer row and count every
 ;; output row.  When this is non-nil Emacs's numbers are off in the buffer
 ;; and each source line is numbered from 1 within its cell instead: lines
-;; 2..n by a `line-prefix' text property that jit-lock sets (see
-;; `jsonyter--nb-number-region'), and line 1 by the tail of its cell's
+;; 2..n by a `line-prefix' text property set by `jsonyter--nb-number-lines',
+;; and line 1 by the tail of its cell's
 ;; prompt string, because the first screen row of line 1 is the spacer row
 ;; and that is where a `line-prefix' on it would be drawn.
 (defvar-local jsonyter--nb-numbers-active nil
@@ -3252,6 +3252,8 @@ end of its last visible line still lands in the right cell."
     ;; stored results to an export; see `jsonyter--nb-collect-cells'.
     (overlay-put ov 'jsonyter-file-outputs (plist-get cell :outputs))
     (jsonyter--nb-refresh-prompt ov)
+    (when jsonyter--nb-numbers-active
+      (jsonyter--nb-number-lines ov start end))
     (let ((rendered (mapconcat (lambda (o)
                                  (jsonyter--nb-render-string
                                   (jsonyter--nb-adapt-output o)))
@@ -3523,7 +3525,7 @@ Bind `inhibit-read-only' to t while doing this."
                                    (list :id nil :cell_type "code" :outputs nil))
             (move-overlay last (overlay-start last) (point-max))
             (set-marker (overlay-get last 'jsonyter-source-end) (point-max))
-            (jsonyter--nb-numbers-update last start))
+            (jsonyter--nb-numbers-update last start (point-max)))
         t))))
 
 (defun jsonyter--nb-empty-cell-p (cell)
@@ -3573,67 +3575,73 @@ intermediate states are not edits to any cell's source."
     (jsonyter--nb-adopt-stray-text)
     (dolist (cell (delete-dups (delq nil (list (jsonyter--nb-cell-at beg)
                                                (jsonyter--nb-cell-at end)))))
-      (jsonyter--nb-numbers-update cell beg)
+      (jsonyter--nb-numbers-update cell beg end)
       (jsonyter--output-update-stale cell (jsonyter--nb-cell-source cell)))))
 
 ;;; Per-cell line numbers
 
-(defun jsonyter--nb-number-region (beg end)
-  "Number the source lines of the cells between BEG and END.
-On `jit-lock-functions' while per-cell numbers are showing.  The first
-line of a cell gets only a `wrap-prefix' of blanks, since its number is
-the tail of the cell's prompt string; every later line gets its number as
-a `line-prefix' and the same width of blanks as a `wrap-prefix', so a
-line that wraps continues under its text.  Output text is left alone."
-  (when jsonyter--nb-numbers-active
-    (dolist (cell (seq-filter (lambda (o) (overlay-get o 'jsonyter-cell))
-                              (overlays-in beg end)))
-      (let* ((start (overlay-start cell))
-             (stop (min end (jsonyter--nb-source-end cell)))
-             (limit (jsonyter--nb-source-end cell))
-             (digits (or (overlay-get cell 'jsonyter-number-digits) 2))
-             (blank (make-string (1+ digits) ?\s)))
+(defun jsonyter--nb-number-lines (cell from to)
+  "Set the per-cell number properties on CELL's source lines from FROM to TO.
+Covers every source line that begins between the start of FROM's line and
+TO, clipped to the cell's source; output text is never touched.  The first
+line of a cell gets only a `wrap-prefix' of blanks, since its number is the
+tail of the cell's prompt string; every later line gets its number as a
+`line-prefix' and the same width of blanks as a `wrap-prefix', so a line
+that wraps continues under its text.
+
+This is done eagerly, by whatever changes the lines, and not left to
+jit-lock: Emacs reads a row's `line-prefix' as it starts the row, before
+jit-lock has fontified the text there, so a prefix set lazily showed its
+old number on the first row of every changed region until something else
+redrew it.  Ordinary edits are cheap, since only the edited lines and,
+when the line count changed, the rest of the cell are visited."
+  (let* ((start (overlay-start cell))
+         (limit (jsonyter--nb-source-end cell))
+         (stop (min to limit))
+         (digits (or (overlay-get cell 'jsonyter-number-digits) 2))
+         (blank (make-string (1+ digits) ?\s)))
+    (when (< (max from start) stop)
+      (with-silent-modifications
         (save-excursion
-          (goto-char (max beg start))
+          (goto-char (max from start))
           (forward-line 0)
           (let ((n (1+ (count-lines start (point)))))
             (while (< (point) stop)
-              (let ((from (point))
-                    (to (min limit (progn (forward-line 1) (point)))))
-                (if (= from start)
-                    (remove-text-properties from to '(line-prefix nil))
-                  (put-text-property from to 'line-prefix
-                                     (jsonyter--nb-number-string n digits)))
-                (put-text-property from to 'wrap-prefix blank)
+              (let ((here (point))
+                    (next (min limit (progn (forward-line 1) (point)))))
+                (if (= here start)
+                    (progn (remove-text-properties here next '(line-prefix nil))
+                           (add-text-properties here next (list 'wrap-prefix blank)))
+                  (add-text-properties here next
+                                       (list 'line-prefix
+                                             (jsonyter--nb-number-string n digits)
+                                             'wrap-prefix blank)))
                 (setq n (1+ n))))))))))
 
-(defun jsonyter--nb-numbers-update (cell pos)
-  "Bring CELL's per-cell numbers in step after an edit at POS.
-Does nothing unless numbers are showing.  Recounts CELL's source lines and
-compares with the count stored on the overlay.  Unchanged, jit-lock's own
-handling of the edited lines is enough.  Changed, the cell's lines from
-the one holding POS to the end of its source are flushed with
-`jit-lock-refontify', which is lazy: only lines on screen are numbered
-before the next redisplay.  When the column width changed too, the prompt
-is redrawn and the whole source flushed, since every prefix changed.
-Returns non-nil when it flushed anything."
+(defun jsonyter--nb-numbers-update (cell beg end)
+  "Bring CELL's per-cell numbers in step after an edit that left BEG..END.
+Does nothing unless numbers are showing.  Recounts CELL's source lines
+and compares with the count stored on the overlay.  Lines before the edit
+keep their numbers.  The edited lines are always renumbered, since text
+inserted without inheriting, or kept from a deleted line, can carry the
+wrong prefix.  When the count changed, every later line of the cell is
+renumbered too, and when the column width changed as well the prompt is
+redrawn and the whole cell renumbered, since every prefix changed.
+Returns non-nil when the count or the width changed."
   (when jsonyter--nb-numbers-active
     (let* ((count (jsonyter--nb-line-count cell))
            (digits (jsonyter--nb-number-digits count))
-           (widened (not (eql digits (overlay-get cell 'jsonyter-number-digits)))))
-      (unless (and (not widened)
-                   (eql count (overlay-get cell 'jsonyter-line-count)))
-        (jsonyter--nb-refresh-prompt cell)
-        (jit-lock-refontify
-         (if widened
-             (overlay-start cell)
-           (save-excursion
-             (goto-char (min (max pos (overlay-start cell))
-                             (jsonyter--nb-source-end cell)))
-             (forward-line 0)
-             (point)))
-         (jsonyter--nb-source-end cell))
-        t))))
+           (widened (not (eql digits (overlay-get cell 'jsonyter-number-digits))))
+           (changed (or widened
+                        (not (eql count (overlay-get cell 'jsonyter-line-count))))))
+      (when changed
+        (jsonyter--nb-refresh-prompt cell))
+      (jsonyter--nb-number-lines
+       cell
+       (if widened (overlay-start cell) beg)
+       (if changed (jsonyter--nb-source-end cell)
+         (save-excursion (goto-char end) (forward-line 1) (point))))
+      changed)))
 
 (defun jsonyter--nb-strip-number-props (string)
   "Return STRING without `line-prefix' and `wrap-prefix' properties.
@@ -3647,12 +3655,11 @@ not carry its numbers into whatever it is pasted into."
 (defun jsonyter--nb-numbers-activate ()
   "Start showing per-cell numbers in this notebook buffer."
   (setq jsonyter--nb-numbers-active t)
-  (jit-lock-register #'jsonyter--nb-number-region)
   (add-function :filter-return (local 'filter-buffer-substring-function)
                 #'jsonyter--nb-strip-number-props)
   (dolist (cell (jsonyter--nb-cells))
-    (jsonyter--nb-refresh-prompt cell))
-  (jit-lock-refontify (point-min) (point-max)))
+    (jsonyter--nb-refresh-prompt cell)
+    (jsonyter--nb-number-lines cell (overlay-start cell) (overlay-end cell))))
 
 (defun jsonyter--nb-numbers-deactivate ()
   "Stop showing per-cell numbers and take every one of them out of the buffer.
@@ -3661,7 +3668,6 @@ the number and, when `display-line-numbers-mode' is on, gives the buffer
 Emacs's own numbers back."
   (when jsonyter--nb-numbers-active
     (setq jsonyter--nb-numbers-active nil)
-    (jit-lock-unregister #'jsonyter--nb-number-region)
     (remove-function (local 'filter-buffer-substring-function)
                      #'jsonyter--nb-strip-number-props)
     (with-silent-modifications
