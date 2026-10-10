@@ -6712,5 +6712,994 @@ missing, like the real thing."
       (should (jsonyter--sync-ensure-local-dir dir))
       (should (file-directory-p dir))
       (should-not (jsonyter--sync-ensure-local-dir dir)))))
+(ert-deftest jsonyter-test-sync-ensure-remote-dir-returns-created-levels ()
+  (jsonyter-tests--with-fake-server '("work") nil
+    (should (equal (jsonyter--sync-ensure-remote-dir (current-buffer) "work/new/deep")
+                   '("work/new" "work/new/deep")))
+    (should (equal (jsonyter-tests--server-mkdirs) '("work/new" "work/new/deep")))
+    (setq jsonyter-tests--server-calls nil)
+    (should-not (jsonyter--sync-ensure-remote-dir (current-buffer) "work/new/deep"))
+    (should-not (jsonyter-tests--server-mkdirs))))
+
+
+(ert-deftest jsonyter-test-sync-ensure-remote-dir-refuses-a-file-level ()
+  (jsonyter-tests--with-fake-server '("work") '("work/data.csv")
+    (let ((err (should-error
+                (jsonyter--sync-ensure-remote-dir (current-buffer) "work/data.csv/sub")
+                :type 'user-error)))
+      (should (string-match-p "work/data\\.csv" (cadr err)))
+      (should-not (jsonyter-tests--server-mkdirs)))))
+
+(ert-deftest jsonyter-test-sync-ensure-remote-dir-ignores-slashes-and-root ()
+  (jsonyter-tests--with-fake-server '("work") nil
+    (should-not (jsonyter--sync-ensure-remote-dir (current-buffer) ""))
+    (should-not (jsonyter--sync-ensure-remote-dir (current-buffer) "/"))
+    (should-not jsonyter-tests--server-calls)
+    (should (equal (jsonyter--sync-ensure-remote-dir (current-buffer) "/work/x/")
+                   '("work/x")))))
+
+(ert-deftest jsonyter-test-sync-add-pair-creates-missing-local-dir ()
+  (jsonyter-tests--with-fake-server nil nil
+    (jsonyter-tests--with-temp-root root
+      (let ((local (expand-file-name "a/b/c" root))
+            (jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair local "" nil nil t)
+        (should (file-directory-p local))
+        (should (equal (plist-get (car jsonyter-sync-pairs) :local) local))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-leaves-existing-local-dir-alone ()
+  (jsonyter-tests--with-fake-server nil nil
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil)
+            (marker (expand-file-name "keep.txt" root)))
+        (write-region "hi" nil marker)
+        (jsonyter-sync-add-pair root "" nil nil t)
+        (should (file-exists-p marker))
+        (should (= (length jsonyter-sync-pairs) 1))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-creates-missing-remote-levels-in-order ()
+  (jsonyter-tests--with-fake-server '("work") nil
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair root "work/new/deep" nil nil t)
+        (should (equal (jsonyter-tests--server-mkdirs) '("work/new" "work/new/deep")))
+        (should (member "work/new/deep" jsonyter-tests--server-dirs))
+        (should (equal (plist-get (car jsonyter-sync-pairs) :remote) "work/new/deep"))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-strips-slashes-from-remote-before-probing ()
+  (jsonyter-tests--with-fake-server '("work") nil
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair root "/work/x/" nil nil t)
+        (should (equal (jsonyter-tests--server-mkdirs) '("work/x")))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-existing-remote-dir-creates-nothing ()
+  (jsonyter-tests--with-fake-server '("work" "work/proj") nil
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair root "work/proj" nil nil t)
+        (should-not (jsonyter-tests--server-mkdirs))
+        (should (= (length jsonyter-sync-pairs) 1))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-root-remote-does-not-contact-server ()
+  (jsonyter-tests--with-fake-server nil nil
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair root "" nil nil t)
+        (should-not jsonyter-tests--server-calls)))))
+
+(ert-deftest jsonyter-test-sync-add-pair-refuses-remote-file ()
+  (jsonyter-tests--with-fake-server '("work") '("work/data.csv")
+    (jsonyter-tests--with-temp-root root
+      (let* ((jsonyter-sync-pairs nil)
+             (err (should-error
+                   (jsonyter-sync-add-pair root "work/data.csv" nil nil t)
+                   :type 'user-error)))
+        (should (string-match-p "work/data\\.csv" (cadr err)))
+        (should-not jsonyter-sync-pairs)
+        (should-not (jsonyter-tests--server-mkdirs))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-refuses-file-in-the-middle-of-remote-path ()
+  (jsonyter-tests--with-fake-server '("work") '("work/data.csv")
+    (jsonyter-tests--with-temp-root root
+      (let ((jsonyter-sync-pairs nil))
+        (should-error (jsonyter-sync-add-pair root "work/data.csv/sub" nil nil t)
+                      :type 'user-error)
+        (should-not jsonyter-sync-pairs)
+        (should-not (jsonyter-tests--server-mkdirs))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-lisp-call-does-not-create-by-default ()
+  (jsonyter-tests--with-fake-server nil nil
+    (jsonyter-tests--with-temp-root root
+      (let ((missing (expand-file-name "not/there" root))
+            (jsonyter-sync-pairs nil))
+        (jsonyter-sync-add-pair missing "work/zz" nil nil)
+        (should-not (file-exists-p missing))
+        (should-not jsonyter-tests--server-calls)
+        (should (= (length jsonyter-sync-pairs) 1))))))
+
+(ert-deftest jsonyter-test-sync-add-pair-interactive-creates-both-sides ()
+  (jsonyter-tests--with-fake-server '("work") nil
+    (jsonyter-tests--with-temp-root root
+      (jsonyter-tests--with-sessions
+        (let ((session (jsonyter-tests--bind-session '("python" . "") "kid"))
+              (missing (expand-file-name "interactive/dir" root))
+              (jsonyter-sync-pairs nil))
+          (setq-local jsonyter--url "http://y")
+          (cl-letf (((symbol-function 'jsonyter--resolve-transfer-context)
+                     (lambda () (cons (current-buffer) session)))
+                    ((symbol-function 'read-directory-name) (lambda (&rest _) missing))
+                    ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "work/"))
+                    ((symbol-function 'jsonyter--read-remote-path)
+                     (lambda (&rest _) "work/interactive"))
+                    ((symbol-function 'y-or-n-p) (lambda (_p) nil))
+                    ((symbol-function 'customize-save-variable) #'ignore))
+            (call-interactively #'jsonyter-sync-add-pair))
+          (should (file-directory-p missing))
+          (should (member "work/interactive" jsonyter-tests--server-dirs))
+          (should (equal (car jsonyter-sync-pairs)
+                         (list :local missing :remote "work/interactive"
+                               :server "http://y"))))))))
+
+;;;; export: structured output data and metadata
+;; Spec: openspec/changes/export-structured-output-data
+
+(ert-deftest jsonyter-test-nb-json-for-wire-converts-arrays-and-keeps-objects ()
+  (should (equal (jsonyter--nb-json-for-wire '(:a 1 :b (1 2) :c (:d "x")))
+                 '(:a 1 :b [1 2] :c (:d "x"))))
+  (should (equal (jsonyter--nb-json-for-wire '(1 2)) [1 2]))
+  (should (equal (jsonyter--nb-json-for-wire '("a" "b")) ["a" "b"]))
+  (should (equal (jsonyter--nb-json-for-wire [1 (2 3)]) [1 [2 3]]))
+  (should (equal (jsonyter--nb-json-for-wire '((:a 1) (:b 2))) [(:a 1) (:b 2)])))
+
+(ert-deftest jsonyter-test-nb-json-for-wire-leaves-atoms-alone ()
+  (should (equal (jsonyter--nb-json-for-wire "s") "s"))
+  (should (equal (jsonyter--nb-json-for-wire 3) 3))
+  (should (eq (jsonyter--nb-json-for-wire nil) nil))
+  (should (eq (jsonyter--nb-json-for-wire :null) :null))
+  (should (eq (jsonyter--nb-json-for-wire :false) :false))
+  (should (eq (jsonyter--nb-json-for-wire t) t)))
+
+(ert-deftest jsonyter-test-nb-data-for-wire-joins-text-and-keeps-json ()
+  (let ((out (jsonyter--nb-data-for-wire
+              '(:text/plain ("a\n" "b")
+                :application/json (:a 1 :b (1 2))
+                :application/vnd.plotly.v1+json (:data ((:y (1 2))))
+                :image/png "AAA="))))
+    (should (equal (plist-get out :text/plain) "a\nb"))
+    (should (equal (plist-get out :application/json) '(:a 1 :b [1 2])))
+    (should (equal (plist-get out :application/vnd.plotly.v1+json)
+                   '(:data [(:y [1 2])])))
+    (should (equal (plist-get out :image/png) "AAA="))))
+
+(ert-deftest jsonyter-test-nb-data-for-wire-json-array-of-strings-stays-an-array ()
+  (should (equal (plist-get (jsonyter--nb-data-for-wire '(:application/json ("a" "b")))
+                            :application/json)
+                 ["a" "b"])))
+
+(ert-deftest jsonyter-test-nb-data-for-wire-non-string-list-under-text-mimetype-does-not-signal ()
+  (should (equal (plist-get (jsonyter--nb-data-for-wire '(:text/plain (1 2))) :text/plain)
+                 [1 2])))
+
+(ert-deftest jsonyter-test-nb-output-for-wire-keeps-metadata-structure ()
+  (let ((out (jsonyter--nb-output-for-wire
+              '(:output_type "display_data" :data (:image/png "AAA=")
+                :metadata (:image/png (:width 300 :height 200) :tags ("a" "b"))))))
+    (should (equal (plist-get out :metadata)
+                   '(:image/png (:width 300 :height 200) :tags ["a" "b"])))
+    (should (json-serialize out))))
+
+(ert-deftest jsonyter-test-nb-output-for-wire-stream-and-execute-result-still-join-text ()
+  (should (equal (plist-get (jsonyter--nb-output-for-wire
+                             '(:output_type "stream" :name "stdout" :text ("a" "b")))
+                            :text)
+                 "ab"))
+  (let ((out (jsonyter--nb-output-for-wire
+              '(:output_type "execute_result" :execution_count 2
+                :data (:text/plain ("1" "2")) :metadata nil))))
+    (should (equal (plist-get (plist-get out :data) :text/plain) "12"))))
+
+(defun jsonyter-tests--structured-output-notebook ()
+  "A notebook JSON string whose one cell has outputs of every awkward shape."
+  (json-serialize
+   (list :cells
+         (vector
+          (list :cell_type "code" :id "aaa" :execution_count 1 :metadata nil
+                :source "x\n"
+                :outputs
+                (vector
+                 (list :output_type "display_data"
+                       :data (list :image/png "iVBORw0KGgo="
+                                   :text/plain (vector "<Figure>"))
+                       :metadata (list :image/png (list :width 300 :height 200)))
+                 (list :output_type "display_data"
+                       :data (list :application/vnd.plotly.v1+json
+                                   (list :data (vector (list :y (vector 1 2)))))
+                       :metadata nil))))
+         :metadata (list :kernelspec (list :display_name "Python 3"
+                                           :language "python" :name "python3"))
+         :nbformat 4 :nbformat_minor 5)))
+
+(ert-deftest jsonyter-test-export-collect-cells-serializes-structured-outputs ()
+  (jsonyter-tests--with-notebook-json (jsonyter-tests--structured-output-notebook)
+    (let* ((cells (jsonyter--nb-collect-cells t t))
+           (json (json-serialize (list :cells (vconcat cells))))
+           (back (json-parse-string json :object-type 'plist :array-type 'list))
+           (outs (plist-get (car (plist-get back :cells)) :outputs))
+           (meta (plist-get (car outs) :metadata))
+           (plotly (plist-get (plist-get (cadr outs) :data)
+                              :application/vnd.plotly.v1+json)))
+      (should (equal (plist-get meta :image/png) '(:width 300 :height 200)))
+      (should (equal (plist-get plotly :data) '((:y (1 2))))))))
+
+;;;; notebook cell integrity
+;; Spec: openspec/changes/notebook-cell-integrity
+
+(defun jsonyter-tests--nb-json (cells)
+  "Notebook JSON for CELLS, a list of (TYPE SOURCE OUTPUTS) triples.
+OUTPUTS is a list of nbformat output plists (code cells only)."
+  (json-serialize
+   (list :cells
+         (vconcat
+          (cl-loop for (type source outputs) in cells
+                   for i from 1
+                   collect (append
+                            (list :cell_type type :id (format "c%d" i)
+                                  :metadata nil :source source)
+                            (when (equal type "code")
+                              (list :execution_count :null
+                                    :outputs (vconcat outputs))))))
+         :metadata (list :kernelspec (list :display_name "Python 3"
+                                           :language "python" :name "python3"))
+         :nbformat 4 :nbformat_minor 5)))
+
+(defun jsonyter-tests--cell-sources ()
+  "The sources of this buffer's cells, in order."
+  (mapcar #'jsonyter--nb-cell-source (jsonyter--nb-cells)))
+
+(defun jsonyter-tests--cells-tile-buffer-p ()
+  "Non-nil when the cells cover the buffer back to back and none is empty."
+  (let ((pos (point-min)) (ok t))
+    (dolist (c (jsonyter--nb-cells))
+      (unless (and (= (overlay-start c) pos)
+                   (< (overlay-start c) (overlay-end c)))
+        (setq ok nil))
+      (setq pos (overlay-end c)))
+    (and ok (= pos (point-max)))))
+
+(defun jsonyter-tests--add-phantom-cell ()
+  "Leave a zero-length cell overlay at the top, as a re-render used to."
+  (let ((phantom (make-overlay (point-min) (point-min))))
+    (overlay-put phantom 'jsonyter-cell t)
+    (overlay-put phantom 'jsonyter-source-end (copy-marker (point-min)))
+    phantom))
+
+(ert-deftest jsonyter-test-nb-forget-cells-removes-every-cell-overlay ()
+  (jsonyter-tests--with-notebook
+    (should (= (length (jsonyter--nb-cells)) 3))
+    (jsonyter--nb-forget-cells)
+    (should-not (jsonyter--nb-cells))))
+
+(ert-deftest jsonyter-test-nb-render-after-revert-has-exactly-the-notebooks-cells ()
+  (jsonyter-tests--with-notebook
+    (dotimes (_ 2) (revert-buffer t t))
+    (should (= (length (jsonyter--nb-cells)) 3))
+    (should (equal (jsonyter-tests--cell-sources) '("x = 1" "print(x)" "# heading")))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-nb-drop-empty-cells-removes-only-zero-length-cells ()
+  (jsonyter-tests--with-notebook
+    (jsonyter-tests--add-phantom-cell)
+    (should (= (length (jsonyter--nb-cells)) 4))
+    (should (= (jsonyter--nb-drop-empty-cells) 1))
+    (should (= (length (jsonyter--nb-cells)) 3))
+    (should (= (jsonyter--nb-drop-empty-cells) 0))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-nb-adopt-stray-text-extends-last-cell-without-output ()
+  (jsonyter-tests--with-notebook
+    (let ((jsonyter--nb-cell-surgery t))
+      (goto-char (point-max))
+      (insert "y = 2"))
+    (should (jsonyter--nb-adopt-stray-text))
+    (should (equal (jsonyter-tests--cell-sources)
+                   '("x = 1" "print(x)" "# heading\ny = 2")))
+    (should (jsonyter-tests--cells-tile-buffer-p))
+    (should-not (jsonyter--nb-adopt-stray-text))))
+
+(ert-deftest jsonyter-test-nb-adopt-stray-text-makes-new-cell-after-output ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       `(("code" "x = 1\n"
+          (,(list :output_type "stream" :name "stdout" :text "hi\n")))))
+    (let ((jsonyter--nb-cell-surgery t))
+      (goto-char (point-max))
+      (insert "y = 2"))
+    (should (jsonyter--nb-adopt-stray-text))
+    (should (= (length (jsonyter--nb-cells)) 2))
+    (should (equal (jsonyter-tests--cell-sources) '("x = 1" "y = 2")))
+    (should (equal (overlay-get (cadr (jsonyter--nb-cells)) 'jsonyter-cell-type)
+                   "code"))
+    (should (jsonyter-tests--cells-tile-buffer-p))
+    (should (string-match-p "hi" (buffer-string)))))
+
+(ert-deftest jsonyter-test-nb-adopt-stray-text-with-nothing-stray-returns-nil ()
+  (jsonyter-tests--with-notebook
+    (should-not (jsonyter--nb-adopt-stray-text))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-typing-at-end-of-buffer-is-saved-in-the-last-cell ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-max))
+    (insert "y = 2")
+    (should (equal (jsonyter-tests--cell-sources)
+                   '("x = 1" "print(x)" "# heading\ny = 2")))
+    (should (jsonyter-tests--cells-tile-buffer-p))
+    (should (equal (plist-get (car (last (jsonyter--nb-collect-cells))) :source)
+                   "# heading\ny = 2"))))
+
+(ert-deftest jsonyter-test-newline-at-end-of-buffer-leaves-no-stray-text ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-max))
+    (call-interactively #'newline)
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-backspacing-an-empty-cell-removes-it ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       '(("code" "a = 1\n" nil) ("code" "" nil) ("code" "b = 2\n" nil)))
+    (should (equal (jsonyter-tests--cell-sources) '("a = 1" "" "b = 2")))
+    (goto-char (overlay-start (nth 2 (jsonyter--nb-cells))))
+    (delete-char -1)
+    (should (equal (jsonyter-tests--cell-sources) '("a = 1" "b = 2")))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-nb-empty-cell-p ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       `(("code" "" nil) ("code" "  \n" nil) ("code" "a" nil)
+         ("code" "" (,(list :output_type "stream" :name "stdout" :text "o\n")))))
+    (let ((cells (jsonyter--nb-cells)))
+      (should (jsonyter--nb-empty-cell-p (nth 0 cells)))
+      (should (jsonyter--nb-empty-cell-p (nth 1 cells)))
+      (should-not (jsonyter--nb-empty-cell-p (nth 2 cells)))
+      (should-not (jsonyter--nb-empty-cell-p (nth 3 cells))))))
+
+(ert-deftest jsonyter-test-prune-removes-blank-cells-without-output ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       `(("code" "a = 1\n" nil) ("code" "" nil) ("markdown" "  \n" nil)
+         ("code" "b = 2\n" nil)
+         ("code" "" (,(list :output_type "stream" :name "stdout" :text "out\n")))))
+    (set-buffer-modified-p nil)
+    (should (= (jsonyter-notebook-prune) 2))
+    (should (equal (jsonyter-tests--cell-sources) '("a = 1" "b = 2" "")))
+    (should (buffer-modified-p))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-prune-with-nothing-empty-changes-nothing ()
+  (jsonyter-tests--with-notebook
+    (set-buffer-modified-p nil)
+    (should (= (jsonyter-notebook-prune) 0))
+    (should-not (buffer-modified-p))
+    (should (= (length (jsonyter--nb-cells)) 3))))
+
+(ert-deftest jsonyter-test-prune-keeps-one-cell-when-all-are-empty ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json '(("code" "" nil) ("code" "\n" nil) ("markdown" "" nil)))
+    (should (= (jsonyter-notebook-prune) 2))
+    (should (= (length (jsonyter--nb-cells)) 1))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-prune-also-drops-zero-length-cells ()
+  (jsonyter-tests--with-notebook
+    (jsonyter-tests--add-phantom-cell)
+    (should (= (jsonyter-notebook-prune) 1))
+    (should (= (length (jsonyter--nb-cells)) 3))))
+
+(ert-deftest jsonyter-test-prune-outside-a-notebook-is-a-user-error ()
+  (with-temp-buffer
+    (should-error (jsonyter-notebook-prune) :type 'user-error)))
+
+;;;; notebook raw cells
+;; Spec: openspec/changes/notebook-raw-cells
+
+(ert-deftest jsonyter-test-nb-next-cell-type-cycles-code-markdown-raw ()
+  (should (equal (jsonyter--nb-next-cell-type "code") "markdown"))
+  (should (equal (jsonyter--nb-next-cell-type "markdown") "raw"))
+  (should (equal (jsonyter--nb-next-cell-type "raw") "code"))
+  (should (equal (jsonyter--nb-next-cell-type nil) "code"))
+  (should (equal (jsonyter--nb-next-cell-type "weird") "code")))
+
+(ert-deftest jsonyter-test-nb-type-from-prefix ()
+  (should (equal (jsonyter--nb-type-from-prefix nil) "code"))
+  (should (equal (jsonyter--nb-type-from-prefix '(4)) "markdown"))
+  (should (equal (jsonyter--nb-type-from-prefix '(16)) "raw"))
+  (should (equal (jsonyter--nb-type-from-prefix t) "markdown"))
+  (should (equal (jsonyter--nb-type-from-prefix 2) "markdown"))
+  (should (equal (jsonyter--nb-type-from-prefix "raw") "raw"))
+  (should (equal (jsonyter--nb-type-from-prefix "code") "code"))
+  (should (equal (jsonyter--nb-type-from-prefix "markdown") "markdown"))
+  (should-error (jsonyter--nb-type-from-prefix "bogus") :type 'user-error))
+
+(ert-deftest jsonyter-test-nb-set-type-changes-type-and-prompt ()
+  (jsonyter-tests--with-notebook
+    (let ((cell (car (jsonyter--nb-cells))))
+      (jsonyter--nb-set-type cell "raw")
+      (should (equal (overlay-get cell 'jsonyter-cell-type) "raw"))
+      (should (string-match-p "Raw" (overlay-get cell 'before-string)))
+      (jsonyter--nb-set-type cell "code")
+      (should (equal (overlay-get cell 'jsonyter-cell-type) "code"))
+      (should-error (jsonyter--nb-set-type cell "bogus") :type 'user-error)
+      (should (equal (overlay-get cell 'jsonyter-cell-type) "code")))))
+
+(ert-deftest jsonyter-test-nb-set-type-to-raw-drops-output-keeps-source ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       `(("code" "x = 1\n"
+          (,(list :output_type "stream" :name "stdout" :text "hi\n")))))
+    (should (string-match-p "hi" (buffer-string)))
+    (jsonyter--nb-set-type (car (jsonyter--nb-cells)) "raw")
+    (should-not (string-match-p "hi" (buffer-string)))
+    (should (equal (jsonyter-tests--cell-sources) '("x = 1")))))
+
+(ert-deftest jsonyter-test-set-cell-type-command-sets-type-at-point ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (jsonyter-set-cell-type "raw")
+    (should (equal (mapcar (lambda (c) (overlay-get c 'jsonyter-cell-type))
+                           (jsonyter--nb-cells))
+                   '("code" "raw" "markdown")))))
+
+(ert-deftest jsonyter-test-set-cell-type-interactive-reads-a-type ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "markdown")))
+      (call-interactively #'jsonyter-set-cell-type))
+    (should (equal (overlay-get (car (jsonyter--nb-cells)) 'jsonyter-cell-type)
+                   "markdown"))))
+
+(ert-deftest jsonyter-test-set-cell-type-rejects-unknown-type-and-non-notebooks ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-min))
+    (should-error (jsonyter-set-cell-type "bogus") :type 'user-error)
+    (should (equal (overlay-get (car (jsonyter--nb-cells)) 'jsonyter-cell-type) "code")))
+  (with-temp-buffer
+    (should-error (jsonyter-set-cell-type "raw") :type 'user-error)))
+
+(ert-deftest jsonyter-test-toggle-cell-type-cycles-through-raw ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-min))
+    (let ((types nil))
+      (dotimes (_ 3)
+        (jsonyter-toggle-cell-type)
+        (push (overlay-get (car (jsonyter--nb-cells)) 'jsonyter-cell-type) types))
+      (should (equal (nreverse types) '("markdown" "raw" "code"))))))
+
+(defun jsonyter-tests--cell-types ()
+  "The types of this buffer's cells, in order."
+  (mapcar (lambda (c) (overlay-get c 'jsonyter-cell-type)) (jsonyter--nb-cells)))
+
+(ert-deftest jsonyter-test-insert-cell-below-prefix-chooses-type ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-min))
+    (jsonyter-insert-cell-below nil)
+    (goto-char (point-min))
+    (jsonyter-insert-cell-below '(4))
+    (goto-char (point-min))
+    (let ((current-prefix-arg '(16)))
+      (call-interactively #'jsonyter-insert-cell-below))
+    (goto-char (point-min))
+    (jsonyter-insert-cell-below "raw")
+    (should (equal (jsonyter-tests--cell-types)
+                   '("code" "raw" "raw" "markdown" "code" "code" "markdown")))))
+
+(ert-deftest jsonyter-test-insert-cell-above-prefix-chooses-type ()
+  (jsonyter-tests--with-notebook
+    (goto-char (point-min))
+    (jsonyter-insert-cell-above '(4))
+    (should (equal (car (jsonyter-tests--cell-types)) "markdown"))
+    (goto-char (point-min))
+    (let ((current-prefix-arg '(16)))
+      (call-interactively #'jsonyter-insert-cell-above))
+    (should (equal (car (jsonyter-tests--cell-types)) "raw"))
+    (goto-char (point-min))
+    (jsonyter-insert-cell-above)
+    (should (equal (car (jsonyter-tests--cell-types)) "code"))
+    (should (= (length (jsonyter--nb-cells)) 6))))
+
+(ert-deftest jsonyter-test-raw-cell-is-saved-as-raw ()
+  (skip-unless (jsonyter-tests--bridge-available-p))
+  (jsonyter-tests--with-notebook
+    (let ((jsonyter-command '("python3" "-m" "jsonyter")))
+      (goto-char (point-min))
+      (jsonyter-insert-cell-below '(16))
+      (insert "\\begin{x}")
+      (jsonyter-notebook-save)
+      (let* ((json (with-temp-buffer (insert-file-contents path) (buffer-string)))
+             (cells (plist-get (json-parse-string json :object-type 'plist
+                                                  :array-type 'list)
+                               :cells))
+             (raw (seq-find (lambda (c) (equal (plist-get c :cell_type) "raw")) cells)))
+        (should raw)
+        (should (equal (mapconcat #'identity (plist-get raw :source) "")
+                       "\\begin{x}"))))))
+
+;;;; LaTeX preview
+;; Spec: openspec/changes/notebook-latex-preview
+
+(ert-deftest jsonyter-test-latex-mask-code-blanks-spans-keeps-length-and-newlines ()
+  (let* ((text "a `x $y$` b\n```\n$$z$$\n```\nend $w$")
+         (masked (jsonyter--latex-mask-code text)))
+    (should (= (length masked) (length text)))
+    (should (equal (replace-regexp-in-string "[^\n]" "." text)
+                   (replace-regexp-in-string "[^\n]" "." masked)))
+    (should-not (string-match-p "y" masked))
+    (should-not (string-match-p "z" masked))
+    (should (string-match-p "\\$w\\$" masked))
+    (should (string-prefix-p "a " masked))
+    (should (string-match-p " b\n" masked))))
+
+(ert-deftest jsonyter-test-latex-mask-code-leaves-plain-text-alone ()
+  (should (equal (jsonyter--latex-mask-code "no code, only $x$ here")
+                 "no code, only $x$ here"))
+  (should (equal (jsonyter--latex-mask-code "") "")))
+
+(ert-deftest jsonyter-test-latex-find-envs-finds-starred-and-plain ()
+  (let* ((a "\\begin{equation}a=b\\end{equation}")
+         (b "\\begin{align*}c\\end{align*}")
+         (text (concat "x " a " y " b))
+         (res (jsonyter--latex-find-envs text)))
+    (should (equal res (list (list 2 (+ 2 (length a)) 'env a)
+                             (list (+ 2 (length a) 3)
+                                   (+ 2 (length a) 3 (length b)) 'env b))))))
+
+(ert-deftest jsonyter-test-latex-find-envs-needs-a-matching-end ()
+  (should-not (jsonyter--latex-find-envs "\\begin{equation} no end"))
+  (should-not (jsonyter--latex-find-envs "\\begin{equation}a\\end{align}"))
+  (should-not (jsonyter--latex-find-envs "\\begin{itemize}a\\end{itemize}")))
+
+(ert-deftest jsonyter-test-latex-find-display-dollars ()
+  (should (equal (jsonyter--latex-find-display-dollars "a $$x^2$$ b $$y$$")
+                 '((2 9 display "x^2") (12 17 display "y"))))
+  (should (equal (jsonyter--latex-find-display-dollars "$$\na\n$$")
+                 '((0 7 display "\na\n"))))
+  (should-not (jsonyter--latex-find-display-dollars "no math, $x$ only"))
+  (should-not (jsonyter--latex-find-display-dollars "unclosed $$ here")))
+
+(ert-deftest jsonyter-test-latex-find-brackets ()
+  (should (equal (jsonyter--latex-find-brackets "p \\[a\\] q \\(b\\)")
+                 '((2 7 display "a") (10 15 inline "b"))))
+  (should (equal (jsonyter--latex-find-brackets "\\(b\\) then \\[a\\]")
+                 '((0 5 inline "b") (11 16 display "a"))))
+  (should-not (jsonyter--latex-find-brackets "nothing \\left( here \\right)")))
+
+(ert-deftest jsonyter-test-latex-find-inline-dollars-basic ()
+  (should (equal (jsonyter--latex-find-inline-dollars "$a$") '((0 3 inline "a"))))
+  (should (equal (jsonyter--latex-find-inline-dollars "$a$ and $b$")
+                 '((0 3 inline "a") (8 11 inline "b"))))
+  (should (equal (jsonyter--latex-find-inline-dollars "$a\nb$") '((0 5 inline "a\nb")))))
+
+(ert-deftest jsonyter-test-latex-find-inline-dollars-currency-is-not-math ()
+  (should-not (jsonyter--latex-find-inline-dollars "costs $5 and $6 today"))
+  (should-not (jsonyter--latex-find-inline-dollars "pay $ a$ now"))
+  (should-not (jsonyter--latex-find-inline-dollars "a $b $ c"))
+  (should-not (jsonyter--latex-find-inline-dollars "$a$2")))
+
+(ert-deftest jsonyter-test-latex-find-inline-dollars-escape-and-paragraph ()
+  (should (equal (jsonyter--latex-find-inline-dollars "\\$5 and $x$")
+                 '((8 11 inline "x"))))
+  (should-not (jsonyter--latex-find-inline-dollars "$a\n\nb$"))
+  (should-not (jsonyter--latex-find-inline-dollars "no dollars"))
+  (should-not (jsonyter--latex-find-inline-dollars "lonely $")))
+
+(ert-deftest jsonyter-test-latex-inline-open-p ()
+  (should (jsonyter--latex-inline-open-p "a $b$" 2))
+  (should-not (jsonyter--latex-inline-open-p "a \\$b$" 3))
+  (should-not (jsonyter--latex-inline-open-p "a $ b$" 2))
+  (should-not (jsonyter--latex-inline-open-p "a $$b" 2))
+  (should-not (jsonyter--latex-inline-open-p "a $" 2))
+  (should-not (jsonyter--latex-inline-open-p "a $\nb$" 2)))
+
+(ert-deftest jsonyter-test-latex-inline-close-p ()
+  (should (jsonyter--latex-inline-close-p "$a$" 2))
+  (should (jsonyter--latex-inline-close-p "$a$ x" 2))
+  (should-not (jsonyter--latex-inline-close-p "$a $" 3))
+  (should-not (jsonyter--latex-inline-close-p "$a\\$" 3))
+  (should-not (jsonyter--latex-inline-close-p "$a$2" 2)))
+
+(ert-deftest jsonyter-test-latex-inline-find-close ()
+  (should (= (jsonyter--latex-inline-find-close "$a$" 0) 2))
+  (should (= (jsonyter--latex-inline-find-close "$a $ b$" 0) 6))
+  (should-not (jsonyter--latex-inline-find-close "$a\n\nb$" 0))
+  (should-not (jsonyter--latex-inline-find-close "$a" 0)))
+
+(ert-deftest jsonyter-test-latex-fragments-every-form-in-text-order ()
+  (let* ((text (concat "inline $a$, display $$b$$, bracket \\[c\\], paren \\(d\\), "
+                       "env \\begin{align}e\\end{align}."))
+         (frags (jsonyter--latex-fragments text)))
+    (should (equal (mapcar (lambda (f) (nth 2 f)) frags)
+                   '(inline display display inline env)))
+    (should (equal (mapcar (lambda (f) (nth 3 f)) frags)
+                   '("a" "b" "c" "d" "\\begin{align}e\\end{align}")))
+    (should (equal (mapcar (lambda (f) (substring text (nth 0 f) (nth 1 f))) frags)
+                   '("$a$" "$$b$$" "\\[c\\]" "\\(d\\)" "\\begin{align}e\\end{align}")))))
+
+(ert-deftest jsonyter-test-latex-fragments-skips-code-and-currency ()
+  (should-not (jsonyter--latex-fragments
+               "see `echo $HOME and $PATH`, then:\n```\n$$x$$\n```\nit costs $5 and $6"))
+  (should (equal (mapcar (lambda (f) (nth 3 f))
+                         (jsonyter--latex-fragments "`$a$` but $b$"))
+                 '("b"))))
+
+(ert-deftest jsonyter-test-latex-fragments-does-not-double-read ()
+  (should (= (length (jsonyter--latex-fragments "$$a$$")) 1))
+  (should (= (length (jsonyter--latex-fragments "\\begin{align}$x$\\end{align}")) 1))
+  (should (= (length (jsonyter--latex-fragments "\\[a\\] and $$b$$")) 2)))
+
+(ert-deftest jsonyter-test-latex-document-wraps-by-kind-and-includes-macros ()
+  (let ((jsonyter-latex-preview-preamble "\\usepackage{amsmath}")
+        (jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}")))
+    (let ((doc (jsonyter--latex-document "x \\in \\R" 'inline)))
+      (should (cl-search "\\documentclass" doc))
+      (should (cl-search "\\usepackage{amsmath}" doc))
+      (should (< (cl-search "\\newcommand{\\R}" doc) (cl-search "\\begin{document}" doc)))
+      (should (cl-search "$x \\in \\R$" doc))
+      (should (string-suffix-p "\\end{document}\n" doc)))
+    (should (cl-search "\\[a\\]" (jsonyter--latex-document "a" 'display)))
+    (let ((doc (jsonyter--latex-document "\\begin{align}a\\end{align}" 'env)))
+      (should (cl-search "\\begin{document}\n\\begin{align}a\\end{align}" doc))
+      (should-not (cl-search "\\[" doc)))))
+
+(ert-deftest jsonyter-test-latex-document-without-macros ()
+  (let ((jsonyter-latex-preview-preamble "\\usepackage{amsmath}")
+        (jsonyter-notebook-latex-macros nil))
+    (should (cl-search "\\usepackage{amsmath}\n\\pagestyle{empty}"
+                       (jsonyter--latex-document "a" 'inline)))))
+
+(ert-deftest jsonyter-test-latex-converter-picks-by-setting-and-availability ()
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (p &rest _) (and (member p '("dvipng" "dvisvgm")) (concat "/bin/" p)))))
+    (let ((jsonyter-latex-preview-converter 'auto))
+      (should (eq (jsonyter--latex-converter) 'dvipng)))
+    (let ((jsonyter-latex-preview-converter 'dvisvgm))
+      (should (eq (jsonyter--latex-converter) 'dvisvgm))))
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (p &rest _) (and (equal p "dvisvgm") "/bin/dvisvgm"))))
+    (let ((jsonyter-latex-preview-converter 'auto))
+      (should (eq (jsonyter--latex-converter) 'dvisvgm)))
+    (let ((jsonyter-latex-preview-converter 'dvipng))
+      (should-not (jsonyter--latex-converter))))
+  (cl-letf (((symbol-function 'executable-find) #'ignore))
+    (let ((jsonyter-latex-preview-converter 'auto))
+      (should-not (jsonyter--latex-converter)))))
+
+(ert-deftest jsonyter-test-latex-cache-file-is-a-pure-function-of-its-inputs ()
+  (let ((jsonyter-latex-preview-cache-directory "/tmp/jy-cache"))
+    (let ((a (jsonyter--latex-cache-file "doc" 'dvipng 140 "rgb 0 0 0")))
+      (should (equal a (jsonyter--latex-cache-file "doc" 'dvipng 140 "rgb 0 0 0")))
+      (should (string-prefix-p "/tmp/jy-cache/" a))
+      (should (string-suffix-p ".png" a))
+      (should-not (equal a (jsonyter--latex-cache-file "doc" 'dvipng 141 "rgb 0 0 0")))
+      (should-not (equal a (jsonyter--latex-cache-file "doc2" 'dvipng 140 "rgb 0 0 0")))
+      (should-not (equal a (jsonyter--latex-cache-file "doc" 'dvipng 140 "rgb 1 1 1")))
+      (should (string-suffix-p ".svg" (jsonyter--latex-cache-file "doc" 'dvisvgm 140 "rgb 0 0 0"))))))
+
+(ert-deftest jsonyter-test-latex-fg-formats-the-faces-colour ()
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "#ff0000")))
+    (should (equal (jsonyter--latex-fg) "rgb 1.000 0.000 0.000")))
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) "unspecified-fg")))
+    (should (equal (jsonyter--latex-fg) "rgb 0.000 0.000 0.000")))
+  (cl-letf (((symbol-function 'face-foreground) (lambda (&rest _) nil)))
+    (should (equal (jsonyter--latex-fg 'shadow) "rgb 0.000 0.000 0.000"))))
+
+(ert-deftest jsonyter-test-latex-first-error-reads-the-bang-line ()
+  (let ((log (make-temp-file "jsonyter-tex-log")))
+    (unwind-protect
+        (progn
+          (with-temp-file log
+            (insert "This is pdfTeX\n! Undefined control sequence.\nl.5 $\\bad$\n! Second.\n"))
+          (should (equal (jsonyter--latex-first-error log) "! Undefined control sequence."))
+          (with-temp-file log (insert "all fine\n"))
+          (should (equal (jsonyter--latex-first-error log) "unknown error")))
+      (delete-file log))
+    (should (equal (jsonyter--latex-first-error "/nonexistent/doc.log") "unknown error"))))
+
+(defvar jsonyter-tests--tex-calls nil
+  "The (PROGRAM . ARGS) calls the fake TeX toolchain received, newest first.")
+
+(defun jsonyter-tests--fake-call-process (latex-rc)
+  "A `call-process' stand-in: a fake latex (exit LATEX-RC) and dvipng/dvisvgm.
+Each program writes the files the real one would into `default-directory'."
+  (lambda (program _infile _dest _display &rest args)
+    (push (cons program args) jsonyter-tests--tex-calls)
+    (pcase program
+      ("latex"
+       (if (eq latex-rc 0)
+           (write-region "dvi" nil (expand-file-name "doc.dvi") nil 'quiet)
+         (write-region "! Undefined control sequence.\n" nil
+                       (expand-file-name "doc.log") nil 'quiet))
+       latex-rc)
+      ("dvipng" (write-region "PNG" nil (expand-file-name "doc.png") nil 'quiet) 0)
+      ("dvisvgm" (write-region "SVG" nil (expand-file-name "doc.svg") nil 'quiet) 0)
+      (_ 1))))
+
+(ert-deftest jsonyter-test-latex-render-runs-latex-then-dvipng-and-caches ()
+  (let* ((jsonyter-latex-preview-cache-directory
+          (make-temp-file "jsonyter-cache" t))
+         (jsonyter-tests--tex-calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'call-process) (jsonyter-tests--fake-call-process 0)))
+          (let ((out (jsonyter--latex-render "DOC" 'dvipng 140 "rgb 0 0 0")))
+            (should (equal out (jsonyter--latex-cache-file "DOC" 'dvipng 140 "rgb 0 0 0")))
+            (should (file-exists-p out))
+            (let ((calls (reverse jsonyter-tests--tex-calls)))
+              (should (equal (mapcar #'car calls) '("latex" "dvipng")))
+              (should (member "-D" (cdr (cadr calls))))
+              (should (member "140" (cdr (cadr calls))))
+              (should (member "rgb 0 0 0" (cdr (cadr calls)))))
+            (setq jsonyter-tests--tex-calls nil)
+            (should (equal (jsonyter--latex-render "DOC" 'dvipng 140 "rgb 0 0 0") out))
+            (should-not jsonyter-tests--tex-calls)))
+      (delete-directory jsonyter-latex-preview-cache-directory t))))
+
+(ert-deftest jsonyter-test-latex-render-dvisvgm-makes-an-svg ()
+  (let* ((jsonyter-latex-preview-cache-directory (make-temp-file "jsonyter-cache" t))
+         (jsonyter-tests--tex-calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'call-process) (jsonyter-tests--fake-call-process 0)))
+          (let ((out (jsonyter--latex-render "DOC" 'dvisvgm 140 "rgb 0 0 0")))
+            (should (string-suffix-p ".svg" out))
+            (should (file-exists-p out))
+            (should (member "--no-fonts" (cdr (assoc "dvisvgm" jsonyter-tests--tex-calls))))))
+      (delete-directory jsonyter-latex-preview-cache-directory t))))
+
+(ert-deftest jsonyter-test-latex-render-reports-the-first-tex-error ()
+  (let* ((jsonyter-latex-preview-cache-directory (make-temp-file "jsonyter-cache" t))
+         (jsonyter-tests--tex-calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'call-process) (jsonyter-tests--fake-call-process 1)))
+          (let ((err (should-error (jsonyter--latex-render "BAD" 'dvipng 140 "rgb 0 0 0")
+                                   :type 'user-error)))
+            (should (string-match-p "Undefined control sequence" (cadr err)))
+            (should-not (file-exists-p
+                         (jsonyter--latex-cache-file "BAD" 'dvipng 140 "rgb 0 0 0")))
+            (should (equal (mapcar #'car jsonyter-tests--tex-calls) '("latex")))))
+      (delete-directory jsonyter-latex-preview-cache-directory t))))
+
+(ert-deftest jsonyter-test-latex-render-with-real-tex ()
+  (skip-unless (and (executable-find "latex") (executable-find "dvipng")))
+  (let ((jsonyter-latex-preview-cache-directory (make-temp-file "jsonyter-cache" t))
+        (jsonyter-latex-preview-preamble "\\usepackage{amsmath}\n\\usepackage{amssymb}")
+        (jsonyter-notebook-latex-macros '("\\newcommand{\\R}{\\mathbb{R}}")))
+    (unwind-protect
+        (let* ((doc (jsonyter--latex-document "x \\in \\R" 'inline))
+               (out (jsonyter--latex-render doc 'dvipng 100 "rgb 0.000 0.000 0.000")))
+          (should (file-exists-p out))
+          (should (> (file-attribute-size (file-attributes out)) 100))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert-file-contents-literally out nil 0 4)
+            (should (equal (buffer-string) "\x89PNG")))
+          (should-error (jsonyter--latex-render
+                         (jsonyter--latex-document "\\undefinedmacro" 'inline)
+                         'dvipng 100 "rgb 0.000 0.000 0.000")
+                        :type 'user-error))
+      (delete-directory jsonyter-latex-preview-cache-directory t))))
+
+(ert-deftest jsonyter-test-latex-image-gives-an-image-or-a-placeholder ()
+  (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) t))
+            ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+            ((symbol-function 'create-image)
+             (lambda (file type &rest _) (list 'image :type type :file file))))
+    (should (equal (jsonyter--latex-image "/tmp/a.png") '(image :type png :file "/tmp/a.png")))
+    (should (equal (jsonyter--latex-image "/tmp/a.svg") '(image :type svg :file "/tmp/a.svg"))))
+  (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+    (should (stringp (jsonyter--latex-image "/tmp/a.png")))))
+
+(ert-deftest jsonyter-test-latex-clear-removes-only-preview-overlays-in-range ()
+  (with-temp-buffer
+    (insert "0123456789abcdefghij")
+    (let ((a (make-overlay 1 3)) (b (make-overlay 8 10)) (other (make-overlay 4 6)))
+      (overlay-put a 'jsonyter-latex-preview t)
+      (overlay-put b 'jsonyter-latex-preview t)
+      (should (= (jsonyter--nb-latex-clear 1 6) 1))
+      (should-not (overlay-buffer a))
+      (should (overlay-buffer b))
+      (should (overlay-buffer other))
+      (should (= (jsonyter--nb-latex-clear 1 (point-max)) 1))
+      (should (= (jsonyter--nb-latex-clear 1 (point-max)) 0)))))
+
+(ert-deftest jsonyter-test-latex-overlay-modified-deletes-before-the-change-only ()
+  (with-temp-buffer
+    (insert "abcdef")
+    (let ((ov (make-overlay 2 4)))
+      (jsonyter--nb-latex-overlay-modified ov t 2 3 1)
+      (should (overlay-buffer ov))
+      (jsonyter--nb-latex-overlay-modified ov nil 2 3)
+      (should-not (overlay-buffer ov)))))
+
+(defun jsonyter-tests--markdown-math-notebook ()
+  "A notebook: markdown with two fragments, a code cell, markdown without math."
+  (jsonyter-tests--nb-json
+   '(("markdown" "text $a$ and $$b$$ end\n" nil)
+     ("code" "x = '$not math$'\n" nil)
+     ("markdown" "plain words\n" nil))))
+
+(defmacro jsonyter-tests--with-fake-latex (&rest body)
+  "Run BODY with the TeX toolchain and image creation stubbed out."
+  (declare (indent 0) (debug t))
+  `(cl-letf (((symbol-function 'jsonyter--latex-converter) (lambda () 'dvipng))
+             ((symbol-function 'executable-find) (lambda (&rest _) "/bin/fake"))
+             ((symbol-function 'jsonyter--latex-render)
+              (lambda (doc &rest _)
+                (when (string-match-p "badmacro" doc)
+                  (user-error "jsonyter: LaTeX failed: ! Undefined control sequence."))
+                (concat "/tmp/" (md5 doc) ".png")))
+             ((symbol-function 'jsonyter--latex-image) (lambda (file) (concat "IMG:" file))))
+     ,@body))
+
+(defun jsonyter-tests--previews ()
+  "The LaTeX preview overlays in this buffer, in buffer order."
+  (sort (seq-filter (lambda (o) (overlay-get o 'jsonyter-latex-preview))
+                    (overlays-in (point-min) (point-max)))
+        (lambda (a b) (< (overlay-start a) (overlay-start b)))))
+
+(ert-deftest jsonyter-test-latex-preview-cell-overlays-the-fragments ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+      (let ((before (buffer-string))
+            (cell (car (jsonyter--nb-cells))))
+        (should (= (jsonyter--nb-latex-preview-cell cell) 2))
+        (let ((ovs (jsonyter-tests--previews)))
+          (should (= (length ovs) 2))
+          (should (equal (mapcar (lambda (o) (buffer-substring-no-properties
+                                              (overlay-start o) (overlay-end o)))
+                                 ovs)
+                         '("$a$" "$$b$$")))
+          (should (string-prefix-p "IMG:" (overlay-get (car ovs) 'display)))
+          (should (equal (overlay-get (car ovs) 'help-echo) "a")))
+        (should (equal (buffer-string) before))
+        (should (equal (jsonyter-tests--cell-sources)
+                       '("text $a$ and $$b$$ end" "x = '$not math$'" "plain words")))
+        (should (= (jsonyter--nb-latex-preview-cell cell) 2))
+        (should (= (length (jsonyter-tests--previews)) 2))))))
+
+(ert-deftest jsonyter-test-latex-preview-cell-skips-a-failing-fragment ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json
+        (jsonyter-tests--nb-json '(("markdown" "bad $\\badmacro$ good $x$\n" nil)))
+      (let ((messages nil))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+          (should (= (jsonyter--nb-latex-preview-cell (car (jsonyter--nb-cells))) 1)))
+        (should (= (length (jsonyter-tests--previews)) 1))
+        (should (equal (buffer-substring-no-properties
+                        (overlay-start (car (jsonyter-tests--previews)))
+                        (overlay-end (car (jsonyter-tests--previews))))
+                       "$x$"))
+        (should (seq-some (lambda (m) (string-match-p "Undefined control sequence" m))
+                          messages))))))
+
+(ert-deftest jsonyter-test-latex-editing-a-fragment-removes-just-its-preview ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+      (jsonyter--nb-latex-preview-cell (car (jsonyter--nb-cells)))
+      (let ((first (car (jsonyter-tests--previews))))
+        (goto-char (1+ (overlay-start first)))
+        (insert "z")
+        (should (= (length (jsonyter-tests--previews)) 1))
+        (should (equal (buffer-substring-no-properties
+                        (overlay-start (car (jsonyter-tests--previews)))
+                        (overlay-end (car (jsonyter-tests--previews))))
+                       "$$b$$"))))))
+
+(ert-deftest jsonyter-test-latex-check-tools-names-what-is-missing ()
+  (cl-letf (((symbol-function 'executable-find) #'ignore))
+    (let ((err (should-error (jsonyter--latex-check-tools) :type 'user-error)))
+      (should (string-match-p "latex" (cadr err)))))
+  (cl-letf (((symbol-function 'executable-find)
+             (lambda (p &rest _) (and (equal p "latex") "/bin/latex"))))
+    (let ((jsonyter-latex-preview-converter 'auto))
+      (let ((err (should-error (jsonyter--latex-check-tools) :type 'user-error)))
+        (should (string-match-p "dvipng" (cadr err))))))
+  (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "/bin/x")))
+    (let ((jsonyter-latex-preview-converter 'auto))
+      (should-not (jsonyter--latex-check-tools)))))
+
+(ert-deftest jsonyter-test-latex-markdown-cells-skip-code-and-the-macros-cell ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       '(("markdown" "<!-- jsonyter:latex-macros -->\n$$\n\\newcommand{\\R}{x}\n$$\n" nil)
+         ("markdown" "math $a$\n" nil)
+         ("code" "y = 1\n" nil)
+         ("raw" "raw $b$\n" nil)))
+    (let ((cells (jsonyter--nb-latex-markdown-cells)))
+      (should (= (length cells) 1))
+      (should (equal (jsonyter--nb-cell-source (car cells)) "math $a$")))))
+
+(ert-deftest jsonyter-test-latex-target-cells ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json
+       '(("markdown" "one $a$\n" nil) ("code" "y = 1\n" nil) ("markdown" "two $b$\n" nil)))
+    (should (= (length (jsonyter--nb-latex-target-cells t)) 2))
+    (goto-char (point-min))
+    (should (equal (mapcar #'jsonyter--nb-cell-source (jsonyter--nb-latex-target-cells nil))
+                   '("one $a$")))
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (let ((err (should-error (jsonyter--nb-latex-target-cells nil) :type 'user-error)))
+      (should (string-match-p "markdown" (cadr err))))))
+
+(ert-deftest jsonyter-test-latex-preview-command-previews-cell-at-point-or-all ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json
+        (jsonyter-tests--nb-json
+         '(("markdown" "one $a$\n" nil) ("code" "y = 1\n" nil) ("markdown" "two $b$ $c$\n" nil)))
+      (goto-char (point-min))
+      (should (= (jsonyter-notebook-latex-preview) 1))
+      (should (= (length (jsonyter-tests--previews)) 1))
+      (should (= (jsonyter-notebook-latex-preview t) 3))
+      (should (= (length (jsonyter-tests--previews)) 3))
+      (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+      (let ((err (should-error (jsonyter-notebook-latex-preview) :type 'user-error)))
+        (should (string-match-p "markdown" (cadr err)))))))
+
+(ert-deftest jsonyter-test-latex-clear-command-clears-cell-or-all ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json
+        (jsonyter-tests--nb-json '(("markdown" "one $a$\n" nil) ("markdown" "two $b$\n" nil)))
+      (mapc #'jsonyter--nb-latex-preview-cell (jsonyter--nb-latex-markdown-cells))
+      (should (= (length (jsonyter-tests--previews)) 2))
+      (goto-char (point-min))
+      (should (= (jsonyter-notebook-latex-preview-clear) 1))
+      (should (= (length (jsonyter-tests--previews)) 1))
+      (should (= (jsonyter-notebook-latex-preview-clear t) 1))
+      (should-not (jsonyter-tests--previews)))))
+
+(ert-deftest jsonyter-test-latex-toggle-turns-previews-on-then-off ()
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json
+        (jsonyter-tests--nb-json '(("markdown" "one $a$ and $$b$$\n" nil) ("code" "y = 1\n" nil)))
+      (goto-char (point-min))
+      (jsonyter-notebook-latex-preview-toggle)
+      (should (= (length (jsonyter-tests--previews)) 2))
+      (jsonyter-notebook-latex-preview-toggle)
+      (should-not (jsonyter-tests--previews))
+      (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+      (should-error (jsonyter-notebook-latex-preview-toggle) :type 'user-error)
+      (should-not (jsonyter-tests--previews)))))
+
+(ert-deftest jsonyter-test-latex-preview-leaves-the-saved-source-alone ()
+  (skip-unless (jsonyter-tests--bridge-available-p))
+  (jsonyter-tests--with-fake-latex
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+      (let ((jsonyter-command '("python3" "-m" "jsonyter")))
+        (jsonyter-notebook-latex-preview t)
+        (set-buffer-modified-p t)
+        (jsonyter-notebook-save)
+        (let* ((json (with-temp-buffer (insert-file-contents path) (buffer-string)))
+               (cells (plist-get (json-parse-string json :object-type 'plist
+                                                    :array-type 'list)
+                                 :cells)))
+          (should (equal (mapconcat #'identity (plist-get (car cells) :source) "")
+                         "text $a$ and $$b$$ end")))))))
+
+(ert-deftest jsonyter-test-latex-preview-key-and-on-open-option ()
+  (should (eq (lookup-key jsonyter-notebook-mode-map (kbd "C-c C-v"))
+              'jsonyter-notebook-latex-preview-toggle))
+  (let ((jsonyter-notebook-latex-preview-on-open t))
+    (jsonyter-tests--with-fake-latex
+      (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+        (should (= (length (jsonyter-tests--previews)) 2)))))
+  (let ((jsonyter-notebook-latex-preview-on-open nil))
+    (jsonyter-tests--with-fake-latex
+      (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+        (should-not (jsonyter-tests--previews)))))
+  (let ((jsonyter-notebook-latex-preview-on-open t))
+    (cl-letf (((symbol-function 'executable-find) #'ignore))
+      (jsonyter-tests--with-notebook-json (jsonyter-tests--markdown-math-notebook)
+        (should-not (jsonyter-tests--previews))
+        (should (= (length (jsonyter--nb-cells)) 3))))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
