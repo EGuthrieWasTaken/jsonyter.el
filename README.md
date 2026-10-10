@@ -183,6 +183,7 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-image-max-width` | `800` | Max pixel width for inline images (a REPL; in a notebook or script cell `jsonyter-notebook-output-width` also applies). |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
 | `jsonyter-notebook-output-width` | `80` | Columns wide the rules framing a notebook/script cell's output are drawn, and the column ceiling an image in that output is scaled to line up with them. |
+| `jsonyter-notebook-line-numbers` | `cell` | With line numbers on, number each cell's lines from 1 within the cell (`cell`) or leave Emacs's own numbering alone (`buffer`). See [Line numbers](#line-numbers). |
 | `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
 | `jsonyter-suppress-line-spacing` | `t` | Drop `line-spacing` in REPL and notebook buffers, where its leading would band a sliced image. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
@@ -520,6 +521,40 @@ removes that cell. Reverting a notebook (`revert-buffer`, or an
 auto-revert after a sync) replaces its cells instead of stacking the old
 ones, empty, at the top — which before 2.5.0 made editing near the top
 slower with every reload.
+
+### Line numbers
+
+With `display-line-numbers-mode` on (or `global-display-line-numbers-mode`),
+a notebook numbers each cell's source lines from 1 *within the cell*, on
+the row that shows the line, and restarts at 1 in every cell — code,
+markdown and raw alike. Prompts, output and images carry no number.
+Emacs's own numbering would count the rows of the rendered view instead:
+the number of a cell's first line lands on the blank row above its
+prompt, and every output row and every row of a sliced image takes a
+number too, so the numbers match neither the cell nor the file.
+
+The numbers are display-only. They are never part of a cell's source, a
+saved file, the undo history, the modified flag or text you copy, and a
+line that wraps continues under its own text. Turning
+`display-line-numbers-mode` off removes them, and on brings them back.
+The mode is how you say you want numbers: a notebook never shows any to
+someone who has them off.
+
+```elisp
+(setq jsonyter-notebook-line-numbers 'buffer)   ; Emacs's own numbers
+```
+
+`jsonyter-notebook-line-numbers` is `cell` by default; `buffer` leaves
+Emacs's numbering alone, as it was before 2.5.0. The option is read when
+line numbers are switched on, so after changing it toggle
+`display-line-numbers-mode` off and on in an open notebook. Per-cell
+numbers replace *absolute* numbering only: with
+`display-line-numbers-type` set to `relative` or `visual` the notebook
+keeps Emacs's numbers. While they are showing, jsonyter owns the
+`line-prefix` and `wrap-prefix` properties on cell source, so a package
+that sets those on the same text (`adaptive-wrap-prefix-mode`, say) will
+fight it — use `buffer` there. `M-g g` still goes to a buffer line, which
+no longer matches the number you see.
 
 ### LaTeX macros
 
