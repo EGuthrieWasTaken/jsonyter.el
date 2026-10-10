@@ -4667,8 +4667,15 @@ newline, optional spaces or tabs, a newline: test it with
 `string-match-p' on \"\\n[ \\t]*\\n\"), give up and return nil; when
 `jsonyter--latex-inline-close-p' accepts the candidate, return its
 offset; otherwise go on to the next.  Return nil when none is left."
-  (ignore text open)
-  (error "jsonyter: not implemented"))
+  (let ((search (1+ open)) (n (length text)) close)
+    (while (and (not close) (< search n) (string-match "\\$" text search))
+      (let ((c (match-beginning 0)))
+        (cond ((string-match-p "\n[ \t]*\n" (substring text (1+ open) c))
+               (setq search n))
+              ((jsonyter--latex-inline-close-p text c)
+               (setq close c))
+              (t (setq search (1+ c))))))
+    close))
 
 (defun jsonyter--latex-find-inline-dollars (text)
   "Return the inline `$...$' fragments in TEXT, as (BEG END inline BODY).
