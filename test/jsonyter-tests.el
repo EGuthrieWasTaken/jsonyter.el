@@ -4669,6 +4669,11 @@ throwaway owner buffer that is killed afterward along with the sync buffer."
                 ((symbol-function 'read-directory-name) (lambda (&rest _) "/tmp/interactive"))
                 ((symbol-function 'jsonyter--transfer-remote-dir) (lambda (&rest _) "work/"))
                 ((symbol-function 'jsonyter--read-remote-path) (lambda (&rest _) "work/interactive"))
+                ;; The interactive form asks for the directories to be
+                ;; created; this test is about the arguments it reads,
+                ;; so keep it off the file system and the server.
+                ((symbol-function 'jsonyter--sync-ensure-local-dir) #'ignore)
+                ((symbol-function 'jsonyter--sync-ensure-remote-dir) #'ignore)
                 ((symbol-function 'y-or-n-p) (lambda (_p) nil))
                 ((symbol-function 'customize-save-variable) #'ignore))
         (call-interactively #'jsonyter-sync-add-pair))
