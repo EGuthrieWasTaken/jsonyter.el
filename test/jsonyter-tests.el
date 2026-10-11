@@ -8096,5 +8096,212 @@ An unnumbered line is nil."
       (should (equal (overlay-get cell 'before-string)
                      (jsonyter--nb-prompt "code" nil nil nil))))))
 
+;;; A real user's setup
+;;
+;; A bug that only shows in someone's own Emacs is hard to guard against
+;; with tests written in a bare one.  These run notebooks under a
+;; reduced copy of the parts of a real, daily-driver configuration that
+;; touch an editing buffer: line numbers and the fill-column indicator on
+;; `prog-mode-hook', a stand-in for `global-flycheck-mode' switched on
+;; for the language mode and off again from `jsonyter-notebook-mode-hook',
+;; and the server token as a function.  The packages themselves (company,
+;; yasnippet, flycheck) are not needed; what matters is the hooks, and
+;; those are reproduced here.  The notebook is shaped like a real
+;; analysis notebook: many cells, each with stream, table and figure
+;; outputs.
+;;
+;; The failure these guard was a reload leaving every cell behind as an
+;; empty overlay at the top of the buffer, each still drawing its prompt.
+;; In a live frame, with that user's packages, redisplay after a newline
+;; at the top of such a notebook took 0.24 s after 4 reloads and 17.5 s
+;; after 20 (3 ms and 4 ms with the fix); batch ERT never redisplays, so
+;; these assert the cause, the number of overlays, rather than the time.
+
+(define-minor-mode jsonyter-tests--checker-mode
+  "Stand-in for `flycheck-mode': it only has to be on or off."
+  :lighter nil)
+
+(defun jsonyter-tests--checker-on ()
+  "What `global-flycheck-mode' does for a buffer's language mode."
+  (jsonyter-tests--checker-mode 1))
+
+(defun jsonyter-tests--checker-off-in-notebooks ()
+  "The user's `jsonyter-notebook-mode-hook' function."
+  (when jsonyter-notebook-mode
+    (jsonyter-tests--checker-mode -1)))
+
+(defmacro jsonyter-tests--with-user-setup (&rest body)
+  "Run BODY under a reduced copy of a real configuration's buffer hooks.
+Everything is bound or restored, so the rest of the suite is untouched."
+  (declare (indent 0) (debug t))
+  `(let ((prog-mode-hook (append prog-mode-hook
+                                 (list #'display-line-numbers-mode
+                                       #'display-fill-column-indicator-mode)))
+         (python-mode-hook (append python-mode-hook
+                                   (list #'jsonyter-tests--checker-on)))
+         (jsonyter-notebook-mode-hook
+          (append jsonyter-notebook-mode-hook
+                  (list #'jsonyter-tests--checker-off-in-notebooks)))
+         (jsonyter-server-token (lambda () "token-from-auth-source"))
+         (jsonyter-server-token-file nil)
+         (jsonyter-notebook-line-numbers 'cell)
+         (old-fill-column (default-value 'fill-column)))
+     (unwind-protect
+         (progn (setq-default fill-column 80)
+                ,@body)
+       (setq-default fill-column old-fill-column))))
+
+(defconst jsonyter-tests--tiny-png
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+  "A one-pixel PNG, base64, for a figure output.")
+
+(defun jsonyter-tests--analysis-notebook (n)
+  "JSON for a notebook of N code cells, each with prose above and rich outputs."
+  (jsonyter-tests--nb-json
+   (cl-loop
+    for i from 1 to n
+    append
+    (list
+     (list "markdown" (format "## Step %d\nWe fit model %d; it's the one with `code`.\n" i i) nil)
+     (list "code" (format "idata_%d = pm.sample(1000)\nsummary_%d = az.summary(idata_%d)\n" i i i)
+           (list (list :output_type "stream" :name "stderr"
+                       :text (mapconcat (lambda (c) (format "Sampling chain %d, 0 divergences 100%%\n" c))
+                                        (number-sequence 0 3) ""))
+                 (list :output_type "execute_result" :execution_count i :metadata nil
+                       :data (list :text/plain
+                                   (mapconcat (lambda (r) (format "param_%02d  %6.3f  %6.3f\n" r (/ r 7.0) (/ r 3.0)))
+                                              (number-sequence 0 14) "")))
+                 (list :output_type "display_data"
+                       :data (list :image/png jsonyter-tests--tiny-png :text/plain "<Figure>")
+                       :metadata (list :image/png (list :width 640 :height 480)))))))))
+
+(defun jsonyter-tests--overlay-strings ()
+  "Number of overlays in this buffer that draw a string."
+  (length (seq-filter (lambda (o) (overlay-get o 'before-string))
+                      (overlays-in (point-min) (point-max)))))
+
+(defun jsonyter-tests--empty-cell-overlays ()
+  "Cell overlays in this buffer that cover no text."
+  (seq-filter (lambda (o) (and (overlay-get o 'jsonyter-cell)
+                               (= (overlay-start o) (overlay-end o))))
+              (overlays-in (point-min) (point-max))))
+
+(ert-deftest jsonyter-test-user-setup-opens-a-notebook-the-way-the-config-expects ()
+  (jsonyter-tests--with-user-setup
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--analysis-notebook 3)
+      (should jsonyter-notebook-mode)
+      (should display-line-numbers-mode)
+      (should jsonyter--nb-numbers-active)
+      (should-not display-line-numbers)
+      (should display-fill-column-indicator-mode)
+      ;; The checker came on with the language mode and was switched off
+      ;; again by the user's notebook-mode hook.
+      (should-not jsonyter-tests--checker-mode)
+      (should (equal (jsonyter-tests--cell-numbers (nth 1 (jsonyter--nb-cells)))
+                     '(1 2))))
+    ;; ...and is left alone in an ordinary Python buffer.
+    (with-temp-buffer
+      (python-mode)
+      (should jsonyter-tests--checker-mode)
+      (should-not jsonyter--nb-numbers-active))
+    (should (equal (jsonyter--token) "token-from-auth-source"))))
+
+(ert-deftest jsonyter-test-user-setup-reloads-do-not-pile-up-cell-overlays ()
+  (jsonyter-tests--with-user-setup
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--analysis-notebook 12)
+      (let ((cells (length (jsonyter--nb-cells))))
+        (should (= cells 24))
+        (dotimes (_ 25)
+          (revert-buffer t t))
+        (should (= (length (jsonyter--nb-cells)) cells))
+        (should-not (jsonyter-tests--empty-cell-overlays))
+        (should (= (jsonyter-tests--overlay-strings) cells))
+        (should (jsonyter-tests--cells-tile-buffer-p))))))
+
+(ert-deftest jsonyter-test-user-setup-a-newline-at-the-top-after-reloads ()
+  (jsonyter-tests--with-user-setup
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--analysis-notebook 6)
+      (dotimes (_ 10)
+        (revert-buffer t t))
+      (let ((strings (jsonyter-tests--overlay-strings))
+            (first (car (jsonyter--nb-cells))))
+        (goto-char (point-min))
+        ;; RET through its binding, in this buffer: `execute-kbd-macro'
+        ;; would run it in whatever the selected window shows.
+        (let ((last-command-event ?\r))
+          (call-interactively (key-binding (kbd "RET"))))
+        ;; Nothing was added to what Emacs must draw at the top, and the
+        ;; first cell's numbers are right.
+        (should (= (jsonyter-tests--overlay-strings) strings))
+        (should-not (jsonyter-tests--empty-cell-overlays))
+        (should (equal (jsonyter-tests--cell-numbers first) '(1 2 3)))
+        (should (jsonyter-tests--cells-tile-buffer-p))))))
+
+(ert-deftest jsonyter-test-user-setup-a-reload-clears-overlays-an-older-version-left ()
+  ;; A buffer opened under 2.4.1 and still alive after an upgrade holds
+  ;; the empty cells it piled up; the first reload has to clear them.
+  (jsonyter-tests--with-user-setup
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--analysis-notebook 4)
+      (dotimes (_ 5)
+        (overlay-put (jsonyter-tests--add-phantom-cell) 'before-string "\nIn [ ]: code ──\n"))
+      (should (= (length (jsonyter-tests--empty-cell-overlays)) 5))
+      (revert-buffer t t)
+      (should-not (jsonyter-tests--empty-cell-overlays))
+      (should (= (jsonyter-tests--overlay-strings) (length (jsonyter--nb-cells)))))))
+
+(ert-deftest jsonyter-test-nb-numbers-keep-the-fill-column-indicator-on-the-text ()
+  ;; Per-cell numbers lie inside the text area, so the indicator, which
+  ;; counts from its left edge, must move right by the gutter's width or
+  ;; a line of exactly `fill-column' characters crosses it.
+  (jsonyter-tests--with-user-setup
+    (jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json '(("code" "a\n" nil)))
+      (should jsonyter--nb-numbers-active)
+      (should (= display-fill-column-indicator-column (+ fill-column 3)))
+      ;; Turning the numbers off puts the indicator back where it was.
+      (display-line-numbers-mode -1)
+      (should-not jsonyter--nb-numbers-active)
+      (should (eq display-fill-column-indicator-column t))
+      (should-not (local-variable-p 'display-fill-column-indicator-column))
+      ;; A column the user chose is shifted from, and restored to, itself.
+      (setq-local display-fill-column-indicator-column 100)
+      (display-line-numbers-mode 1)
+      (should (= display-fill-column-indicator-column 103))
+      (display-line-numbers-mode -1)
+      (should (= display-fill-column-indicator-column 100)))))
+
+(ert-deftest jsonyter-test-nb-numbers-buffer-setting-leaves-the-fill-column-indicator ()
+  (jsonyter-tests--with-user-setup
+    (let ((jsonyter-notebook-line-numbers 'buffer))
+      (jsonyter-tests--with-notebook-json (jsonyter-tests--nb-json '(("code" "a\n" nil)))
+        (should-not jsonyter--nb-numbers-active)
+        (should (eq display-fill-column-indicator-column t))))))
+
+(ert-deftest jsonyter-test-docstrings-render-as-written ()
+  ;; In a Lisp string `\b' is a backspace and `\e' an escape, and
+  ;; `substitute-command-keys' turns a literal backslash-bracket into a
+  ;; command-key reference, so a docstring about LaTeX can quietly show
+  ;; `M-x ...' where it meant TeX.  Nothing that reads like an
+  ;; implementer's instructions (numbered steps, "Call `x', then") should
+  ;; reach a user's `C-h f' either.
+  (let (problems)
+    (mapatoms
+     (lambda (sym)
+       (when (and (string-prefix-p "jsonyter" (symbol-name sym))
+                  (or (fboundp sym) (boundp sym)))
+         (let ((raw (or (and (fboundp sym) (ignore-errors (documentation sym t)))
+                        (documentation-property sym 'variable-documentation t))))
+           (when (stringp raw)
+             (let ((shown (substitute-command-keys raw)))
+               (cond
+                ((seq-find (lambda (c) (and (< c 32) (/= c ?\n))) raw)
+                 (push (format "%s has a control character" sym) problems))
+                ((string-match-p "M-x \\.\\.\\." shown)
+                 (push (format "%s shows a stray command-key reference" sym) problems))
+                ((string-match-p "\n[0-9]\\. " raw)
+                 (push (format "%s has numbered implementation steps" sym) problems))
+                ((string-match-p "Call `jsonyter[^ ]*', then" raw)
+                 (push (format "%s reads as instructions to an implementer" sym) problems)))))))))
+    (should (equal (sort problems #'string<) nil))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here

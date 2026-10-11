@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.0/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.1/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.0/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.0"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.1"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.0"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.1"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -550,7 +550,11 @@ line numbers are switched on, so after changing it toggle
 `display-line-numbers-mode` off and on in an open notebook. Per-cell
 numbers replace *absolute* numbering only: with
 `display-line-numbers-type` set to `relative` or `visual` the notebook
-keeps Emacs's numbers. While they are showing, jsonyter owns the
+keeps Emacs's numbers. The numbers lie inside the text area, so while they
+show, `display-fill-column-indicator-column` is moved right by their width
+(three columns for a cell of under a hundred lines) and put back when they
+go: a line of exactly `fill-column` characters then ends at the indicator,
+as it does with Emacs's own numbers. While they are showing, jsonyter owns the
 `line-prefix` and `wrap-prefix` properties on cell source, so a package
 that sets those on the same text (`adaptive-wrap-prefix-mode`, say) will
 fight it — use `buffer` there. `M-g g` still goes to a buffer line, which
@@ -1335,7 +1339,7 @@ base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
 you think it is.
 
-[`harness/`](harness/) is the other half: 56 scenarios that run in a
+[`harness/`](harness/) is the other half: 57 scenarios that run in a
 **real graphical Emacs on an X server in a container**, driven through
 the actual command loop, using
 [emacs-harness](https://github.com/EGuthrieWasTaken/emacs-harness).

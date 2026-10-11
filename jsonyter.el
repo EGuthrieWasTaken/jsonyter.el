@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.5.0
+;; Version: 2.5.1
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -2846,14 +2846,15 @@ are told apart by whether the car is a keyword.  Returns VALUE with:
    (t value)))
 
 (defun jsonyter--nb-data-for-wire (data)
-  "Reshape mimebundle DATA (an output's `:data' or `:metadata' plist) so
-`json-serialize' can encode it.  nbformat allows any mimetype's value to
-be stored as a list of line fragments instead of one string --
-`jsonyter--mime' already documents this and joins it for rendering --
-but `json-serialize' cannot encode a Lisp list as a JSON array, so each
-list-valued entry is joined here too.  Values that are not lists pass
-through unchanged. A value under a JSON mimetype, or a list that is not all
-strings, is kept as structured JSON instead."
+  "Reshape mimebundle DATA so `json-serialize' can encode it.
+DATA is an output's `:data' or `:metadata' plist.  nbformat lets any
+mimetype's value be a list of line fragments instead of one string
+\(`jsonyter--mime' joins such a list for rendering), and `json-serialize'
+cannot encode a Lisp list as a JSON array, so a list of strings is
+joined into one string here.  A value under a JSON mimetype, or any list
+that is not all strings (image metadata, say), is structured JSON and
+goes through `jsonyter--nb-json-for-wire' instead.  Values that are not
+lists pass through unchanged."
   (cl-loop for (key val) on data by #'cddr
            append (list key (cond
                             ((not (listp val)) val)
@@ -3037,6 +3038,13 @@ string there is nothing to protect, and as buffer text the whole span
 ;; and that is where a `line-prefix' on it would be drawn.
 (defvar-local jsonyter--nb-numbers-active nil
   "Non-nil while this notebook buffer shows per-cell line numbers.")
+
+(defvar display-fill-column-indicator-column)
+
+(defvar-local jsonyter--nb-indicator-restore nil
+  "How to undo `jsonyter--nb-shift-fill-column-indicator'.
+Either (set . VALUE), the buffer's own value of
+`display-fill-column-indicator-column', or the symbol `kill'.")
 
 (defun jsonyter--nb-source-end (cell)
   "Position where CELL's source ends and its rendered output begins.
@@ -3465,11 +3473,11 @@ marked stale."
           (jsonyter--nb-refresh-output ov))))))
 
 (defun jsonyter--nb-forget-cells ()
-  "Delete every cell overlay in this buffer, and each one's source-end marker.
-Overlays outlive `erase-buffer' (they collapse to empty ones at the top),
-so a re-render must forget the cells it is replacing.  Uses
-`jsonyter--nb-cells' to find them; each cell's `jsonyter-source-end'
-property is a marker, to be detached with (set-marker MARKER nil)."
+  "Delete every cell overlay in this buffer, with its source-end marker.
+`erase-buffer' does not remove overlays: each cell's overlay survives as
+an empty one at the top of the buffer.  A re-render must therefore forget
+the cells it replaces, or every revert stacks another full set of empty
+cells there, each still drawing its prompt."
   (dolist (cell (jsonyter--nb-cells))
     (let ((marker (overlay-get cell 'jsonyter-source-end)))
       (when (markerp marker)
@@ -3478,10 +3486,11 @@ property is a marker, to be detached with (set-marker MARKER nil)."
     )
 
 (defun jsonyter--nb-drop-empty-cells ()
-  "Delete every cell overlay that covers no text, and return how many.
-A cell is empty here when its overlay start equals its overlay end.
-Also detach its `jsonyter-source-end' marker.  Cells that cover text are
-left alone.  Uses `jsonyter--nb-cells'."
+  "Delete every cell overlay that covers no text; return how many.
+Such an overlay is what a cell leaves behind when everything it covered
+is deleted, and it no longer names a line of the notebook.  The
+overlay's `jsonyter-source-end' marker is detached too.  Cells that
+cover text are left alone."
   (let ((count 0))
     (dolist (cell (jsonyter--nb-cells))
       (when (= (overlay-start cell) (overlay-end cell))
@@ -3493,21 +3502,13 @@ left alone.  Uses `jsonyter--nb-cells'."
     count))
 
 (defun jsonyter--nb-adopt-stray-text ()
-  "Bring text after the last cell into a cell; return t if there was any.
-Stray text is any text between the end of the last cell's overlay and
-`point-max' (for example what the user types after the final newline).
-Returns nil, doing nothing, when there is none or there are no cells.
-Otherwise, with `jsonyter--nb-cell-surgery' bound to t:
-1. If the buffer text does not end in a newline, insert one at
-   `point-max', keeping point where it was (use `save-excursion').
-2. If the last cell shows no output (its `jsonyter-source-end' marker is
-   at or past its overlay end), extend its overlay to `point-max' with
-   `move-overlay' and move its source-end marker there too.
-3. Otherwise create a new code cell over the stray text with
-   (jsonyter--nb-make-cell START (point-max)
-                            (list :id nil :cell_type \"code\" :outputs nil))
-   where START is the old end of the last cell's overlay.
-Bind `inhibit-read-only' to t while doing this."
+  "Bring text typed after the last cell into a cell; return t if there was any.
+Cells tile the buffer, so text past the end of the last cell belongs to
+none of them and a save would not write it.  It joins the last cell, or,
+when that cell shows output, a new code cell, so that it never becomes
+part of the read-only output block.  A missing final newline is
+supplied, and point stays where it was.  Return nil, changing nothing,
+when there is no such text or no cells."
   (let* ((cells (jsonyter--nb-cells))
          (last (if (null cells) nil (car (last cells))))
          (start (if last (overlay-end last) nil)))
@@ -3530,9 +3531,8 @@ Bind `inhibit-read-only' to t while doing this."
 
 (defun jsonyter--nb-empty-cell-p (cell)
   "Non-nil when CELL has blank source and shows no output.
-Blank means `string-blank-p' of (jsonyter--nb-cell-source CELL).  A cell
-shows output when its `jsonyter-source-end' marker is before its overlay
-end."
+Blank means nothing but whitespace.  A blank cell that still shows
+output is not empty."
   (and (string-blank-p (jsonyter--nb-cell-source cell))
         (>= (marker-position (overlay-get cell 'jsonyter-source-end))
             (overlay-end cell))))
@@ -3540,14 +3540,12 @@ end."
 ;;;###autoload
 (defun jsonyter-notebook-prune ()
   "Delete every empty cell in this notebook; return how many were removed.
-First call `jsonyter--nb-ensure-notebook'.  Then drop zero-length cells
-\(`jsonyter--nb-drop-empty-cells'), and delete each cell for which
-`jsonyter--nb-empty-cell-p' is true with `jsonyter--nb-excise-cell' --
-but never the notebook's last remaining cell (stop excising when only
-one cell is left).  The count removed includes the dropped zero-length
-cells.  When it is above zero, mark the buffer modified with
-\(set-buffer-modified-p t).  Always `message' the result, \"jsonyter:
-removed N empty cell(s)\" or \"jsonyter: no empty cells\"."
+A cell is empty when its source is blank and it shows no output; one
+that is blank but shows output is kept, and so is the notebook's last
+remaining cell.  Cells that have collapsed to nothing, which an old
+re-render could leave behind, are removed and counted too.  When
+anything was removed the buffer is marked modified; either way the
+result is reported in the echo area."
   (interactive)
   (jsonyter--nb-ensure-notebook)
   (let ((removed (jsonyter--nb-drop-empty-cells)))
@@ -3652,9 +3650,41 @@ not carry its numbers into whatever it is pasted into."
                                   '(line-prefix wrap-prefix) string)
   string)
 
+(defun jsonyter--nb-shift-fill-column-indicator ()
+  "Move the fill-column indicator right by the width of a number gutter.
+Per-cell numbers are a `line-prefix', which lies inside the text area,
+and `display-fill-column-indicator' counts columns from the left edge of
+that area, so without this it is drawn that many columns before the point
+where source text reaches the fill column: a line of exactly `fill-column'
+characters would cross it.  Emacs's own numbers sit outside the text area
+and need no such shift.  The shift is the narrowest gutter, that of a cell
+under a hundred lines; a longer cell's gutter is a column wider, so its
+text ends a column past the indicator.  The indicator follows
+`fill-column' as it was when the numbers started."
+  (setq jsonyter--nb-indicator-restore
+        (if (local-variable-p 'display-fill-column-indicator-column)
+            (cons 'set display-fill-column-indicator-column)
+          'kill))
+  (setq-local display-fill-column-indicator-column
+              (+ (if (and (boundp 'display-fill-column-indicator-column)
+                          (integerp display-fill-column-indicator-column))
+                     display-fill-column-indicator-column
+                   fill-column)
+                 (1+ (jsonyter--nb-number-digits 1)))))
+
+(defun jsonyter--nb-restore-fill-column-indicator ()
+  "Undo `jsonyter--nb-shift-fill-column-indicator'."
+  (pcase jsonyter--nb-indicator-restore
+    (`(set . ,value)
+     (setq-local display-fill-column-indicator-column value))
+    ('kill
+     (kill-local-variable 'display-fill-column-indicator-column)))
+  (setq jsonyter--nb-indicator-restore nil))
+
 (defun jsonyter--nb-numbers-activate ()
   "Start showing per-cell numbers in this notebook buffer."
   (setq jsonyter--nb-numbers-active t)
+  (jsonyter--nb-shift-fill-column-indicator)
   (add-function :filter-return (local 'filter-buffer-substring-function)
                 #'jsonyter--nb-strip-number-props)
   (dolist (cell (jsonyter--nb-cells))
@@ -3668,6 +3698,7 @@ the number and, when `display-line-numbers-mode' is on, gives the buffer
 Emacs's own numbers back."
   (when jsonyter--nb-numbers-active
     (setq jsonyter--nb-numbers-active nil)
+    (jsonyter--nb-restore-fill-column-indicator)
     (remove-function (local 'filter-buffer-substring-function)
                      #'jsonyter--nb-strip-number-props)
     (with-silent-modifications
@@ -4304,16 +4335,12 @@ ARG is the raw prefix argument or a Lisp caller's value:
    (t "markdown")))
 
 (defun jsonyter--nb-set-type (cell type)
-  "Change cell overlay CELL to TYPE, one of \"code\", \"markdown\", \"raw\".
-Any other TYPE signals (user-error \"jsonyter: unknown cell type %s\" TYPE)
-before anything is changed.  Otherwise, in order:
-1. store TYPE in the overlay property `jsonyter-cell-type';
-2. clear the overlay property `jsonyter-exec-count' (set it to nil);
-3. clear the cell's output with (jsonyter--nb-set-output CELL \"\");
-4. redraw the prompt with (jsonyter--nb-refresh-prompt CELL);
-5. flush syntax and font-lock state for the cell's span:
-   (syntax-ppss-flush-cache (overlay-start CELL)) and
-   (font-lock-flush (overlay-start CELL) (overlay-end CELL))."
+  "Change cell overlay CELL to TYPE: \"code\", \"markdown\" or \"raw\".
+Any other TYPE signals a `user-error' before anything changes.  The
+cell's execution count and output are dropped, since only a code cell
+can carry them; its source is untouched.  The prompt is redrawn and the
+cell's syntax and font-lock state refreshed, so a former code cell stops
+being highlighted as code."
   (if (not (member type '("code" "markdown" "raw")))
       (user-error "jsonyter: unknown cell type %s" type)
     (overlay-put cell 'jsonyter-cell-type type)
@@ -4326,11 +4353,10 @@ before anything is changed.  Otherwise, in order:
 ;;;###autoload
 (defun jsonyter-set-cell-type (type)
   "Set the cell at point to TYPE: \"code\", \"markdown\" or \"raw\".
-Interactively, read TYPE with `completing-read' over those three names,
-requiring a match.  Call `jsonyter--nb-ensure-notebook' first, then find
-the cell with `jsonyter--nb-cell-at' (signal (user-error \"No cell at
-point\") when there is none), change it with `jsonyter--nb-set-type', and
-`message' \"jsonyter: cell is now TYPE\"."
+Interactively, read TYPE with completion over those three names.
+Changing the type drops the cell's output and execution count (see
+`jsonyter--nb-set-type').  Signal a `user-error' outside a notebook,
+when there is no cell at point, or for any other TYPE."
   (interactive (list (completing-read "Cell type: " '("code" "markdown" "raw") nil t)))
   (jsonyter--nb-ensure-notebook)
   (let ((cell (jsonyter--nb-cell-at)))
@@ -4788,26 +4814,25 @@ The lines of `jsonyter-notebook-latex-macros' follow them."
 (defconst jsonyter--latex-bracket-regexps
   '(("\\\\\\[\\(\\(?:.\\|\n\\)*?\\)\\\\\\]" . display)
     ("\\\\(\\(\\(?:.\\|\n\\)*?\\)\\\\)" . inline))
-  "Alist of (REGEXP . KIND) for `\\[...\\]' and `\\(...\\)'; group 1 is the TeX.")
+  "Alist of (REGEXP . KIND) for the backslash-bracket and backslash-paren forms.
+Group 1 of each regexp is the TeX inside.")
 
 (defun jsonyter--latex-mask-code (text)
-  "Return TEXT with every character inside code replaced by a space.
-Code means a fenced block (`jsonyter--latex-fence-regexp') or an inline
+  "Return TEXT with the characters inside code replaced by spaces.
+Code is a fenced block (`jsonyter--latex-fence-regexp') or an inline
 span (`jsonyter--latex-code-span-regexp').  Newlines are kept, so the
-result has TEXT's length and line structure, and an offset found in it
-is an offset in TEXT.  Mask fences first, then spans, each with
-`replace-regexp-in-string' and a function that returns its match with
-every character except newline replaced by a space."
+result has TEXT's length and line structure and an offset found in it
+is an offset in TEXT.  This keeps a dollar sign inside code from being
+read as math."
   (let ((blank (lambda (match) (replace-regexp-in-string "[^\n]" " " match))))
     (let ((text (replace-regexp-in-string jsonyter--latex-fence-regexp blank text)))
       (replace-regexp-in-string jsonyter--latex-code-span-regexp blank text))))
 
 (defun jsonyter--latex-find-envs (text)
-  "Return the math environments in TEXT, as (BEG END env BODY) lists.
+  "Return the math environments in TEXT as a list of (BEG END env BODY).
 BEG and END are string offsets, END exclusive, and BODY is the whole
-matched text, \\begin and \\end included.  Search with `string-match' on
-`jsonyter--latex-env-regexp' from offset 0, continuing from each match
-end.  The result is in text order, nil when there are none."
+matched text, the opening and closing environment markers included.
+The list is in text order, nil when there are none."
   (let ((pos 0)
         (out nil))
     (while (string-match jsonyter--latex-env-regexp text pos)
@@ -4820,10 +4845,9 @@ end.  The result is in text order, nil when there are none."
     (nreverse out)))
 
 (defun jsonyter--latex-find-display-dollars (text)
-  "Return the `$$...$$' fragments in TEXT, as (BEG END display BODY).
-BODY is the TeX between the dollars (group 1 of
-`jsonyter--latex-display-dollars-regexp').  Search with `string-match'
-from offset 0, continuing from each match end.  Text order, nil if none."
+  "Return the double-dollar fragments in TEXT as (BEG END display BODY) lists.
+BODY is the TeX between the dollars.  The list is in text order, nil
+when there are none."
   (let ((pos 0)
         (out nil))
     (while (string-match jsonyter--latex-display-dollars-regexp text pos)
@@ -4836,11 +4860,10 @@ from offset 0, continuing from each match end.  Text order, nil if none."
     (nreverse out)))
 
 (defun jsonyter--latex-find-brackets (text)
-  "Return the `\\[...\\]' and `\\(...\\)' fragments in TEXT.
-Each is (BEG END KIND BODY): KIND is `display' for `\\[' and `inline' for
-`\\(', BODY is the TeX inside.  Use each (REGEXP . KIND) of
-`jsonyter--latex-bracket-regexps' with `string-match', continuing from
-each match end, then sort the combined list by BEG."
+  "Return the backslash-bracket and backslash-parenthesis fragments in TEXT.
+Each is (BEG END KIND BODY): KIND is `display' for the bracket form and
+`inline' for the parenthesis form, and BODY is the TeX inside.  The
+list is in text order, nil when there are none."
   (let ((out nil))
     (dolist (spec jsonyter--latex-bracket-regexps)
       (let ((pos 0))
@@ -4874,14 +4897,10 @@ a backslash, or when the character after it is a digit (which is how
                (and after (<= ?0 after ?9))))))
 
 (defun jsonyter--latex-inline-find-close (text open)
-  "Return the offset of the dollar sign closing the one opened at OPEN, or nil.
-Look at each dollar sign after OPEN in turn (`string-match' on \"\\\\$\"
-from OPEN plus one, continuing from just past each candidate): when the
-text between OPEN plus one and the candidate contains a blank line (a
-newline, optional spaces or tabs, a newline: test it with
-`string-match-p' on \"\\n[ \\t]*\\n\"), give up and return nil; when
-`jsonyter--latex-inline-close-p' accepts the candidate, return its
-offset; otherwise go on to the next.  Return nil when none is left."
+  "Return the offset of the dollar sign that closes the one opened at OPEN.
+Return nil if there is none.  A blank line between the two ends the
+search, since inline math does not span paragraphs, and a candidate
+that `jsonyter--latex-inline-close-p' refuses is skipped."
   (let ((search (1+ open)) (n (length text)) close)
     (while (and (not close) (< search n) (string-match "\\$" text search))
       (let ((c (match-beginning 0)))
@@ -4893,15 +4912,12 @@ offset; otherwise go on to the next.  Return nil when none is left."
     close))
 
 (defun jsonyter--latex-find-inline-dollars (text)
-  "Return the inline `$...$' fragments in TEXT, as (BEG END inline BODY).
+  "Return the inline dollar fragments in TEXT as (BEG END inline BODY) lists.
 BEG is the offset of the opening dollar, END is one past the closing
-dollar, BODY is the TeX between them.  Scan TEXT from offset 0 with
-`string-match' on a literal dollar sign.  For each dollar at OPEN: when
-`jsonyter--latex-inline-open-p' accepts it and
-`jsonyter--latex-inline-find-close' returns a CLOSE, collect
-\(OPEN (1+ CLOSE) \\='inline (substring text (1+ OPEN) CLOSE)) and resume
-scanning at (1+ CLOSE); otherwise resume at (1+ OPEN).  Text order; nil
-when there are none."
+dollar, and BODY is the TeX between them.  A dollar sign that cannot
+open or close math, such as an escaped one or a price, is skipped (see
+`jsonyter--latex-inline-open-p' and `jsonyter--latex-inline-close-p').
+The list is in text order, nil when there are none."
   (let ((pos 0) (n (length text)) out)
     (while (and (< pos n) (string-match "\\$" text pos))
       (let* ((open (match-beginning 0))
@@ -4918,13 +4934,11 @@ when there are none."
 
 (defun jsonyter--latex-fragments (text)
   "Return every math fragment in TEXT as (BEG END KIND BODY), in text order.
-KIND is `inline', `display' or `env'.  Start with WORK, the result of
-`jsonyter--latex-mask-code' on TEXT.  Run these finders on WORK in this
-order: `jsonyter--latex-find-envs', `jsonyter--latex-find-display-dollars',
-`jsonyter--latex-find-brackets', `jsonyter--latex-find-inline-dollars'.
-After each finder, collect its fragments and blank their spans in WORK
-\(every character except newline becomes a space) before the next finder
-runs, so no span is found twice.  Sort the collected fragments by BEG."
+KIND is `inline', `display' or `env'.  Code is ignored (see
+`jsonyter--latex-mask-code').  A span claimed by one form of math is not
+claimed again by another: environments win over double dollars, those
+over the backslash-bracket and backslash-parenthesis forms, and those
+over single dollars."
   (let ((work (jsonyter--latex-mask-code text))
         (found nil))
     (dolist (finder '(jsonyter--latex-find-envs
@@ -4940,14 +4954,12 @@ runs, so no span is found twice.  Sort the collected fragments by BEG."
     (sort found (lambda (a b) (< (car a) (car b))))))
 
 (defun jsonyter--latex-document (body kind)
-  "Return a complete LaTeX document that typesets fragment BODY.
-KIND is `inline', `display' or `env'.  The document is, in order: the
-line \\documentclass[12pt]{article}, `jsonyter-latex-preview-preamble',
-the lines of `jsonyter-notebook-latex-macros' (each on its own line, if
-there are any), the lines \\pagestyle{empty} and \\begin{document}, the
-fragment, and \\end{document} with a final newline.  The fragment is $BODY$
-for `inline', \\[BODY\\] for `display', and BODY unchanged for `env'.
-Every line is newline-terminated."
+  "Return a complete LaTeX document that typesets the fragment BODY.
+KIND is `inline', `display' or `env' and decides how BODY is wrapped: in
+dollar signs, in display brackets, or not at all, since an environment
+brings its own.  The document is an article with an empty page style,
+and `jsonyter-latex-preview-preamble' and the lines of
+`jsonyter-notebook-latex-macros' come ahead of the body."
   (concat "\\documentclass[12pt]{article}\n"
          (concat jsonyter-latex-preview-preamble "\n")
          (concat (mapconcat #'identity jsonyter-notebook-latex-macros "\n")
@@ -4974,9 +4986,9 @@ that name, else nil."
 
 (defun jsonyter--latex-cache-file (document converter dpi fg)
   "Return the cache path of the image for DOCUMENT rendered by CONVERTER.
-The name is the SHA-1 (`secure-hash') of the string made by
-\(format \"%s\\n%s\\n%s\\n%s\" DOCUMENT CONVERTER DPI FG), then \".svg\" when
-CONVERTER is `dvisvgm' and \".png\" otherwise, expanded in
+The name is a hash of DOCUMENT, CONVERTER, DPI and FG, so changing any
+of them gives a new file, and it ends in `.svg' for `dvisvgm' and
+`.png' otherwise.  The file lives in
 `jsonyter-latex-preview-cache-directory'."
   (expand-file-name
    (concat (secure-hash 'sha1 (format "%s\n%s\n%s\n%s" document converter dpi fg))
@@ -4984,11 +4996,9 @@ CONVERTER is `dvisvgm' and \".png\" otherwise, expanded in
    jsonyter-latex-preview-cache-directory))
 
 (defun jsonyter--latex-fg (&optional face)
-  "Return FACE's foreground (default: `default') as a dvipng colour string.
-Take (face-foreground (or FACE \\='default) nil \\='default); when that is a
-string `color-name-to-rgb' understands, format it as
-\"rgb R G B\" with three-decimal components, e.g. \"rgb 1.000 0.000 0.000\";
-otherwise return \"rgb 0.000 0.000 0.000\"."
+  "Return FACE's foreground, default `default', as a dvipng colour string.
+The result looks like \"rgb 1.000 0.000 0.000\".  A colour Emacs cannot
+resolve gives black."
   (let* ((color (face-foreground (or face 'default) nil 'default))
          (rgb (and (stringp color) (color-name-to-rgb color))))
     (if rgb
@@ -5009,24 +5019,15 @@ otherwise return \"rgb 0.000 0.000 0.000\"."
        "unknown error"))
 
 (defun jsonyter--latex-render (document converter dpi fg)
-  "Typeset DOCUMENT into an image file and return its path, using a cache.
-The path is `jsonyter--latex-cache-file' for the same arguments; when
-that file exists return it without running anything.  Otherwise, in a
-fresh temporary directory (`make-temp-file' with a non-nil DIR-FLAG),
-with `default-directory' bound to it:
-1. write DOCUMENT to doc.tex there;
-2. run (call-process \"latex\" nil nil nil \"-interaction=nonstopmode\"
-   \"-halt-on-error\" \"doc.tex\"); a result other than 0 signals
-   (user-error \"jsonyter: LaTeX failed: %s\" ERROR-LINE) where ERROR-LINE
-   is `jsonyter--latex-first-error' of doc.log in that directory;
-3. for `dvisvgm' run (call-process \"dvisvgm\" nil nil nil \"--no-fonts\"
-   \"--exact\" \"-o\" \"doc.svg\" \"doc.dvi\"); otherwise run
-   (call-process \"dvipng\" nil nil nil \"-T\" \"tight\" \"-D\" DPI-AS-STRING
-   \"-bg\" \"Transparent\" \"-fg\" FG \"-o\" \"doc.png\" \"doc.dvi\"); a result
-   other than 0 signals (user-error \"jsonyter: %s failed\" CONVERTER);
-4. create the cache directory (`make-directory' with PARENTS t) and
-   `copy-file' the image there, overwriting.
-Always delete the temporary directory afterwards (`unwind-protect')."
+  "Typeset DOCUMENT into an image file and return its path.
+Images are cached: when `jsonyter--latex-cache-file' already exists for
+these arguments it is returned without running anything.  Otherwise
+`latex' runs on DOCUMENT in a temporary directory, CONVERTER (`dvipng'
+or `dvisvgm') turns the result into an image at DPI dots per inch in
+colour FG, and the image is copied into the cache; the temporary
+directory is always removed.  Signal a `user-error' carrying LaTeX's
+first error line when `latex' fails, or naming CONVERTER when it
+fails."
   (let ((out (jsonyter--latex-cache-file document converter dpi fg)))
     (unless (file-exists-p out)
       (let* ((dir (make-temp-file "jsonyter-latex-" t))
@@ -5055,10 +5056,9 @@ Always delete the temporary directory afterwards (`unwind-protect')."
 
 (defun jsonyter--latex-image (file)
   "Return a `display' value showing the image FILE.
-The type is `svg' when FILE ends in \".svg\", else `png'.  When
-\(display-images-p) and (image-type-available-p TYPE) are both true,
-return (create-image FILE TYPE nil :ascent \\='center); otherwise return
-the placeholder string (format \"[math: %s]\" (file-name-nondirectory FILE))."
+That is an `svg' or `png' image, by the file's extension, centered on
+its line, when this Emacs can display one; otherwise a short
+placeholder string naming the file."
   (let ((type (if (string-suffix-p ".svg" file) 'svg 'png)))
     (if (and (display-images-p) (image-type-available-p type))
         (create-image file type nil :ascent 'center)
@@ -5066,11 +5066,8 @@ the placeholder string (format \"[math: %s]\" (file-name-nondirectory FILE))."
 
 (defun jsonyter--latex-check-tools ()
   "Signal a `user-error' unless LaTeX preview can run; return nil if it can.
-Without `latex' (`executable-find') signal
-\(user-error \"jsonyter: LaTeX preview needs `latex\\=' on the exec-path\").
-Without a converter (`jsonyter--latex-converter') signal
-\(user-error \"jsonyter: LaTeX preview needs `dvipng\\='
-or `dvisvgm\\=' on the exec-path\")."
+Preview needs `latex' and either `dvipng' or `dvisvgm' on the
+`exec-path'; the error names what is missing."
   (unless (executable-find "latex")
     (user-error "jsonyter: LaTeX preview needs `latex' on the exec-path"))
   (unless (jsonyter--latex-converter)
@@ -5089,27 +5086,19 @@ overlays are left alone."
 
 (defun jsonyter--nb-latex-overlay-modified (ov after _beg _end &optional _len)
   "Delete preview overlay OV when the text under it is about to change.
-Used in the overlay's `modification-hooks': it is called before (AFTER
-nil) and after (AFTER non-nil) a change.  Delete OV only before."
+For an overlay's `modification-hooks': it runs before and after a change
+and acts only before, so the source reappears as soon as it is edited."
   (unless after (delete-overlay ov)))
 
 (defun jsonyter--nb-latex-preview-cell (cell)
-  "Show the math in markdown cell overlay CELL as images; return the count.
-First delete the cell's old previews (`jsonyter--nb-latex-clear' over the
-cell).  Then for each fragment of `jsonyter--latex-fragments' applied to
-\(jsonyter--nb-cell-source CELL): build the document
-\(`jsonyter--latex-document' with the fragment's BODY and KIND), render it
-with (jsonyter--latex-render DOC CONVERTER jsonyter-latex-preview-dpi FG)
-where CONVERTER is (jsonyter--latex-converter) and FG is
-\(jsonyter--latex-fg) computed once, and make an overlay over the
-fragment's text -- offsets are relative to the cell's source, which
-starts at (overlay-start CELL).  Put on it: `jsonyter-latex-preview' t,
-`display' (jsonyter--latex-image FILE), `evaporate' t, `help-echo' the
-fragment's BODY, `modification-hooks'
-\(list \\='jsonyter--nb-latex-overlay-modified).
-A `user-error' from rendering is caught per fragment: say
-\(message \"jsonyter: LaTeX preview skipped -- %s\" MESSAGE) and go on.
-Count only the fragments that got an overlay."
+  "Show the math in markdown cell CELL as images; return how many were shown.
+Previews already in CELL are replaced.  Each fragment of the cell's
+source (see `jsonyter--latex-fragments') is typeset at
+`jsonyter-latex-preview-dpi', in the buffer's foreground colour, and
+covered by an overlay that displays the image, shows the TeX as its
+tooltip and is deleted when the text beneath it is edited.  A fragment
+that fails to typeset is skipped, with LaTeX's first error line in the
+echo area, and does not stop the others."
   (let* ((start (overlay-start cell))
          (source (jsonyter--nb-cell-source cell))
          (fg (jsonyter--latex-fg))
@@ -5135,10 +5124,8 @@ Count only the fragments that got an overlay."
     count))
 
 (defun jsonyter--nb-latex-markdown-cells ()
-  "Return the cells that can be previewed: markdown, not the macros cell.
-Filter `jsonyter--nb-cells' to those whose `jsonyter-cell-type' property
-is \"markdown\" and that are not the cell `jsonyter--nb-latex-cell'
-returns (the managed LaTeX-macros cell)."
+  "Return the cells that can be previewed.
+Those are the markdown cells other than the managed LaTeX macros cell."
   (let ((macros (jsonyter--nb-latex-cell)))
     (seq-filter (lambda (c)
                   (and (equal (overlay-get c 'jsonyter-cell-type) "markdown")
@@ -5147,9 +5134,9 @@ returns (the managed LaTeX-macros cell)."
 
 (defun jsonyter--nb-latex-target-cells (all)
   "Return the cells a preview command acts on.
-With ALL non-nil, `jsonyter--nb-latex-markdown-cells'.  Otherwise a list
-of just the cell at point (`jsonyter--nb-cell-at') when it is one of
-those, else signal (user-error \"jsonyter: not a markdown cell\")."
+With ALL, every previewable cell; otherwise only the cell at point, which
+must be a markdown cell other than the macros cell, or a `user-error' is
+signalled."
   (if all
       (jsonyter--nb-latex-markdown-cells)
     (let ((cell (jsonyter--nb-cell-at)))
@@ -5160,11 +5147,11 @@ those, else signal (user-error \"jsonyter: not a markdown cell\")."
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview (&optional all)
   "Show the math in the markdown cell at point as images.
-With a prefix argument ALL, do it for every markdown cell.  Needs `latex'
-and `dvipng' or `dvisvgm'.  Call `jsonyter--nb-ensure-notebook', then
-`jsonyter--latex-check-tools', then `jsonyter--nb-latex-preview-cell' on
-each of `jsonyter--nb-latex-target-cells'.  `message' \"jsonyter:
-previewed N LaTeX fragment(s)\" (\"fragment\" when N is 1) and return N."
+With a prefix argument ALL, do it for every markdown cell.  The math it
+finds is dollar-delimited (single or double), the backslash-bracket and
+backslash-parenthesis forms, and the amsmath environments; code blocks
+and spans are skipped.  Needs `latex' and `dvipng' or `dvisvgm'.  Report
+how many fragments were previewed and return that number."
   (interactive "P")
   (jsonyter--nb-ensure-notebook)
   (jsonyter--latex-check-tools)
@@ -5177,10 +5164,8 @@ previewed N LaTeX fragment(s)\" (\"fragment\" when N is 1) and return N."
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview-clear (&optional all)
   "Remove LaTeX preview images from the cell at point; with ALL, every cell.
-Call `jsonyter--nb-ensure-notebook'.  The cells are `jsonyter--nb-cells'
-with ALL, else just the cell at point (none if there is no cell).  Clear
-each cell's span with `jsonyter--nb-latex-clear', `message' \"jsonyter:
-removed N LaTeX preview(s)\" (\"preview\" when N is 1) and return N."
+The source text underneath is untouched.  Report how many previews were
+removed and return that number."
   (interactive "P")
   (jsonyter--nb-ensure-notebook)
   (let ((n 0))
@@ -5195,12 +5180,8 @@ removed N LaTeX preview(s)\" (\"preview\" when N is 1) and return N."
 ;;;###autoload
 (defun jsonyter-notebook-latex-preview-toggle (&optional all)
   "Preview the markdown cell at point, or clear it if previews are showing.
-With ALL, act on every cell.  Call `jsonyter--nb-ensure-notebook'.  The
-previews are showing when any preview overlay (a non-nil
-`jsonyter-latex-preview' property) lies within the span of any of the
-cells: `jsonyter--nb-cells' with ALL, else just the cell at point.  If
-showing, call `jsonyter-notebook-latex-preview-clear' with ALL; else
-call `jsonyter-notebook-latex-preview' with ALL."
+With a prefix argument ALL, act on every cell: previews are cleared
+when any cell has one showing, and made otherwise."
   (interactive "P")
   (jsonyter--nb-ensure-notebook)
   (let* ((cells (if all
@@ -7143,11 +7124,11 @@ Return t when it was created, nil when it already existed."
   "Create each missing level of REMOTE on BUFFER's server, outermost first.
 REMOTE is a Contents-API directory path such as \"work/new/deep\";
 surrounding slashes are ignored (see `jsonyter--sync-clean-remote').
-The server's `make_directory' makes exactly one level, so every
-cumulative prefix (\"work\", \"work/new\", \"work/new/deep\") is probed
-with `list_contents' first.  Signals a `user-error' when a level exists
-but is not a directory.  Returns the list of paths created, in order,
-or nil when everything already existed or REMOTE is empty."
+The server's `make_directory' makes exactly one level, so each level is
+created in turn and only when it does not already exist.  Signal a
+`user-error' when a level exists but is not a directory.  Return the
+list of paths created, in order, or nil when everything already existed
+or REMOTE is empty."
   (let ((prefix nil) (created nil))
     (dolist (part (split-string (jsonyter--sync-clean-remote remote) "/" t))
       (setq prefix (if prefix (concat prefix "/" part) part))
@@ -7172,9 +7153,10 @@ directory (the same kernel-cwd probe transfer commands use) and PERSIST
 asks whether to save it now via `customize-save-variable'; a Lisp caller
 gets a session-local pair unless PERSIST is non-nil.
 
-With CREATE-DIRS (always when called interactively) a missing LOCAL or REMOTE
-directory is created before the pair is recorded, and a REMOTE path blocked by
-a file signals a `user-error`."
+With CREATE-DIRS (always when called interactively) a missing LOCAL or
+REMOTE directory is created, parents included, before the pair is
+recorded.  A REMOTE path that exists but is a file signals a
+`user-error', and nothing is recorded."
   (interactive
    (let* ((context (jsonyter--resolve-transfer-context))
           (buffer (car context))
