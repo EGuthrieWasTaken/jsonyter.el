@@ -322,3 +322,31 @@
                      "no cell text may carry a per-cell number")
     (eh-expect (seq-every-p #'null (jy-cell-numbers 1))
                "no line may show a per-cell number")))
+
+(eh-scenario jsonyter/notebook-reloads-do-not-pile-up-cell-overlays
+  :doc "A notebook reloads whenever the file changes under it -- a sync, a
+        `git pull', `revert-buffer'.  `erase-buffer' leaves overlays
+        behind, so a reload that did not forget the cells it replaced
+        stacked a new set of empty ones at the top, each still drawing its
+        prompt, and the next newline typed there took redisplay seconds
+        (17 s after twenty reloads of a real analysis notebook, with the
+        reporter's packages).  Redisplay cannot be timed here, so this
+        asserts its cause: one string-drawing overlay per cell, however
+        often the notebook is reloaded, and none added by an edit at the
+        top."
+  :fixture "demo.ipynb"
+  :tags (jsonyter notebook)
+
+  (let ((cells (length (jy-cells)))
+        (strings (lambda ()
+                   (length (seq-filter (lambda (o) (overlay-get o 'before-string))
+                                       (overlays-in (point-min) (point-max)))))))
+    (dotimes (_ 30) (revert-buffer t t))
+    (eh-expect-equal (length (jy-cells)) cells
+                     "reloading must not add cells")
+    (eh-expect-equal (funcall strings) cells
+                     "reloading must not leave overlays drawing prompts behind")
+    (goto-char (point-min))
+    (execute-kbd-macro (kbd "RET"))
+    (eh-expect-equal (funcall strings) cells
+                     "a newline at the top must not add anything to draw there")))
