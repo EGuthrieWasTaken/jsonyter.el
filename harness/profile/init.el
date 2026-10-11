@@ -207,6 +207,40 @@ and fails in CI."
          (end (overlay-end cell)))
     (and (< beg end) (list beg end))))
 
+(defmacro jy-with-line-numbers (fixture &rest body)
+  "Open FIXTURE with line numbers on, as a `prog-mode-hook' line does, run BODY.
+The hook is global and so is `jsonyter-notebook-line-numbers', which BODY
+may set: both are put back whatever happens, or every later scenario in
+the session would be opened with line numbers it did not ask for."
+  (declare (indent 1))
+  `(progn
+     (add-hook 'prog-mode-hook #'display-line-numbers-mode)
+     (unwind-protect
+         (progn (eh-open-fixture ,fixture) ,@body)
+       (setq jsonyter-notebook-line-numbers 'cell)
+       (remove-hook 'prog-mode-hook #'display-line-numbers-mode))))
+
+(defun jy-cell-numbers (n)
+  "The per-cell line numbers shown beside cell N's source, one per line.
+The first line's number is the tail of the cell's prompt string and the
+others are `line-prefix' text properties; a line showing none is nil."
+  (let* ((cell (jy-cell n))
+         (tail (car (last (split-string (overlay-get cell 'before-string) "\n"))))
+         (end (marker-position (overlay-get cell 'jsonyter-source-end)))
+         numbers first)
+    (save-excursion
+      (goto-char (overlay-start cell))
+      (setq first t)
+      (while (< (point) end)
+        (push (if first
+                  (and (not (string-empty-p tail)) (string-to-number tail))
+                (let ((prefix (get-text-property (point) 'line-prefix)))
+                  (and prefix (string-to-number prefix))))
+              numbers)
+        (setq first nil)
+        (forward-line 1)))
+    (nreverse numbers)))
+
 (defun jy-cell-has-output-p (n)
   "Non-nil once cell N has rendered output."
   (let ((region (jy-cell-output-region n)))

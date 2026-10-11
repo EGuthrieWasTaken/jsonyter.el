@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.4.1/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.0/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.4.1/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.4.1"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.0"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.4.1"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.0"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -183,6 +183,7 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-image-max-width` | `800` | Max pixel width for inline images (a REPL; in a notebook or script cell `jsonyter-notebook-output-width` also applies). |
 | `jsonyter-image-max-height` | `nil` | Max pixel height for inline images. |
 | `jsonyter-notebook-output-width` | `80` | Columns wide the rules framing a notebook/script cell's output are drawn, and the column ceiling an image in that output is scaled to line up with them. |
+| `jsonyter-notebook-line-numbers` | `cell` | With line numbers on, number each cell's lines from 1 within the cell (`cell`) or leave Emacs's own numbering alone (`buffer`). See [Line numbers](#line-numbers). |
 | `jsonyter-slice-images` | `t` | Slice tall images one line per row so they scroll (REPL and notebook buffers). |
 | `jsonyter-suppress-line-spacing` | `t` | Drop `line-spacing` in REPL and notebook buffers, where its leading would band a sliced image. |
 | `jsonyter-render-html` | `t` | Render `text/html` output with shr. |
@@ -449,13 +450,14 @@ refresh.
 | `C-c M-h` | Show the kernel's most recent commands |
 | `C-c M-o` / `C-c M-O` | Clear this cell's output / all output |
 | `C-c C-k` | Start the kernel explicitly |
-| `C-c C-i` / `C-c C-a` | Insert a cell below / above (`C-u` for markdown) |
+| `C-c C-i` / `C-c C-a` | Insert a cell below / above (`C-u` for markdown, `C-u C-u` for raw) |
 | `C-c C-w` | Delete the cell at point |
-| `C-c C-t` | Toggle the cell between code and markdown |
+| `C-c C-t` | Cycle the cell code → markdown → raw → code |
 | `C-c <up>` / `C-c <down>` | Move the cell up / down |
 | `C-x C-s` | Save cell source |
 | `C-c C-s` | Save cell source and this session's new outputs |
 | `C-c C-x` | Export to HTML, PDF, ... (`jsonyter-notebook-export`) |
+| `C-c C-v` | Show the math in this markdown cell as images, or hide it (`C-u`: every cell) — [LaTeX preview](#latex-preview) |
 
 The cell-editing commands are autoloaded under stable public names, so you
 can bind them in your own keymap instead of relying on the defaults above:
@@ -466,12 +468,16 @@ can bind them in your own keymap instead of relying on the defaults above:
 | `jsonyter-insert-cell-above` | `C-c C-a` |
 | `jsonyter-delete-cell` | `C-c C-w` |
 | `jsonyter-toggle-cell-type` | `C-c C-t` |
+| `jsonyter-set-cell-type` | — (`M-x`) |
+| `jsonyter-notebook-prune` | — (`M-x`) |
+| `jsonyter-notebook-latex-preview-toggle` | `C-c C-v` |
 | `jsonyter-move-cell-up` | `C-c <up>` |
 | `jsonyter-move-cell-down` | `C-c <down>` |
 
-Both insert commands take a prefix argument to insert a markdown cell. All
-six require a notebook buffer and signal an error elsewhere, so they are
-safe to bind globally:
+Both insert commands take a prefix argument: `C-u` inserts a markdown
+cell and `C-u C-u` a raw one (a Lisp caller may pass `"code"`,
+`"markdown"` or `"raw"` instead). All of these require a notebook buffer
+and signal an error elsewhere, so they are safe to bind globally:
 
 ```elisp
 (use-package jsonyter
@@ -486,6 +492,69 @@ These were named `jsonyter-notebook-insert-cell-below` and so on through
 `M-x jsonyter-clear` clears every output in the buffer and blanks the
 execution counts, leaving the notebook as though nothing had been run. It
 does the equivalent thing in a REPL or script buffer too.
+
+### Cell types: code, markdown, raw
+
+A notebook has three kinds of cell and all three can be made and
+changed from the keyboard. `C-c C-t` cycles the cell at point
+code → markdown → raw → code; `M-x jsonyter-set-cell-type` jumps straight
+to a type chosen with completion. Insert a cell of a given type with
+`C-u C-c C-i` (markdown) or `C-u C-u C-c C-i` (raw). A raw cell is the
+passthrough kind — LaTeX or reST that `nbconvert` hands to the output
+format untouched — and is saved as `raw` with its source intact; an
+existing raw cell's `format` metadata is preserved. Changing a cell to
+markdown or raw drops its output and execution count (only code cells can
+carry any).
+
+### Empty cells, and typing at the bottom
+
+`M-x jsonyter-notebook-prune` deletes every empty cell — blank source and
+no output — says how many it removed, and never removes the notebook's
+last cell. A cell that is blank but shows output is not empty.
+
+The buffer keeps its cells in step with what you see. If you move past
+the last cell's final newline (`M->`, or `C-n` off the last line) and
+type there, the text goes into the last cell, or into a new code cell if
+the last one shows output; it is never left outside every cell, where a
+save would silently drop it. Backspacing over an empty cell's newline
+removes that cell. Reverting a notebook (`revert-buffer`, or an
+auto-revert after a sync) replaces its cells instead of stacking the old
+ones, empty, at the top — which before 2.5.0 made editing near the top
+slower with every reload.
+
+### Line numbers
+
+With `display-line-numbers-mode` on (or `global-display-line-numbers-mode`),
+a notebook numbers each cell's source lines from 1 *within the cell*, on
+the row that shows the line, and restarts at 1 in every cell — code,
+markdown and raw alike. Prompts, output and images carry no number.
+Emacs's own numbering would count the rows of the rendered view instead:
+the number of a cell's first line lands on the blank row above its
+prompt, and every output row and every row of a sliced image takes a
+number too, so the numbers match neither the cell nor the file.
+
+The numbers are display-only. They are never part of a cell's source, a
+saved file, the undo history, the modified flag or text you copy, and a
+line that wraps continues under its own text. Turning
+`display-line-numbers-mode` off removes them, and on brings them back.
+The mode is how you say you want numbers: a notebook never shows any to
+someone who has them off.
+
+```elisp
+(setq jsonyter-notebook-line-numbers 'buffer)   ; Emacs's own numbers
+```
+
+`jsonyter-notebook-line-numbers` is `cell` by default; `buffer` leaves
+Emacs's numbering alone, as it was before 2.5.0. The option is read when
+line numbers are switched on, so after changing it toggle
+`display-line-numbers-mode` off and on in an open notebook. Per-cell
+numbers replace *absolute* numbering only: with
+`display-line-numbers-type` set to `relative` or `visual` the notebook
+keeps Emacs's numbers. While they are showing, jsonyter owns the
+`line-prefix` and `wrap-prefix` properties on cell source, so a package
+that sets those on the same text (`adaptive-wrap-prefix-mode`, say) will
+fight it — use `buffer` there. `M-g g` still goes to a buffer line, which
+no longer matches the number you see.
 
 ### LaTeX macros
 
@@ -502,6 +571,39 @@ the cell automatically when the option is set.
       '("\\newcommand{\\R}{\\mathbb{R}}"
         "\\newcommand{\\abs}[1]{\\left|#1\\right|}"))
 ```
+
+### LaTeX preview
+
+Math in a markdown cell is raw TeX in the buffer. `C-c C-v`
+(`jsonyter-notebook-latex-preview-toggle`) typesets the fragments in the
+markdown cell at point and shows them as images laid over their own text,
+or removes the images if they are showing; `C-u C-c C-v` does every
+markdown cell. `M-x jsonyter-notebook-latex-preview` and
+`M-x jsonyter-notebook-latex-preview-clear` do each half separately.
+
+It recognises `$…$`, `$$…$$`, `\(…\)`, `\[…\]` and the
+`equation`, `align`, `gather`, `multline`, `eqnarray` and `flalign`
+environments (starred or not), and skips code spans, fenced code blocks,
+escaped dollars and prices such as "costs $5 and $6". Your
+`jsonyter-notebook-latex-macros` are in every fragment's preamble, so
+`\R` and `\abs{…}` render; the managed macros cell itself is skipped.
+
+The images are overlays: the cell's text — and so the saved file — is
+never changed, and editing a fragment removes just its image. Typesetting
+uses your own `latex` and `dvipng` (or `dvisvgm`) on the machine running
+Emacs — not the Jupyter server — about 0.15 s per new fragment; each
+image is cached by content, so previewing again is instant. Without the
+tools you get a plain message naming what to install, and a fragment
+LaTeX rejects is left as text with the first TeX error in the echo area
+while the rest still render.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `jsonyter-latex-preview-converter` | `auto` | `dvipng`, `dvisvgm`, or `auto` (dvipng if installed, else dvisvgm). |
+| `jsonyter-latex-preview-dpi` | `140` | Resolution of a preview image (dvipng). |
+| `jsonyter-latex-preview-preamble` | `amsmath`, `amssymb` | LaTeX lines before every fragment; your macros follow. |
+| `jsonyter-latex-preview-cache-directory` | `jsonyter-latex` under `temporary-file-directory` | Where rendered images are kept. |
+| `jsonyter-notebook-latex-preview-on-open` | `nil` | Preview every markdown cell when a notebook opens. |
 
 Outputs stored in the file are rendered when it opens, including figures.
 Running a cell **replaces** its output rather than appending, and results
@@ -676,8 +778,11 @@ configured for the directory you're in, `jsonyter-sync` offers to create
 one on the spot, seeded from the current directory and the same
 kernel-cwd probe transfer commands use — normally two confirmations and
 no typing. `jsonyter-sync-add-pair` does the same thing as a standalone
-command, and `jsonyter-sync-forget-pair` removes one again, optionally
-deleting its baseline.
+command — and creates either directory, parents included, if you typed a
+path that does not exist yet, refusing a remote path that is a file (a
+Lisp caller opts in with a fifth argument, `CREATE-DIRS`) — and
+`jsonyter-sync-forget-pair` removes one again, optionally deleting its
+baseline.
 
 Which pair a command means is resolved in order: the pair whose
 `:local` is the current directory or one of its parents (the most
@@ -1049,6 +1154,10 @@ Six formats worth a name of their own also get a dedicated command:
 the current server offers, without exporting anything — the first thing
 to check before waiting on a render that is only going to fail.
 
+Outputs of any shape export: image sizes in an output's metadata, JSON
+mimetypes such as `application/json` or Plotly's, and ordinary text
+stored as lines all reach the bridge as the structure the file holds.
+
 The export always reflects the buffer as it stands right now — unsaved
 edits and this session's outputs included, plus every cell's outputs
 already stored on disk for one nothing has been re-run — not merely what
@@ -1220,13 +1329,13 @@ Two suites, covering different halves of the package.
 emacs -Q --batch -L . -l test/jsonyter-tests.el -f ert-run-tests-batch-and-exit
 ```
 
-That runs 116 tests under `emacs -Q --batch`, where there is no frame, no
+That runs over 550 tests under `emacs -Q --batch`, where there is no frame, no
 X server and no redisplay — so it structurally cannot see whether a
 base64 PNG in a mimebundle actually decodes, whether a tall figure
 becomes drawable rows or one blob, or whether `C-RET` is bound to what
 you think it is.
 
-[`harness/`](harness/) is the other half: 51 scenarios that run in a
+[`harness/`](harness/) is the other half: 56 scenarios that run in a
 **real graphical Emacs on an X server in a container**, driven through
 the actual command loop, using
 [emacs-harness](https://github.com/EGuthrieWasTaken/emacs-harness).

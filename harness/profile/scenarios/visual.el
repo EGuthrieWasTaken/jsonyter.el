@@ -127,9 +127,13 @@ something other than its own fill is drawn through it" colors)))))
 
   ;; The hook is global; put it back whatever happens, or every later
   ;; prog-mode buffer in this session gets line numbers it did not ask for.
+  ;; `buffer' is chosen on purpose: by default a notebook numbers its
+  ;; lines per cell and turns Emacs's own numbers off, which would make
+  ;; this scenario test nothing; the per-cell case has its own below.
   (add-hook 'prog-mode-hook #'display-line-numbers-mode)
   (unwind-protect
       (progn
+        (setq jsonyter-notebook-line-numbers 'buffer)
         (eh-open-fixture "solid-plot.ipynb")
         (eh-expect display-line-numbers
                    "the hook must have switched line numbers on in the notebook buffer, \
@@ -162,6 +166,53 @@ with line numbers on; got %S -- each extra pixel is a band of background under t
              colors 1
              (format "with line numbers on, the sliced image shows %d distinct colours \
 inside its box, not 1 -- something other than its own fill is drawn through it" colors)))))
+    (setq jsonyter-notebook-line-numbers 'cell)
+    (remove-hook 'prog-mode-hook #'display-line-numbers-mode)))
+
+(eh-scenario jsonyter/notebook-sliced-image-tiles-under-per-cell-numbers
+  :doc "The default numbering, per cell, draws its numbers as a
+        `line-prefix' on source rows only, so an image slice row has no
+        number glyph from the text font to ask it for the font's ascent.
+        Same assertions as the Emacs-numbers scenario above: each sliced
+        row is exactly one text line tall and the image shows one flat
+        colour -- plus the guard that per-cell numbers really are on,
+        or this tests nothing."
+  :needs (:cairo t)
+  :tags (jsonyter notebook visual slicing line-numbers)
+
+  (add-hook 'prog-mode-hook #'display-line-numbers-mode)
+  (unwind-protect
+      (progn
+        (setq jsonyter-notebook-line-numbers 'cell)
+        (eh-open-fixture "solid-plot.ipynb")
+        (eh-expect jsonyter--nb-numbers-active
+                   "per-cell numbers must be on in the notebook buffer, or this scenario \
+is not testing anything")
+        (eh-expect (null display-line-numbers)
+                   "Emacs's own numbers must be off while per-cell numbers show")
+        (delete-other-windows)
+        (goto-char (point-min))
+        (set-window-start (selected-window) (point-min))
+        (eh-settle)
+        (let* ((region (jy-cell-output-region 1))
+               (positions (jy-image-positions (nth 0 region) (nth 1 region)))
+               (line-height (default-font-height)))
+          (eh-expect (> (length positions) 1)
+                     "solid-plot.png must be sliced into more than one row")
+          (eh-expect (and (pos-visible-in-window-p (car positions))
+                          (pos-visible-in-window-p (1- (nth 1 region))))
+                     "the sliced image does not fit in the window")
+          (let ((heights (mapcar (lambda (pos)
+                                   (save-excursion (goto-char pos) (line-pixel-height)))
+                                 positions)))
+            (eh-expect (seq-every-p (lambda (h) (= h line-height)) heights)
+                       (format "every sliced row must be exactly one text line (%dpx) tall \
+under per-cell numbers; got %S" line-height heights)))
+          (let ((colors (jy-bbox-unique-colors (jy-image-pixel-bbox (car positions)))))
+            (eh-expect-equal
+             colors 1
+             (format "under per-cell numbers the sliced image shows %d distinct colours \
+inside its box, not 1" colors)))))
     (remove-hook 'prog-mode-hook #'display-line-numbers-mode)))
 
 (eh-scenario jsonyter/image-fits-to-the-frame-showing-it-not-the-selected-one
