@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.1/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.2/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.1/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.1"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.2"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.1"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.2"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -127,6 +127,31 @@ instead of the script:
 ```elisp
 (setq jsonyter-command '("python3" "-m" "jsonyter"))
 ```
+
+### Checking what you are running
+
+`M-x jsonyter-version` shows the version of jsonyter.el and of the
+jsonyter Python package that `jsonyter-command` starts:
+
+```
+jsonyter.el v2.5.2 running on jsonyter v2.1.1
+```
+
+`M-x jsonyter-version-full` adds what a bug report needs: the file Emacs
+loaded jsonyter.el from, the Python that runs the bridge, the Jupyter
+server's version (when the current buffer has a bridge connected to one)
+and Emacs's own version. With a prefix argument either command inserts
+its report at point instead of showing it, and both return it as a
+string. The variable `jsonyter-version` holds just jsonyter.el's version.
+
+jsonyter.el's version is the one in the code Emacs has loaded, so after an
+upgrade it keeps showing the old number until you restart Emacs, which is
+the quickest way to tell whether a restart picked the upgrade up. The
+Python package's version is found by asking the interpreter that starts the
+bridge to import it, so the package's dependencies must be installed
+there too; when that cannot be done the report says why rather than
+failing, for example `jsonyter bridge version unknown (ModuleNotFoundError:
+No module named 'jsonyter')`.
 
 ## Configuration
 

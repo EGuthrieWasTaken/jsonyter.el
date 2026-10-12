@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.5.1
+;; Version: 2.5.2
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -713,6 +713,190 @@ At `jsonyter--is-complete-give-up' we stop asking; a success resets it.")
 (defvar-local jsonyter--history nil "List of previous inputs, newest first.")
 (defvar-local jsonyter--history-index -1)
 (defvar-local jsonyter--history-stash nil)
+
+;;;; Version
+
+(defmacro jsonyter--source-version ()
+  "The version in this file's \"Version:\" header, as a string.
+Read once, when the file is compiled (or, loaded as source, when it is
+loaded), so the answer names the code that is running even if an upgrade
+has since replaced the file on disk.  \"unknown\" when the file cannot be
+found while this is expanded."
+  (let ((file (or (bound-and-true-p byte-compile-current-file)
+                  load-file-name
+                  (buffer-file-name))))
+    (or (and file
+             (file-readable-p file)
+             (with-temp-buffer
+               (insert-file-contents file nil 0 4096)
+               (and (re-search-forward "^;; Version: *\\([0-9][^ \t\n]*\\)" nil t)
+                    (match-string 1))))
+        "unknown")))
+
+(defconst jsonyter-version (jsonyter--source-version)
+  "The version of jsonyter.el that is loaded, such as \"2.5.2\".
+Taken from the \"Version:\" header of this file.  See `jsonyter-version'
+for a report that includes the Python package.")
+
+(defconst jsonyter--bridge-probe-code "\
+import sys
+sys.path[:] = [p for p in sys.path if p not in ('', '.')]
+import jsonyter
+try:
+    version = jsonyter.__version__
+except AttributeError:
+    from importlib.metadata import version as _version
+    version = _version('jsonyter')
+print(version, sys.version.split()[0])
+"
+  "Python that prints the jsonyter package version and Python's own.
+Run with the interpreter that launches the bridge.  The current directory
+is dropped from the import path, as it is when the bridge is started from
+its entry-point script.")
+
+(defun jsonyter--script-interpreter (script)
+  "The interpreter named by the first lines of SCRIPT, or nil.
+Understands \"#!/path/to/python\", \"#!/usr/bin/env python3\" and the
+\"/bin/sh\" form that pip writes when the interpreter's path is long or has
+a space in it."
+  (with-temp-buffer
+    (insert-file-contents-literally script nil 0 512)
+    (goto-char (point-min))
+    (cond
+     ((looking-at "#![ \t]*/bin/sh[ \t]*\n'''exec' +\"\\([^\"\n]+\\)\"")
+      (executable-find (match-string 1)))
+     ((looking-at "#![ \t]*\\(?:[^ \t\n]*/env[ \t]+\\(?:-S[ \t]+\\)?\\)?\\([^ \t\n]+\\)")
+      (let ((interpreter (match-string 1)))
+        ;; A shell script is a launcher, not the Python behind it.
+        (unless (member (file-name-nondirectory interpreter)
+                        '("sh" "bash" "dash" "zsh"))
+          (executable-find interpreter)))))))
+
+(defun jsonyter--bridge-python ()
+  "The Python interpreter that runs the bridge `jsonyter-command' names.
+That is its first word when the command is an interpreter (\"python3 -m
+jsonyter\"), and otherwise the interpreter in the entry-point script's
+first line.  nil when it cannot be told."
+  (let* ((program (car jsonyter-command))
+         (path (and (stringp program) (executable-find program))))
+    (cond
+     ((null path) nil)
+     ((or (member "-m" (cdr jsonyter-command))
+          (string-match-p "\\`python[0-9.]*\\(?:\\.exe\\)?\\'"
+                          (file-name-nondirectory path)))
+      path)
+     (t (jsonyter--script-interpreter path)))))
+
+(defvar jsonyter--bridge-probe-timeout 10
+  "Seconds `jsonyter--run-probe' waits for the interpreter to answer.")
+
+(defun jsonyter--run-probe (python)
+  "Run `jsonyter--bridge-probe-code' with PYTHON; return its output or nil.
+Waits at most `jsonyter--bridge-probe-timeout' seconds, so an interpreter
+that hangs cannot freeze Emacs.  Standard error is mixed into the output."
+  (let ((buffer (generate-new-buffer " *jsonyter version*"))
+        (default-directory (file-name-as-directory temporary-file-directory)))
+    (unwind-protect
+        (let* ((done nil)
+               (proc (make-process
+                      :name "jsonyter-version"
+                      :buffer buffer
+                      :command (list python "-c" jsonyter--bridge-probe-code)
+                      :connection-type 'pipe
+                      :noquery t
+                      :sentinel (lambda (process event)
+                                 (ignore event)
+                                 (unless (process-live-p process)
+                                   (setq done t)))))
+               (deadline (+ (float-time) jsonyter--bridge-probe-timeout)))
+          (while (and (not done) (< (float-time) deadline))
+            (accept-process-output proc 0.05))
+          (if (not done)
+              (progn (delete-process proc) nil)
+            (string-trim (with-current-buffer buffer (buffer-string)))))
+      (kill-buffer buffer))))
+
+(defun jsonyter--bridge-info ()
+  "What the jsonyter Python package that `jsonyter-command' runs says it is.
+A plist with :version and :python (strings) on success, or with :error, a
+sentence on why not.  Starts a short-lived Python process; the bridge
+itself is not involved."
+  (let ((python (jsonyter--bridge-python)))
+    (if (null python)
+        (list :error (format "cannot tell which Python runs %S"
+                             (mapconcat #'identity jsonyter-command " ")))
+      (let ((output (condition-case err
+                        (jsonyter--run-probe python)
+                      (error (error-message-string err)))))
+        (cond
+         ((null output) (list :error (format "%s did not answer" python)))
+         ((string-match "\\`\\([0-9][^ \t\n]*\\) +\\([0-9][^ \t\n]*\\)\\'" output)
+          (list :version (match-string 1 output) :python (match-string 2 output)))
+         (t (list :error (let ((last (car (last (split-string output "\n" t)))))
+                           (or last (format "%s printed nothing" python))))))))))
+
+(defun jsonyter--server-version ()
+  "The Jupyter server's version, asked through this buffer's live bridge.
+nil when this buffer has no bridge running or the server does not answer."
+  (when (process-live-p jsonyter--process)
+    (condition-case nil
+        (plist-get (jsonyter--request-sync "version" nil 5) :version)
+      (error nil))))
+
+(defun jsonyter--version-emit (text here)
+  "Insert TEXT at point if HERE, otherwise show it in the echo area."
+  (if here (insert text) (message "%s" text)))
+
+;;;###autoload
+(defun jsonyter-version (&optional here)
+  "Report the jsonyter.el version and the jsonyter Python package under it.
+Shows, for example, \"jsonyter.el v2.5.2 running on jsonyter v2.1.1\".  The
+Python package is the one that `jsonyter-command' would start, found by
+asking its interpreter, so this works with no REPL or notebook open.  When
+that cannot be done the report says so instead of failing.
+
+With a prefix argument HERE, insert the report at point rather than
+showing it.  Returns the report as a string.  The variable
+`jsonyter-version' holds just the version of jsonyter.el.  For more detail
+for a bug report, see `jsonyter-version-full'."
+  (interactive "P")
+  (let* ((bridge (jsonyter--bridge-info))
+         (text (if (plist-get bridge :version)
+                   (format "jsonyter.el v%s running on jsonyter v%s"
+                           jsonyter-version (plist-get bridge :version))
+                 (format "jsonyter.el v%s, jsonyter bridge version unknown (%s)"
+                         jsonyter-version (plist-get bridge :error)))))
+    (when (called-interactively-p 'any)
+      (jsonyter--version-emit text here))
+    text))
+
+;;;###autoload
+(defun jsonyter-version-full (&optional here)
+  "Report everything about this jsonyter install that a bug report needs.
+Adds to `jsonyter-version' the file jsonyter.el was loaded from, the Python
+that runs the bridge, the Jupyter server's version when this buffer has a
+bridge connected to one, and Emacs's own version and system.
+
+With a prefix argument HERE, insert the report at point rather than
+showing it.  Returns the report as a string."
+  (interactive "P")
+  (let* ((bridge (jsonyter--bridge-info))
+         (server (jsonyter--server-version))
+         (loaded (symbol-file 'jsonyter-version-full 'defun))
+         (text
+          (concat
+           (format "jsonyter.el v%s" jsonyter-version)
+           (and loaded (format " (%s)" (abbreviate-file-name loaded)))
+           (if (plist-get bridge :version)
+               (format " running on jsonyter v%s (Python %s)"
+                       (plist-get bridge :version) (plist-get bridge :python))
+             (format ", jsonyter bridge version unknown (%s)"
+                     (plist-get bridge :error)))
+           (format ", Jupyter server %s" (or server "not connected from this buffer"))
+           (format ", Emacs %s (%s)" emacs-version system-configuration))))
+    (when (called-interactively-p 'any)
+      (jsonyter--version-emit text here))
+    text))
 
 ;;;; Token handling
 
@@ -3418,10 +3602,36 @@ major-mode change — would take the renderer's own colours with it and
 never put them back, since refontifying deliberately skips both."
   (jsonyter--nb-map-source-runs beg end #'font-lock-default-unfontify-region))
 
-(defconst jsonyter--nb-inert-syntax (string-to-syntax ".")
-  "Punctuation syntax: cannot open or close a string, comment or pair.
-Applied as a `syntax-table' text property over text that is not this
-notebook's kernel-language code — see `jsonyter--nb-syntax-propertize'.")
+(defvar-local jsonyter--nb-inert-table nil
+  "The inert syntax table last built, as (BASE . TABLE).
+BASE is the buffer's syntax table it was built from; see
+`jsonyter--nb-inert-syntax-table'.")
+
+(defun jsonyter--nb-inert-syntax-table ()
+  "The syntax table that goes on text that is not kernel-language code.
+
+Every character is punctuation, so none of it can open or close a
+string, comment or pair.  The exception is whitespace: a character the
+buffer's own syntax table gives the whitespace or the comment-end class,
+which in practice means the space, the tab and above all the newline,
+keeps exactly the entry the language mode gave it.  Packages that walk
+the buffer backward a line at a time, such as ESS when it indents, step
+over the newline ending the previous cell with `forward-comment', which
+moves only over whitespace and comment ends; with the newline as
+punctuation it cannot move, and the walk goes round forever on the first
+line of every code cell.
+
+The table is built from the buffer's current syntax table and kept
+until that changes."
+  (let ((base (syntax-table)))
+    (if (eq (car jsonyter--nb-inert-table) base)
+        (cdr jsonyter--nb-inert-table)
+      (let ((table (make-char-table 'syntax-table (string-to-syntax "."))))
+        (dotimes (char 128)
+          (when (memq (syntax-class (aref base char)) '(0 12))
+            (aset table char (aref base char))))
+        (setq jsonyter--nb-inert-table (cons base table))
+        table))))
 
 (defun jsonyter--nb-syntax-propertize (beg end)
   "`syntax-propertize-function' for `jsonyter-notebook-mode'.
@@ -3437,10 +3647,11 @@ character — prose and rendered output included.  So one unbalanced
 string, comment or paired delimiter anywhere in the buffer changes the
 fontification of everything after it, to the end of the buffer.
 
-Blankets every character of each `jsonyter--nb-non-code-spans' span with
-`jsonyter--nb-inert-syntax', so none of them can open or close anything.
-Blanketing rather than only neutralizing delimiters is simpler and
-cheap: an output span is already rewritten wholesale on every re-run
+Covers each `jsonyter--nb-non-code-spans' span with
+`jsonyter--nb-inert-syntax-table', so none of them can open or close
+anything while its whitespace stays whitespace.  Covering the whole span
+rather than only neutralizing delimiters is simpler and cheap: an output
+span is already rewritten wholesale on every re-run
 \(`jsonyter--nb-show-output-as-text'\), and a markdown/raw cell's source
 is ordinarily short.
 
@@ -3448,10 +3659,11 @@ is ordinarily short.
 property to take effect at all; `jsonyter-notebook-mode' sets it
 buffer-locally rather than relying on the language mode to have done
 so."
-  (dolist (span (jsonyter--nb-non-code-spans beg end))
-    (let ((from (max beg (car span))) (to (min end (cdr span))))
-      (when (< from to)
-        (put-text-property from to 'syntax-table jsonyter--nb-inert-syntax)))))
+  (let ((table (jsonyter--nb-inert-syntax-table)))
+    (dolist (span (jsonyter--nb-non-code-spans beg end))
+      (let ((from (max beg (car span))) (to (min end (cdr span))))
+        (when (< from to)
+          (put-text-property from to 'syntax-table table))))))
 
 (defun jsonyter--source-hash (code)
   "Hash of CODE, as stored on an overlay to detect later source edits."

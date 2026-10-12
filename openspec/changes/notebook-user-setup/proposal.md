@@ -5,10 +5,14 @@
 A real daily-driver configuration (company at a 0.1 s idle delay, yasnippet,
 flycheck, line numbers and the fill-column indicator on `prog-mode-hook`, a
 function-valued server token) was run against the shipped 2.5.0 and the 2.4.1
-before it. It confirmed the cause of the reported "inserting a newline hangs
-Emacs" and turned up two more things:
+before it. It found a real slowness that looked like the reported "inserting a
+newline hangs Emacs", and two more things. **Correction:** the slowness was not
+what the reporter was hitting. A profile from their session on 2.5.1 showed an
+endless loop in ESS's indentation instead, fixed by `notebook-syntax-whitespace`.
+The finding below stands as a bug that was fixed in 2.5.0, not as the cause of
+their hang.
 
-- **The hang is the 2.4.1 reload bug.** Every `revert-buffer` (an auto-revert
+- **The 2.4.1 reload bug.** Every `revert-buffer` (an auto-revert
   after a sync does it too) left each cell behind as an empty overlay at the top
   of the buffer, still drawing its prompt. Redisplay after a newline typed at the
   top of a 120-cell notebook then took 0.24 s after 4 reloads and 9.5 s after 20

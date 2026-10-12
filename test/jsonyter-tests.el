@@ -911,6 +911,121 @@ certainly wrong."
     (font-lock-ensure)
     (should-not (eq 'font-lock-keyword-face (jsonyter-tests--face-at "and")))))
 
+;; The blanket must leave whitespace alone.  Packages that walk the buffer
+;; backward a line at a time -- ESS does it for every indentation -- step
+;; over the newline ending the previous cell with `forward-comment', which
+;; moves only over whitespace and comment ends.  With the newline made
+;; punctuation too (2.4.1 to 2.5.1) it could not move, and the walk went
+;; round forever on the first line of every code cell and anywhere in a
+;; markdown cell.
+
+(defconst jsonyter-tests--notebook-prose-then-code "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"aaa\", \"metadata\": {},
+   \"source\": \"## Step 0\\n\\nIt's stable.\\n- bullet one\\n- bullet two\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\",
+                \"text\": \"it can't be found\\n\\nlast line\\n\"}],
+   \"source\": \"library(dplyr)\\nx <- 1\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"ccc\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"y <- 2\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"R\",
+                            \"language\": \"R\", \"name\": \"ir\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "A markdown cell, then a code cell with output, then a code cell, in R.
+The prose and the output both contain an apostrophe and a blank line.")
+
+(defun jsonyter-tests--walk-back-like-ess (limit)
+  "Walk backward from point as ESS's `ess-skip-blanks-backward' does.
+Return the number of steps taken, or nil if it had not stopped after LIMIT.
+The loop is ESS's own: while at the start of a line, go up a line, go to
+where that line's code ends (`ess-code-end-position': past the newline,
+then back over whitespace and comments) and skip blanks."
+  (let ((steps 0))
+    (while (and (not (bobp)) (= (point) (line-beginning-position))
+                (< steps limit))
+      (forward-line -1)
+      (goto-char (save-excursion
+                   (goto-char (1+ (line-end-position)))
+                   (forward-comment -1)
+                   (point)))
+      (skip-syntax-backward " ")
+      (cl-incf steps))
+    (and (< steps limit) steps)))
+
+(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-syntax ()
+  "Whitespace in prose and output keeps the language's own syntax.
+Every other character there is punctuation; a space, a tab and a newline
+are what the major mode's syntax table says they are."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+    (syntax-propertize (point-max))
+    (let ((spans (jsonyter--nb-non-code-spans (point-min) (point-max)))
+          (checked 0))
+      (should (>= (length spans) 2))
+      (dolist (span spans)
+        (dolist (pos (number-sequence (car span) (1- (cdr span))))
+          (let ((char (char-after pos))
+                (class (syntax-class (syntax-after pos))))
+            (cl-incf checked)
+            (if (memq char '(?\s ?\t ?\n))
+                (should (eq class (syntax-class (aref (syntax-table) char))))
+              (unless (and (>= char ?0) (<= char ?9))
+                (should (eq class 1)))))))
+      (should (> checked 100)))))
+
+(ert-deftest jsonyter-test-walking-back-over-a-cell-boundary-stops ()
+  "A backward line walk from the first line of a cell reaches the top.
+Replays the loop ESS runs when it indents, from the first line of a code
+cell that follows prose, from the first line of one that follows output,
+and from a new blank line inside the prose cell."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+    (syntax-propertize (point-max))
+    (let ((cells (jsonyter--nb-cells)))
+      (dolist (start (list (overlay-start (nth 1 cells))
+                           (overlay-start (nth 2 cells))
+                           (1- (jsonyter--nb-source-end (nth 0 cells)))))
+        (save-excursion
+          (goto-char start)
+          (should (jsonyter-tests--walk-back-like-ess 200)))))))
+
+(defvar jsonyter-tests--ess-steps 0
+  "Calls to `ess-code-end-position' so far in the test counting them.")
+
+(defun jsonyter-tests--count-ess-step (&rest _)
+  "Count a call to `ess-code-end-position'; end a walk that will not stop."
+  (when (> (cl-incf jsonyter-tests--ess-steps) 2000)
+    (error "ESS indentation walk did not stop")))
+
+(ert-deftest jsonyter-test-ess-newline-does-not-hang ()
+  "RET on a cell's first line and in a markdown cell finishes under ESS.
+Needs ESS; skipped without it.  The walk calls `ess-code-end-position'
+once a step, so counting those and raising an error ends a walk that
+would otherwise never return."
+  (skip-unless (locate-library "ess-r-mode"))
+  (require 'ess-r-mode)
+  (advice-add 'ess-code-end-position :before #'jsonyter-tests--count-ess-step)
+  (unwind-protect
+      (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+        (should (eq major-mode 'ess-r-mode))
+        (let* ((cells (jsonyter--nb-cells))
+               (code-start (overlay-start (nth 1 cells))))
+          (dolist (where (list code-start
+                               (+ code-start (length "library(dplyr)"))
+                               (1- (jsonyter--nb-source-end (nth 0 cells)))
+                               (1- (jsonyter--nb-source-end (nth 1 cells)))))
+            (setq jsonyter-tests--ess-steps 0)
+            (goto-char where)
+            (let ((last-command-event ?\r))
+              (call-interactively (key-binding (kbd "RET"))))
+            (should (< jsonyter-tests--ess-steps 2000)))))
+    (advice-remove 'ess-code-end-position #'jsonyter-tests--count-ess-step)))
+
 ;;;; Saving
 
 (ert-deftest jsonyter-test-save-writes-source-only ()
@@ -8302,6 +8417,158 @@ Everything is bound or restored, so the rest of the suite is untouched."
                 ((string-match-p "Call `jsonyter[^ ]*', then" raw)
                  (push (format "%s reads as instructions to an implementer" sym) problems)))))))))
     (should (equal (sort problems #'string<) nil))))
+
+;;;; Version
+
+(defun jsonyter-tests--header-version ()
+  "The \"Version:\" header of jsonyter.el on disk."
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t) nil 0 4096)
+    (and (re-search-forward "^;; Version: *\\([0-9][^ \t\n]*\\)" nil t)
+         (match-string 1))))
+
+(defmacro jsonyter-tests--with-fake-python (dir script &rest body)
+  "Run BODY with DIR bound to a directory holding an executable \"fakepy\".
+SCRIPT is a shell script standing in for a Python interpreter.  Skipped
+where there is no POSIX shell."
+  (declare (indent 2) (debug t))
+  `(progn
+     (skip-unless (and (not (memq system-type '(windows-nt ms-dos)))
+                       (executable-find "sh")))
+     (let ((,dir (make-temp-file "jsonyter-test-py-" t)))
+       (unwind-protect
+           (progn
+             (with-temp-file (expand-file-name "fakepy" ,dir)
+               (insert "#!/bin/sh\n" ,script "\n"))
+             (set-file-modes (expand-file-name "fakepy" ,dir) #o755)
+             ,@body)
+         (delete-directory ,dir t)))))
+
+(defun jsonyter-tests--write-script (path first-lines)
+  "Write an executable file at PATH that begins with FIRST-LINES."
+  (with-temp-file path (insert first-lines "\nprint('entry point')\n"))
+  (set-file-modes path #o755))
+
+(ert-deftest jsonyter-test-version-is-the-files-header ()
+  "`jsonyter-version' (the variable) is the \"Version:\" header, not a copy."
+  (should (string-match-p "\\`[0-9]+\\.[0-9]+\\.[0-9]+\\'" jsonyter-version))
+  (should (equal jsonyter-version (jsonyter-tests--header-version))))
+
+(ert-deftest jsonyter-test-version-is-baked-into-the-compiled-file ()
+  "A compiled copy knows its version with the source gone.
+The version names the code that is loaded, so it is read when the file is
+compiled and not from the file on disk when it is asked for."
+  (let* ((dir (make-temp-file "jsonyter-test-elc-" t))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (source (expand-file-name "jsonyter.el" dir)))
+    (unwind-protect
+        (progn
+          (copy-file (locate-library "jsonyter.el" t) source)
+          (should (eq 0 (call-process emacs nil nil nil "--batch" "-Q" "-L" dir
+                                      "--eval" (format "(byte-compile-file %S)" source))))
+          (should (file-exists-p (expand-file-name "jsonyter.elc" dir)))
+          (delete-file source)
+          (with-temp-buffer
+            (should (eq 0 (call-process emacs nil t nil "--batch" "-Q" "-L" dir
+                                        "--eval" "(progn (require 'jsonyter) (princ jsonyter-version))")))
+            (should (equal (buffer-string) (jsonyter-tests--header-version)))))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-version-commands-are-autoloaded ()
+  "`M-x jsonyter-version' works before anything else has loaded the package."
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t))
+    (dolist (name '("jsonyter-version" "jsonyter-version-full"))
+      (goto-char (point-min))
+      (should (re-search-forward
+               (format "^;;;###autoload\n(defun %s " name) nil t)))))
+
+(ert-deftest jsonyter-test-version-names-the-python-package ()
+  "The report names the jsonyter package the interpreter would import."
+  (jsonyter-tests--with-fake-python dir "echo '9.8.7 3.99.1'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (should (equal (jsonyter-version)
+                     (format "jsonyter.el v%s running on jsonyter v9.8.7"
+                             jsonyter-version))))))
+
+(ert-deftest jsonyter-test-version-finds-the-python-behind-an-entry-point ()
+  "For a console script, the interpreter on its first line is the one asked."
+  (jsonyter-tests--with-fake-python dir "echo '4.5.6 3.10.2'"
+    (let ((fake (expand-file-name "fakepy" dir))
+          (script (expand-file-name "jsonyter" dir)))
+      (dolist (first-lines
+               (list (concat "#!" fake)
+                     "#!/usr/bin/env fakepy"
+                     (format "#!/bin/sh\n'''exec' \"%s\" \"$0\" \"$@\"\n' '''" fake)))
+        (jsonyter-tests--write-script script first-lines)
+        (let ((jsonyter-command (list script))
+              (exec-path (cons dir exec-path)))
+          (should (equal (plist-get (jsonyter--bridge-info) :version) "4.5.6")))))))
+
+(ert-deftest jsonyter-test-version-says-why-it-cannot-tell ()
+  "No answer is an explanation in the report, never an error."
+  (jsonyter-tests--with-fake-python dir
+      "echo \"ModuleNotFoundError: No module named 'jsonyter'\" >&2; exit 1"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (should (equal (jsonyter-version)
+                     (format "jsonyter.el v%s, jsonyter bridge version unknown (ModuleNotFoundError: No module named 'jsonyter')"
+                             jsonyter-version))))
+    (let ((jsonyter-command '("no-such-program-for-jsonyter-tests")))
+      (should (string-match-p "bridge version unknown (cannot tell which Python"
+                              (jsonyter-version))))
+    ;; A shell script launcher is not a Python.
+    (jsonyter-tests--write-script (expand-file-name "jsonyter" dir) "#!/bin/sh")
+    (let ((jsonyter-command (list (expand-file-name "jsonyter" dir))))
+      (should (null (jsonyter--bridge-python))))))
+
+(ert-deftest jsonyter-test-version-does-not-wait-for-a-stuck-python ()
+  "An interpreter that never answers costs the timeout, and no more."
+  (jsonyter-tests--with-fake-python dir "sleep 20"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter"))
+          (jsonyter--bridge-probe-timeout 0.3)
+          (start (float-time)))
+      (should (string-match-p "did not answer" (jsonyter-version)))
+      (should (< (- (float-time) start) 5)))))
+
+(ert-deftest jsonyter-test-version-full-adds-the-server-and-emacs ()
+  "The full report names the server through a live bridge, and Emacs."
+  (jsonyter-tests--with-fake-python dir "echo '2.1.1 3.12.3'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (with-temp-buffer
+        (let ((text (jsonyter-version-full)))
+          (should (string-match-p "running on jsonyter v2\\.1\\.1 (Python 3\\.12\\.3)" text))
+          (should (string-match-p "Jupyter server not connected" text))
+          (should (string-match-p (regexp-quote (format "Emacs %s" emacs-version)) text)))
+        (setq-local jsonyter--process (start-process "jsonyter-test-version" nil "cat"))
+        (unwind-protect
+            (cl-letf (((symbol-function 'jsonyter--request-sync)
+                       (lambda (method &rest _)
+                         (should (equal method "version"))
+                         '(:version "2.14.2"))))
+              (should (string-match-p "Jupyter server 2\\.14\\.2" (jsonyter-version-full))))
+          (delete-process jsonyter--process))))))
+
+(ert-deftest jsonyter-test-version-can-be-inserted ()
+  "A prefix argument puts the report in the buffer; otherwise it is shown.
+Other messages may be printed meanwhile (the coverage build prints compiler
+warnings), so the report is looked for among them, not taken as the last."
+  (jsonyter-tests--with-fake-python dir "echo '2.1.1 3.12.3'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter"))
+          (messages nil)
+          (report "\\`jsonyter\\.el v[0-9.]+ running on jsonyter v2\\.1\\.1\\'"))
+      (with-temp-buffer
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) messages))))
+          (call-interactively #'jsonyter-version)
+          (should (seq-find (lambda (m) (string-match-p report m)) messages))
+          (should (equal (buffer-string) ""))
+          (setq messages nil)
+          (let ((current-prefix-arg '(4)))
+            (call-interactively #'jsonyter-version))
+          (should-not (seq-find (lambda (m) (string-match-p "running on jsonyter" m))
+                                messages))
+          (should (string-match-p "running on jsonyter v2\\.1\\.1" (buffer-string))))))))
 
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
