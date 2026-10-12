@@ -804,7 +804,10 @@ that hangs cannot freeze Emacs.  Standard error is mixed into the output."
                       :command (list python "-c" jsonyter--bridge-probe-code)
                       :connection-type 'pipe
                       :noquery t
-                      :sentinel (lambda (_proc _event) (setq done t))))
+                      :sentinel (lambda (process event)
+                                 (ignore event)
+                                 (unless (process-live-p process)
+                                   (setq done t)))))
                (deadline (+ (float-time) jsonyter--bridge-probe-timeout)))
           (while (and (not done) (< (float-time) deadline))
             (accept-process-output proc 0.05))

@@ -8549,20 +8549,25 @@ compiled and not from the file on disk when it is asked for."
           (delete-process jsonyter--process))))))
 
 (ert-deftest jsonyter-test-version-can-be-inserted ()
-  "A prefix argument puts the report in the buffer; otherwise it is shown."
+  "A prefix argument puts the report in the buffer; otherwise it is shown.
+Other messages may be printed meanwhile (the coverage build prints compiler
+warnings), so the report is looked for among them, not taken as the last."
   (jsonyter-tests--with-fake-python dir "echo '2.1.1 3.12.3'"
     (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter"))
-          (shown nil))
+          (messages nil)
+          (report "\\`jsonyter\\.el v[0-9.]+ running on jsonyter v2\\.1\\.1\\'"))
       (with-temp-buffer
         (cl-letf (((symbol-function 'message)
-                   (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) messages))))
           (call-interactively #'jsonyter-version)
-          (should (string-match-p "\\`jsonyter\\.el v[0-9.]+ running on jsonyter v2\\.1\\.1\\'" shown))
+          (should (seq-find (lambda (m) (string-match-p report m)) messages))
           (should (equal (buffer-string) ""))
-          (setq shown nil)
+          (setq messages nil)
           (let ((current-prefix-arg '(4)))
             (call-interactively #'jsonyter-version))
-          (should (null shown))
+          (should-not (seq-find (lambda (m) (string-match-p "running on jsonyter" m))
+                                messages))
           (should (string-match-p "running on jsonyter v2\\.1\\.1" (buffer-string))))))))
 
 (provide 'jsonyter-tests)
