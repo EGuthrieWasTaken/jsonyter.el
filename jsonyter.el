@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.5.1
+;; Version: 2.5.2
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -3418,10 +3418,36 @@ major-mode change — would take the renderer's own colours with it and
 never put them back, since refontifying deliberately skips both."
   (jsonyter--nb-map-source-runs beg end #'font-lock-default-unfontify-region))
 
-(defconst jsonyter--nb-inert-syntax (string-to-syntax ".")
-  "Punctuation syntax: cannot open or close a string, comment or pair.
-Applied as a `syntax-table' text property over text that is not this
-notebook's kernel-language code — see `jsonyter--nb-syntax-propertize'.")
+(defvar-local jsonyter--nb-inert-table nil
+  "The inert syntax table last built, as (BASE . TABLE).
+BASE is the buffer's syntax table it was built from; see
+`jsonyter--nb-inert-syntax-table'.")
+
+(defun jsonyter--nb-inert-syntax-table ()
+  "The syntax table that goes on text that is not kernel-language code.
+
+Every character is punctuation, so none of it can open or close a
+string, comment or pair.  The exception is whitespace: a character the
+buffer's own syntax table gives the whitespace or the comment-end class,
+which in practice means the space, the tab and above all the newline,
+keeps exactly the entry the language mode gave it.  Packages that walk
+the buffer backward a line at a time, such as ESS when it indents, step
+over the newline ending the previous cell with `forward-comment', which
+moves only over whitespace and comment ends; with the newline as
+punctuation it cannot move, and the walk goes round forever on the first
+line of every code cell.
+
+The table is built from the buffer's current syntax table and kept
+until that changes."
+  (let ((base (syntax-table)))
+    (if (eq (car jsonyter--nb-inert-table) base)
+        (cdr jsonyter--nb-inert-table)
+      (let ((table (make-char-table 'syntax-table (string-to-syntax "."))))
+        (dotimes (char 128)
+          (when (memq (syntax-class (aref base char)) '(0 12))
+            (aset table char (aref base char))))
+        (setq jsonyter--nb-inert-table (cons base table))
+        table))))
 
 (defun jsonyter--nb-syntax-propertize (beg end)
   "`syntax-propertize-function' for `jsonyter-notebook-mode'.
@@ -3437,10 +3463,11 @@ character — prose and rendered output included.  So one unbalanced
 string, comment or paired delimiter anywhere in the buffer changes the
 fontification of everything after it, to the end of the buffer.
 
-Blankets every character of each `jsonyter--nb-non-code-spans' span with
-`jsonyter--nb-inert-syntax', so none of them can open or close anything.
-Blanketing rather than only neutralizing delimiters is simpler and
-cheap: an output span is already rewritten wholesale on every re-run
+Covers each `jsonyter--nb-non-code-spans' span with
+`jsonyter--nb-inert-syntax-table', so none of them can open or close
+anything while its whitespace stays whitespace.  Covering the whole span
+rather than only neutralizing delimiters is simpler and cheap: an output
+span is already rewritten wholesale on every re-run
 \(`jsonyter--nb-show-output-as-text'\), and a markdown/raw cell's source
 is ordinarily short.
 
@@ -3448,10 +3475,11 @@ is ordinarily short.
 property to take effect at all; `jsonyter-notebook-mode' sets it
 buffer-locally rather than relying on the language mode to have done
 so."
-  (dolist (span (jsonyter--nb-non-code-spans beg end))
-    (let ((from (max beg (car span))) (to (min end (cdr span))))
-      (when (< from to)
-        (put-text-property from to 'syntax-table jsonyter--nb-inert-syntax)))))
+  (let ((table (jsonyter--nb-inert-syntax-table)))
+    (dolist (span (jsonyter--nb-non-code-spans beg end))
+      (let ((from (max beg (car span))) (to (min end (cdr span))))
+        (when (< from to)
+          (put-text-property from to 'syntax-table table))))))
 
 (defun jsonyter--source-hash (code)
   "Hash of CODE, as stored on an overlay to detect later source edits."

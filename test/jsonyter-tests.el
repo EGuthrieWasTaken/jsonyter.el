@@ -911,6 +911,121 @@ certainly wrong."
     (font-lock-ensure)
     (should-not (eq 'font-lock-keyword-face (jsonyter-tests--face-at "and")))))
 
+;; The blanket must leave whitespace alone.  Packages that walk the buffer
+;; backward a line at a time -- ESS does it for every indentation -- step
+;; over the newline ending the previous cell with `forward-comment', which
+;; moves only over whitespace and comment ends.  With the newline made
+;; punctuation too (2.4.1 to 2.5.1) it could not move, and the walk went
+;; round forever on the first line of every code cell and anywhere in a
+;; markdown cell.
+
+(defconst jsonyter-tests--notebook-prose-then-code "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"aaa\", \"metadata\": {},
+   \"source\": \"## Step 0\\n\\nIt's stable.\\n- bullet one\\n- bullet two\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\",
+                \"text\": \"it can't be found\\n\\nlast line\\n\"}],
+   \"source\": \"library(dplyr)\\nx <- 1\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"ccc\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"y <- 2\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"R\",
+                            \"language\": \"R\", \"name\": \"ir\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "A markdown cell, then a code cell with output, then a code cell, in R.
+The prose and the output both contain an apostrophe and a blank line.")
+
+(defun jsonyter-tests--walk-back-like-ess (limit)
+  "Walk backward from point as ESS's `ess-skip-blanks-backward' does.
+Return the number of steps taken, or nil if it had not stopped after LIMIT.
+The loop is ESS's own: while at the start of a line, go up a line, go to
+where that line's code ends (`ess-code-end-position': past the newline,
+then back over whitespace and comments) and skip blanks."
+  (let ((steps 0))
+    (while (and (not (bobp)) (= (point) (line-beginning-position))
+                (< steps limit))
+      (forward-line -1)
+      (goto-char (save-excursion
+                   (goto-char (1+ (line-end-position)))
+                   (forward-comment -1)
+                   (point)))
+      (skip-syntax-backward " ")
+      (cl-incf steps))
+    (and (< steps limit) steps)))
+
+(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-syntax ()
+  "Whitespace in prose and output keeps the language's own syntax.
+Every other character there is punctuation; a space, a tab and a newline
+are what the major mode's syntax table says they are."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+    (syntax-propertize (point-max))
+    (let ((spans (jsonyter--nb-non-code-spans (point-min) (point-max)))
+          (checked 0))
+      (should (>= (length spans) 2))
+      (dolist (span spans)
+        (dolist (pos (number-sequence (car span) (1- (cdr span))))
+          (let ((char (char-after pos))
+                (class (syntax-class (syntax-after pos))))
+            (cl-incf checked)
+            (if (memq char '(?\s ?\t ?\n))
+                (should (eq class (syntax-class (aref (syntax-table) char))))
+              (unless (and (>= char ?0) (<= char ?9))
+                (should (eq class 1)))))))
+      (should (> checked 100)))))
+
+(ert-deftest jsonyter-test-walking-back-over-a-cell-boundary-stops ()
+  "A backward line walk from the first line of a cell reaches the top.
+Replays the loop ESS runs when it indents, from the first line of a code
+cell that follows prose, from the first line of one that follows output,
+and from a new blank line inside the prose cell."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+    (syntax-propertize (point-max))
+    (let ((cells (jsonyter--nb-cells)))
+      (dolist (start (list (overlay-start (nth 1 cells))
+                           (overlay-start (nth 2 cells))
+                           (1- (jsonyter--nb-source-end (nth 0 cells)))))
+        (save-excursion
+          (goto-char start)
+          (should (jsonyter-tests--walk-back-like-ess 200)))))))
+
+(defvar jsonyter-tests--ess-steps 0
+  "Calls to `ess-code-end-position' so far in the test counting them.")
+
+(defun jsonyter-tests--count-ess-step (&rest _)
+  "Count a call to `ess-code-end-position'; end a walk that will not stop."
+  (when (> (cl-incf jsonyter-tests--ess-steps) 2000)
+    (error "ESS indentation walk did not stop")))
+
+(ert-deftest jsonyter-test-ess-newline-does-not-hang ()
+  "RET on a cell's first line and in a markdown cell finishes under ESS.
+Needs ESS; skipped without it.  The walk calls `ess-code-end-position'
+once a step, so counting those and raising an error ends a walk that
+would otherwise never return."
+  (skip-unless (locate-library "ess-r-mode"))
+  (require 'ess-r-mode)
+  (advice-add 'ess-code-end-position :before #'jsonyter-tests--count-ess-step)
+  (unwind-protect
+      (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
+        (should (eq major-mode 'ess-r-mode))
+        (let* ((cells (jsonyter--nb-cells))
+               (code-start (overlay-start (nth 1 cells))))
+          (dolist (where (list code-start
+                               (+ code-start (length "library(dplyr)"))
+                               (1- (jsonyter--nb-source-end (nth 0 cells)))
+                               (1- (jsonyter--nb-source-end (nth 1 cells)))))
+            (setq jsonyter-tests--ess-steps 0)
+            (goto-char where)
+            (let ((last-command-event ?\r))
+              (call-interactively (key-binding (kbd "RET"))))
+            (should (< jsonyter-tests--ess-steps 2000)))))
+    (advice-remove 'ess-code-end-position #'jsonyter-tests--count-ess-step)))
+
 ;;;; Saving
 
 (ert-deftest jsonyter-test-save-writes-source-only ()

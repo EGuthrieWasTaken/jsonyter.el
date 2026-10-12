@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.1/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.2/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.1/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.1"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.2"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.1"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.2"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
