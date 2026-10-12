@@ -8418,5 +8418,152 @@ Everything is bound or restored, so the rest of the suite is untouched."
                  (push (format "%s reads as instructions to an implementer" sym) problems)))))))))
     (should (equal (sort problems #'string<) nil))))
 
+;;;; Version
+
+(defun jsonyter-tests--header-version ()
+  "The \"Version:\" header of jsonyter.el on disk."
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t) nil 0 4096)
+    (and (re-search-forward "^;; Version: *\\([0-9][^ \t\n]*\\)" nil t)
+         (match-string 1))))
+
+(defmacro jsonyter-tests--with-fake-python (dir script &rest body)
+  "Run BODY with DIR bound to a directory holding an executable \"fakepy\".
+SCRIPT is a shell script standing in for a Python interpreter.  Skipped
+where there is no POSIX shell."
+  (declare (indent 2) (debug t))
+  `(progn
+     (skip-unless (and (not (memq system-type '(windows-nt ms-dos)))
+                       (executable-find "sh")))
+     (let ((,dir (make-temp-file "jsonyter-test-py-" t)))
+       (unwind-protect
+           (progn
+             (with-temp-file (expand-file-name "fakepy" ,dir)
+               (insert "#!/bin/sh\n" ,script "\n"))
+             (set-file-modes (expand-file-name "fakepy" ,dir) #o755)
+             ,@body)
+         (delete-directory ,dir t)))))
+
+(defun jsonyter-tests--write-script (path first-lines)
+  "Write an executable file at PATH that begins with FIRST-LINES."
+  (with-temp-file path (insert first-lines "\nprint('entry point')\n"))
+  (set-file-modes path #o755))
+
+(ert-deftest jsonyter-test-version-is-the-files-header ()
+  "`jsonyter-version' (the variable) is the \"Version:\" header, not a copy."
+  (should (string-match-p "\\`[0-9]+\\.[0-9]+\\.[0-9]+\\'" jsonyter-version))
+  (should (equal jsonyter-version (jsonyter-tests--header-version))))
+
+(ert-deftest jsonyter-test-version-is-baked-into-the-compiled-file ()
+  "A compiled copy knows its version with the source gone.
+The version names the code that is loaded, so it is read when the file is
+compiled and not from the file on disk when it is asked for."
+  (let* ((dir (make-temp-file "jsonyter-test-elc-" t))
+         (emacs (expand-file-name invocation-name invocation-directory))
+         (source (expand-file-name "jsonyter.el" dir)))
+    (unwind-protect
+        (progn
+          (copy-file (locate-library "jsonyter.el" t) source)
+          (should (eq 0 (call-process emacs nil nil nil "--batch" "-Q" "-L" dir
+                                      "--eval" (format "(byte-compile-file %S)" source))))
+          (should (file-exists-p (expand-file-name "jsonyter.elc" dir)))
+          (delete-file source)
+          (with-temp-buffer
+            (should (eq 0 (call-process emacs nil t nil "--batch" "-Q" "-L" dir
+                                        "--eval" "(progn (require 'jsonyter) (princ jsonyter-version))")))
+            (should (equal (buffer-string) (jsonyter-tests--header-version)))))
+      (delete-directory dir t))))
+
+(ert-deftest jsonyter-test-version-commands-are-autoloaded ()
+  "`M-x jsonyter-version' works before anything else has loaded the package."
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t))
+    (dolist (name '("jsonyter-version" "jsonyter-version-full"))
+      (goto-char (point-min))
+      (should (re-search-forward
+               (format "^;;;###autoload\n(defun %s " name) nil t)))))
+
+(ert-deftest jsonyter-test-version-names-the-python-package ()
+  "The report names the jsonyter package the interpreter would import."
+  (jsonyter-tests--with-fake-python dir "echo '9.8.7 3.99.1'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (should (equal (jsonyter-version)
+                     (format "jsonyter.el v%s running on jsonyter v9.8.7"
+                             jsonyter-version))))))
+
+(ert-deftest jsonyter-test-version-finds-the-python-behind-an-entry-point ()
+  "For a console script, the interpreter on its first line is the one asked."
+  (jsonyter-tests--with-fake-python dir "echo '4.5.6 3.10.2'"
+    (let ((fake (expand-file-name "fakepy" dir))
+          (script (expand-file-name "jsonyter" dir)))
+      (dolist (first-lines
+               (list (concat "#!" fake)
+                     "#!/usr/bin/env fakepy"
+                     (format "#!/bin/sh\n'''exec' \"%s\" \"$0\" \"$@\"\n' '''" fake)))
+        (jsonyter-tests--write-script script first-lines)
+        (let ((jsonyter-command (list script))
+              (exec-path (cons dir exec-path)))
+          (should (equal (plist-get (jsonyter--bridge-info) :version) "4.5.6")))))))
+
+(ert-deftest jsonyter-test-version-says-why-it-cannot-tell ()
+  "No answer is an explanation in the report, never an error."
+  (jsonyter-tests--with-fake-python dir
+      "echo \"ModuleNotFoundError: No module named 'jsonyter'\" >&2; exit 1"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (should (equal (jsonyter-version)
+                     (format "jsonyter.el v%s, jsonyter bridge version unknown (ModuleNotFoundError: No module named 'jsonyter')"
+                             jsonyter-version))))
+    (let ((jsonyter-command '("no-such-program-for-jsonyter-tests")))
+      (should (string-match-p "bridge version unknown (cannot tell which Python"
+                              (jsonyter-version))))
+    ;; A shell script launcher is not a Python.
+    (jsonyter-tests--write-script (expand-file-name "jsonyter" dir) "#!/bin/sh")
+    (let ((jsonyter-command (list (expand-file-name "jsonyter" dir))))
+      (should (null (jsonyter--bridge-python))))))
+
+(ert-deftest jsonyter-test-version-does-not-wait-for-a-stuck-python ()
+  "An interpreter that never answers costs the timeout, and no more."
+  (jsonyter-tests--with-fake-python dir "sleep 20"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter"))
+          (jsonyter--bridge-probe-timeout 0.3)
+          (start (float-time)))
+      (should (string-match-p "did not answer" (jsonyter-version)))
+      (should (< (- (float-time) start) 5)))))
+
+(ert-deftest jsonyter-test-version-full-adds-the-server-and-emacs ()
+  "The full report names the server through a live bridge, and Emacs."
+  (jsonyter-tests--with-fake-python dir "echo '2.1.1 3.12.3'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter")))
+      (with-temp-buffer
+        (let ((text (jsonyter-version-full)))
+          (should (string-match-p "running on jsonyter v2\\.1\\.1 (Python 3\\.12\\.3)" text))
+          (should (string-match-p "Jupyter server not connected" text))
+          (should (string-match-p (regexp-quote (format "Emacs %s" emacs-version)) text)))
+        (setq-local jsonyter--process (start-process "jsonyter-test-version" nil "cat"))
+        (unwind-protect
+            (cl-letf (((symbol-function 'jsonyter--request-sync)
+                       (lambda (method &rest _)
+                         (should (equal method "version"))
+                         '(:version "2.14.2"))))
+              (should (string-match-p "Jupyter server 2\\.14\\.2" (jsonyter-version-full))))
+          (delete-process jsonyter--process))))))
+
+(ert-deftest jsonyter-test-version-can-be-inserted ()
+  "A prefix argument puts the report in the buffer; otherwise it is shown."
+  (jsonyter-tests--with-fake-python dir "echo '2.1.1 3.12.3'"
+    (let ((jsonyter-command (list (expand-file-name "fakepy" dir) "-m" "jsonyter"))
+          (shown nil))
+      (with-temp-buffer
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+          (call-interactively #'jsonyter-version)
+          (should (string-match-p "\\`jsonyter\\.el v[0-9.]+ running on jsonyter v2\\.1\\.1\\'" shown))
+          (should (equal (buffer-string) ""))
+          (setq shown nil)
+          (let ((current-prefix-arg '(4)))
+            (call-interactively #'jsonyter-version))
+          (should (null shown))
+          (should (string-match-p "running on jsonyter v2\\.1\\.1" (buffer-string))))))))
+
 (provide 'jsonyter-tests)
 ;;; jsonyter-tests.el ends here
