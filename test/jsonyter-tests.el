@@ -2267,6 +2267,111 @@ to the on-success handler, without a real bridge in the loop."
         (jsonyter-notebook-export "markdown" "/tmp/out/analysis.md"))
       (should (string-match-p "1 resource" reported)))))
 
+;;;; Export reverts a buffer visiting the written path
+;; Spec: openspec/changes/notebook-export-revert-open-buffer
+
+(ert-deftest jsonyter-test-revert-if-visiting-no-buffer-is-a-no-op ()
+  "Reverting a path nothing is visiting signals no error."
+  (should-not (jsonyter--revert-if-visiting "/nonexistent/path/does-not-exist.html")))
+
+(ert-deftest jsonyter-test-revert-if-visiting-swallows-a-revert-error ()
+  "A failure reverting the buffer never propagates out of the helper."
+  (let* ((out (make-temp-file "jsonyter-export-out-" nil ".html"))
+         (out-buffer nil))
+    (unwind-protect
+        (progn
+          (with-temp-file out (insert "content"))
+          (setq out-buffer (find-file-noselect out))
+          (cl-letf (((symbol-function 'revert-buffer)
+                     (lambda (&rest _) (error "boom"))))
+            (should-not (jsonyter--revert-if-visiting out))))
+      (when (buffer-live-p out-buffer)
+        (with-current-buffer out-buffer (set-buffer-modified-p nil))
+        (kill-buffer out-buffer))
+      (when (file-exists-p out) (delete-file out)))))
+
+(ert-deftest jsonyter-test-export-reverts-visiting-buffer-when-unmodified ()
+  "After a successful export, an already-open, unmodified buffer visiting
+the exported path is reverted to show what was just written."
+  (jsonyter-tests--with-notebook
+    (let* ((out (make-temp-file "jsonyter-export-out-" nil ".html"))
+           (out-buffer nil))
+      (unwind-protect
+          (progn
+            (with-temp-file out (insert "old content"))
+            (setq out-buffer (find-file-noselect out))
+            (with-current-buffer out-buffer (should-not (buffer-modified-p)))
+            (with-temp-file out (insert "new content"))
+            (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                      ((symbol-function 'jsonyter--export-run)
+                       (lambda (_session _params on-success)
+                         (funcall on-success (list :format "html" :path out :bytes 11)))))
+              (jsonyter-notebook-export "html" out))
+            (with-current-buffer out-buffer
+              (should (equal (buffer-string) "new content"))))
+        (when (buffer-live-p out-buffer)
+          (with-current-buffer out-buffer (set-buffer-modified-p nil))
+          (kill-buffer out-buffer))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-export-prompts-before-reverting-modified-buffer ()
+  "A buffer with unsaved edits visiting the exported path is only reverted
+through the normal `revert-buffer' confirmation, never silently."
+  (jsonyter-tests--with-notebook
+    (let* ((out (make-temp-file "jsonyter-export-out-" nil ".html"))
+           (out-buffer nil)
+           (asked nil))
+      (unwind-protect
+          (progn
+            (with-temp-file out (insert "old content"))
+            (setq out-buffer (find-file-noselect out))
+            (with-current-buffer out-buffer
+              (goto-char (point-max))
+              (insert " unsaved edit")
+              (should (buffer-modified-p)))
+            (with-temp-file out (insert "new content"))
+            (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                      ((symbol-function 'jsonyter--export-run)
+                       (lambda (_session _params on-success)
+                         (funcall on-success (list :format "html" :path out :bytes 11))))
+                      ((symbol-function 'yes-or-no-p)
+                       (lambda (&rest _) (setq asked t) nil)))
+              (jsonyter-notebook-export "html" out))
+            (should asked)
+            (with-current-buffer out-buffer
+              (should (string-suffix-p " unsaved edit" (buffer-string)))))
+        (when (buffer-live-p out-buffer)
+          (with-current-buffer out-buffer (set-buffer-modified-p nil))
+          (kill-buffer out-buffer))
+        (when (file-exists-p out) (delete-file out))))))
+
+(ert-deftest jsonyter-test-export-reverts-bundle-resource-buffers ()
+  "A buffer visiting one of a bundled export's `:resources' paths is
+reverted too, not just the buffer visiting `:path'."
+  (jsonyter-tests--with-notebook
+    (let* ((res (make-temp-file "jsonyter-export-res-" nil ".txt"))
+           (res-buffer nil))
+      (unwind-protect
+          (progn
+            (with-temp-file res (insert "old"))
+            (setq res-buffer (find-file-noselect res))
+            (with-temp-file res (insert "new"))
+            (cl-letf (((symbol-function 'jsonyter--ensure-bridge) #'ignore)
+                      ((symbol-function 'jsonyter--export-run)
+                       (lambda (_session _params on-success)
+                         (funcall on-success
+                                  (list :format "markdown" :path "/tmp/does-not-matter.md"
+                                        :bytes 5 :bundle t
+                                        :resources (vector (list :name (file-name-nondirectory res)
+                                                                  :path res :bytes 3)))))))
+              (jsonyter-notebook-export "markdown" "/tmp/does-not-matter.md"))
+            (with-current-buffer res-buffer
+              (should (equal (buffer-string) "new"))))
+        (when (buffer-live-p res-buffer)
+          (with-current-buffer res-buffer (set-buffer-modified-p nil))
+          (kill-buffer res-buffer))
+        (when (file-exists-p res) (delete-file res))))))
+
 (ert-deftest jsonyter-test-notebook-export-round-trips-with-bridge ()
   "Exporting the fixture notebook to html via `to_path' produces a
 non-empty file carrying the markdown cell's rendered heading.  Needs
@@ -7215,6 +7320,67 @@ OUTPUTS is a list of nbformat output plists (code cells only)."
 (ert-deftest jsonyter-test-prune-outside-a-notebook-is-a-user-error ()
   (with-temp-buffer
     (should-error (jsonyter-notebook-prune) :type 'user-error)))
+
+;;;; notebook split cell
+;; Spec: openspec/changes/notebook-split-cell
+
+(ert-deftest jsonyter-test-split-cell-mid-source ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json '(("code" "a\nb\nc\n" nil)))
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (forward-line 1)
+    (jsonyter-split-cell)
+    (should (equal (jsonyter-tests--cell-sources) '("a" "b\nc")))
+    (should (= (point) (overlay-start (jsonyter-tests--cell 1))))
+    (should (jsonyter-tests--cells-tile-buffer-p))))
+
+(ert-deftest jsonyter-test-split-cell-at-start-leaves-an-empty-upper-cell ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+    (goto-char (overlay-start (jsonyter-tests--cell 0)))
+    (jsonyter-split-cell)
+    (should (equal (jsonyter-tests--cell-sources) '("" "a\nb")))))
+
+(ert-deftest jsonyter-test-split-cell-at-end-leaves-an-empty-lower-cell ()
+  (jsonyter-tests--with-notebook-json
+      (jsonyter-tests--nb-json '(("code" "a\nb\n" nil)))
+    (goto-char (jsonyter--nb-source-end (jsonyter-tests--cell 0)))
+    (jsonyter-split-cell)
+    (should (equal (jsonyter-tests--cell-sources) '("a\nb" "")))))
+
+(ert-deftest jsonyter-test-split-cell-preserves-markdown-type ()
+  (jsonyter-tests--with-notebook
+    (goto-char (overlay-start (jsonyter-tests--cell 2)))
+    (forward-char 2)
+    (jsonyter-split-cell)
+    (should (equal (mapcar (lambda (c) (overlay-get c 'jsonyter-cell-type))
+                           (last (jsonyter--nb-cells) 2))
+                   '("markdown" "markdown")))))
+
+(ert-deftest jsonyter-test-split-cell-discards-output-id-and-exec-count ()
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+    (let ((cell (jsonyter-tests--cell 0)))
+      (should (overlay-get cell 'jsonyter-cell-id))
+      (should (overlay-get cell 'jsonyter-exec-count))
+      (goto-char (overlay-start cell))
+      (forward-char 1))
+    (jsonyter-split-cell)
+    (should (= (length (jsonyter--nb-cells)) 3))
+    (dolist (c (list (jsonyter-tests--cell 0) (jsonyter-tests--cell 1)))
+      (should-not (overlay-get c 'jsonyter-cell-id))
+      (should-not (overlay-get c 'jsonyter-exec-count))
+      (should-not (overlay-get c 'jsonyter-file-outputs))
+      (should (equal (jsonyter-tests--output-text c) "")))))
+
+(ert-deftest jsonyter-test-split-cell-in-output-is-a-user-error ()
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+    (goto-char (1- (overlay-end (jsonyter-tests--cell 0))))
+    (should-error (jsonyter-split-cell) :type 'user-error)
+    (should (= (length (jsonyter--nb-cells)) 2))))
+
+(ert-deftest jsonyter-test-split-cell-outside-a-notebook-is-a-user-error ()
+  (with-temp-buffer
+    (should-error (jsonyter-split-cell) :type 'user-error)))
 
 ;;;; notebook raw cells
 ;; Spec: openspec/changes/notebook-raw-cells
