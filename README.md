@@ -49,7 +49,7 @@ change from breaking your setup between updates.
 `load-path`:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.2/jsonyter.el
+curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.6.0/jsonyter.el
 ```
 
 ```elisp
@@ -61,7 +61,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.5.2/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.5.2"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.6.0"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +69,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.5.2"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.6.0"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -134,7 +134,7 @@ instead of the script:
 jsonyter Python package that `jsonyter-command` starts:
 
 ```
-jsonyter.el v2.5.2 running on jsonyter v2.1.1
+jsonyter.el v2.6.0 running on jsonyter v2.1.1
 ```
 
 `M-x jsonyter-version-full` adds what a bug report needs: the file Emacs
@@ -495,6 +495,7 @@ can bind them in your own keymap instead of relying on the defaults above:
 | `jsonyter-toggle-cell-type` | `C-c C-t` |
 | `jsonyter-set-cell-type` | — (`M-x`) |
 | `jsonyter-notebook-prune` | — (`M-x`) |
+| `jsonyter-split-cell` | — (`M-x`) |
 | `jsonyter-notebook-latex-preview-toggle` | `C-c C-v` |
 | `jsonyter-move-cell-up` | `C-c <up>` |
 | `jsonyter-move-cell-down` | `C-c <down>` |
@@ -536,6 +537,14 @@ carry any).
 `M-x jsonyter-notebook-prune` deletes every empty cell — blank source and
 no output — says how many it removed, and never removes the notebook's
 last cell. A cell that is blank but shows output is not empty.
+
+`M-x jsonyter-split-cell` splits the cell at point into two cells of the
+same type: everything before point goes into the upper cell, everything
+from point onward into the lower, and point ends at the start of the
+lower cell. Point must be in the cell's source, not its rendered output —
+either refuses with an error and leaves the buffer untouched. Both halves
+start with no stored output and no execution count, even if the original
+cell had either.
 
 The buffer keeps its cells in step with what you see. If you move past
 the last cell's final newline (`M->`, or `C-n` off the last line) and
@@ -1194,7 +1203,12 @@ was last saved to a file. It runs on the bridge's REST pool rather than
 a kernel, so it is safe to start while a cell is executing, and
 asynchronously: a PDF or `webpdf` render can take minutes
 (`jsonyter-export-timeout`, default 120s, matching the bridge's own),
-and the mode line shows a plain `:export` tag while one is in flight.
+and the mode line shows a plain `:export` tag while one is in flight. If
+you already have the destination file (or, for a bundled export, one of
+its resource files) open in another buffer, that buffer is refreshed
+once the export succeeds — through the usual `revert-buffer` confirmation
+if it has unsaved edits of its own, silently otherwise — so it never
+keeps showing what it last read before the export overwrote it.
 
 **`html` and `markdown` work essentially everywhere; `pdf` and `webpdf`
 frequently do not**, because both need extra software installed **on the

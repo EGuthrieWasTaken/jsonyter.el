@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.5.2
+;; Version: 2.6.0
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -4482,6 +4482,30 @@ the strings code, markdown or raw; see `jsonyter--nb-type-from-prefix'."
   (let ((cell (jsonyter--nb-cell-at)))
     (jsonyter--nb-insert-cell (if cell (overlay-start cell) (point-min))
                               (jsonyter--nb-type-from-prefix arg))))
+
+;;;###autoload
+(defun jsonyter-split-cell ()
+  "Split the cell at point into an upper and a lower cell.
+Point must be within the cell's own source, not its rendered output.
+The upper cell gets the source up to point, the lower cell the rest;
+both keep the original cell's type and start with no id and no output.
+Point ends at the start of the lower cell."
+  (interactive)
+  (jsonyter--nb-ensure-notebook)
+  (let ((cell (jsonyter--nb-cell-at)))
+    (unless cell (user-error "No cell at point"))
+    (let ((start (overlay-start cell))
+          (source-end (jsonyter--nb-source-end cell))
+          (split (point)))
+      (when (> split source-end)
+        (user-error "jsonyter: point is in the cell's output, not its source"))
+      (let ((cell-type (overlay-get cell 'jsonyter-cell-type))
+            (upper (buffer-substring-no-properties start split))
+            (lower (buffer-substring-no-properties split source-end)))
+        (jsonyter--nb-excise-cell cell)
+        (let ((upper-cell (jsonyter--nb-put-cell start cell-type upper)))
+          (jsonyter--nb-put-cell (overlay-end upper-cell) cell-type lower))
+        (set-buffer-modified-p t)))))
 
 (defun jsonyter--nb-excise-cell (cell)
   "Remove CELL from the buffer — source and output together — no questions asked."
@@ -9359,6 +9383,15 @@ prompt time.  Whatever TO-PATH the user confirms is what
   (or (cdr (assoc format jsonyter--export-format-extensions))
       (concat "." format)))
 
+(defun jsonyter--revert-if-visiting (path)
+  "Revert the buffer visiting PATH, if one is open."
+  (let ((buf (find-buffer-visiting path)))
+    (when buf
+      (condition-case nil
+          (with-current-buffer buf
+            (revert-buffer t (not (buffer-modified-p)) t))
+        (error nil)))))
+
 (defun jsonyter--export-run (session params on-success)
   "Run `export_notebook' with PARAMS through this buffer's bridge, async.
 
@@ -9459,6 +9492,9 @@ extension for FORMAT; see `jsonyter--export-format-guess-extension'."
            :metadata (or jsonyter--nb-metadata (list))
            :include_outputs t :timeout (or timeout jsonyter-export-timeout))
      (lambda (result)
+       (jsonyter--revert-if-visiting (plist-get result :path))
+       (dolist (res (append (plist-get result :resources) nil))
+         (jsonyter--revert-if-visiting (plist-get res :path)))
        (message "jsonyter: exported %s to %s (%s)%s"
                 (plist-get result :format)
                 (plist-get result :path)
