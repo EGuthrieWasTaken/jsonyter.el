@@ -537,6 +537,50 @@ Where the output goes depends on what the buffer's text is; see
              body
            (concat "\n" body)))))))
 
+(defun jsonyter--nb-silent-replace (beg end replace)
+  "Call REPLACE, which rewrites BEG..END without modification hooks, then
+tell the buffer's change trackers what it did.  Returns what REPLACE did.
+
+A cell's output is written with `with-silent-modifications', so it stays
+out of the undo history and the modified flag, and that also keeps
+`before-change-functions' and `after-change-functions' from running.
+Everything that follows edits to mirror the buffer then misses the
+write: `lsp-mode' and `eglot' keep a language server's copy of the text
+up to date from exactly those hooks, and a server that never hears about
+a cell's output holds a copy that is shorter than the buffer by the
+height of every output above the line being edited, so its answers
+(on-type formatting, completion, diagnostics) apply to the wrong lines.
+
+REPLACE is run with the hooks still off and returns the end of the text
+it wrote.  The hooks are then run once, as Emacs runs them for a
+replacement: `before-change-functions' first, with the text as it was,
+and `after-change-functions' afterwards with the length of what was
+replaced.  `jsonyter--nb-cell-surgery' should be bound by the caller, so
+that this package's own hook stands down just as it does for the write.
+A hook that signals is reported and skipped; a failing third-party
+tracker must not be able to stop a cell's output from appearing."
+  (unless (and (<= (point-min) beg) (<= beg end) (<= end (point-max)))
+    (error "jsonyter: bad region %s..%s" beg end))
+  (let ((modification-hooks-were-off inhibit-modification-hooks))
+    (unless modification-hooks-were-off
+      (jsonyter--nb-run-change-hook 'before-change-functions beg end))
+    (let ((new-end (funcall replace)))
+      (unless modification-hooks-were-off
+        (jsonyter--nb-run-change-hook 'after-change-functions
+                                      beg new-end (- end beg)))
+      new-end)))
+
+(defun jsonyter--nb-run-change-hook (hook &rest args)
+  "Run HOOK, a change hook, with ARGS as Emacs does for an edit.
+Modification hooks stay off inside it, as they are while Emacs runs
+them, and a hook that signals is reported and left to the next change
+rather than stopping the caller."
+  (let ((inhibit-modification-hooks t))
+    (condition-case err
+        (apply #'run-hook-with-args hook args)
+      (error (message "jsonyter: %s hook failed: %s" hook
+                      (error-message-string err))))))
+
 (defun jsonyter--nb-show-output-as-text (cell)
   "Rewrite CELL's output region in the buffer from its rendered text.
 
@@ -567,11 +611,14 @@ by the edit either way.
 and out of the buffer's modified flag — output is a result, not part of
 the document, exactly as it was when it lived in an overlay string — and
 stands `after-change-functions' down for the same reason
-`jsonyter--nb-cell-surgery' does.  That also means Emacs's usual
+`jsonyter--nb-cell-surgery' does.  The rewrite is still reported to
+whatever else follows edits, a language server's copy of the buffer
+above all: see `jsonyter--nb-silent-replace'.  Emacs's usual
 `syntax-ppss' cache invalidation (hung off `before-change-functions')
-never runs for this edit, so it is flushed explicitly from SRC-END: a
-cell re-run whose new output changes what `jsonyter--nb-syntax-propertize'
-blanks there would otherwise leave stale parse state behind."
+is one of those hooks, but it is also flushed explicitly from SRC-END,
+which does not depend on what is installed: a cell re-run whose new
+output changes what `jsonyter--nb-syntax-propertize' blanks there would
+otherwise leave stale parse state behind."
   (let* ((body (jsonyter--nb-outputs-string
                 (overlay-get cell 'jsonyter-output-string)
                 (overlay-get cell 'jsonyter-output-stale)))
@@ -589,24 +636,27 @@ blanks there would otherwise leave stale parse state behind."
          (point-marker (copy-marker (point) t))
          (new-end
           (let ((jsonyter--nb-cell-surgery t))
-            (with-silent-modifications
-              (delete-region src-end out-end)
-              (goto-char src-end)
-              (unless (string-empty-p body)
-                ;; Output must begin on a line of its own.  A notebook
-                ;; cell owns its trailing newline, so this only fires
-                ;; for a cell whose own has been edited away; the
-                ;; newline stays outside the read-only span so that
-                ;; typing at the end of that line still works.
-                (unless (bolp) (insert "\n"))
-                (let ((start (point)))
-                  (insert body)
-                  (add-text-properties
-                   start (point)
-                   '(read-only t front-sticky (read-only) rear-nonsticky t))))
-              (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
-              (move-overlay cell (overlay-start cell) (point))
-              (point)))))
+            (jsonyter--nb-silent-replace
+             src-end out-end
+             (lambda ()
+               (with-silent-modifications
+                 (delete-region src-end out-end)
+                 (goto-char src-end)
+                 (unless (string-empty-p body)
+                   ;; Output must begin on a line of its own.  A notebook
+                   ;; cell owns its trailing newline, so this only fires
+                   ;; for a cell whose own has been edited away; the
+                   ;; newline stays outside the read-only span so that
+                   ;; typing at the end of that line still works.
+                   (unless (bolp) (insert "\n"))
+                   (let ((start (point)))
+                     (insert body)
+                     (add-text-properties
+                      start (point)
+                      '(read-only t front-sticky (read-only) rear-nonsticky t))))
+                 (dolist (o adjacent) (move-overlay o (point) (overlay-end o)))
+                 (move-overlay cell (overlay-start cell) (point))
+                 (point)))))))
     (goto-char point-marker)
     (set-marker point-marker nil)
     (syntax-ppss-flush-cache src-end)
@@ -810,15 +860,30 @@ BASE is the buffer's syntax table it was built from; see
   "The syntax table that goes on text that is not kernel-language code.
 
 Every character is punctuation, so none of it can open or close a
-string, comment or pair.  The exception is whitespace: a character the
-buffer's own syntax table gives the whitespace or the comment-end class,
-which in practice means the space, the tab and above all the newline,
-keeps exactly the entry the language mode gave it.  Packages that walk
-the buffer backward a line at a time, such as ESS when it indents, step
-over the newline ending the previous cell with `forward-comment', which
-moves only over whitespace and comment ends; with the newline as
-punctuation it cannot move, and the walk goes round forever on the first
-line of every code cell.
+string, comment or pair, with two kinds of exception that cannot.
+
+Whitespace: a character the buffer's own syntax table gives the
+whitespace or the comment-end class, which in practice means the space,
+the tab and above all the newline, keeps exactly the entry the language
+mode gave it.  Packages that walk the buffer backward a line at a time,
+such as ESS when it indents, step over the newline ending the previous
+cell with `forward-comment', which moves only over whitespace and comment
+ends; with the newline as punctuation it cannot move, and the walk goes
+round forever on the first line of every code cell.
+
+Words: a letter or digit stays a word constituent, so `forward-word',
+`backward-word' and everything built on them (`kill-word', `M-DEL',
+`transpose-words', word-wise search and Meow's word motions) stop at the
+words of a markdown cell, a raw cell or rendered output as they do in a
+code cell.  With no word characters in the span those motions have no
+boundary to stop at and run straight through it, into the next code cell
+or to the end of the buffer.  The ASCII word characters come from the
+buffer's own table, so a language that treats an ASCII character as a
+letter (or not) is followed; every other character that the standard
+syntax table calls a word constituent, accented letters and CJK
+included, is a word here too.  A word character cannot begin or end a
+string, a comment or a pair, so keeping it does not undo the point of the
+table.
 
 The table is built from the buffer's current syntax table and kept
 until that changes."
@@ -826,8 +891,17 @@ until that changes."
     (if (eq (car jsonyter--nb-inert-table) base)
         (cdr jsonyter--nb-inert-table)
       (let ((table (make-char-table 'syntax-table (string-to-syntax "."))))
+        ;; Letters and digits beyond ASCII, from the standard table.
+        (map-char-table
+         (lambda (key value)
+           (when (and (consp value) (eq (syntax-class value) 2)
+                      (if (consp key) (> (cdr key) 127) (> key 127)))
+             (if (consp key)
+                 (set-char-table-range table (cons (max (car key) 128) (cdr key)) value)
+               (aset table key value))))
+         (standard-syntax-table))
         (dotimes (char 128)
-          (when (memq (syntax-class (aref base char)) '(0 12))
+          (when (memq (syntax-class (aref base char)) '(0 2 12))
             (aset table char (aref base char))))
         (setq jsonyter--nb-inert-table (cons base table))
         table))))
@@ -1719,7 +1793,11 @@ Point ends at the start of the lower cell."
     ;; in the undo history, and undoing would then restore a read-only
     ;; block with no cell left to own it — text the buffer would give no
     ;; way to remove again.
-    (with-silent-modifications (delete-region src-end end))
+    (jsonyter--nb-silent-replace
+     src-end end
+     (lambda ()
+       (with-silent-modifications (delete-region src-end end))
+       src-end))
     ;; Only that silent delete needs the history trimmed after it; a cell
     ;; with no output (src-end = end) had nothing removed silently, so
     ;; trimming here would throw away undo entries for the whole rest of
@@ -2036,6 +2114,16 @@ font-lock, so undo and editing still see only the cell source.
         (setq-local parse-sexp-lookup-properties t)
         (setq-local syntax-propertize-function #'jsonyter--nb-syntax-propertize)
         (syntax-ppss-flush-cache (point-min))
+        ;; Nor may one code cell's unfinished statement or open bracket
+        ;; decide how the next cell is indented; see
+        ;; `jsonyter--nb-indent-line-in-cell'.  The tabbing functions
+        ;; are left alone: `indent-according-to-mode' and TAB tell them
+        ;; apart by identity, which an advised function would defeat.
+        (unless (memq indent-line-function
+                      '(indent-relative indent-relative-maybe
+                        indent-relative-first-indent-point))
+          (add-function :around (local 'indent-line-function)
+                        #'jsonyter--nb-indent-line-in-cell))
         (add-hook 'write-contents-functions #'jsonyter-notebook-save nil t)
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions
@@ -2052,6 +2140,8 @@ font-lock, so undo and editing still see only the cell source.
     (kill-local-variable 'font-lock-unfontify-region-function)
     (kill-local-variable 'parse-sexp-lookup-properties)
     (kill-local-variable 'syntax-propertize-function)
+    (remove-function (local 'indent-line-function)
+                     #'jsonyter--nb-indent-line-in-cell)
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
@@ -2059,6 +2149,29 @@ font-lock, so undo and editing still see only the cell source.
                  #'jsonyter--nb-line-numbers-sync t)
     (jsonyter--nb-numbers-deactivate)
     (jsonyter-mode -1)))
+
+(defun jsonyter--nb-indent-line-in-cell (indent-line &rest args)
+  "Call INDENT-LINE (with ARGS) with the buffer narrowed to point's code cell.
+An `:around' advice on the buffer-local `indent-line-function' of a
+notebook.  Indentation is computed from the text before the line, and
+`syntax-ppss' parses from the top of the buffer through every earlier
+cell: one that ends inside a bracket, or in the middle of a statement,
+would then be read as the context of every cell after it, and the first
+line typed in the next cell would come out indented as a continuation of
+code that is not in it.  Narrowing to the cell's own source gives its
+indentation exactly the context it has in a file of its own, and
+`syntax-ppss' keeps a separate parse for a narrowed buffer.
+
+Outside a code cell's source (in prose, in output, past the end of a
+cell) nothing is narrowed."
+  (let ((cell (jsonyter--nb-cell-at)))
+    (if (and cell
+             (equal (overlay-get cell 'jsonyter-cell-type) "code")
+             (<= (point) (jsonyter--nb-source-end cell)))
+        (save-restriction
+          (narrow-to-region (overlay-start cell) (jsonyter--nb-source-end cell))
+          (apply indent-line args))
+      (apply indent-line args))))
 
 (defun jsonyter--nb-new-id ()
   "A fresh cell id for a notebook written at nbformat 4.5."

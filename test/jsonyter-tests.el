@@ -959,25 +959,173 @@ then back over whitespace and comments) and skip blanks."
       (cl-incf steps))
     (and (< steps limit) steps)))
 
-(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-syntax ()
+(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-and-word-syntax ()
   "Whitespace in prose and output keeps the language's own syntax.
-Every other character there is punctuation; a space, a tab and a newline
-are what the major mode's syntax table says they are."
+A letter or digit is a word constituent, so word motion has boundaries
+to stop at.  Every other character there is punctuation, so none of it
+can open a string, a comment or a pair."
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
     (syntax-propertize (point-max))
     (let ((spans (jsonyter--nb-non-code-spans (point-min) (point-max)))
-          (checked 0))
+          (checked 0)
+          (words 0))
       (should (>= (length spans) 2))
       (dolist (span spans)
         (dolist (pos (number-sequence (car span) (1- (cdr span))))
           (let ((char (char-after pos))
                 (class (syntax-class (syntax-after pos))))
             (cl-incf checked)
-            (if (memq char '(?\s ?\t ?\n))
-                (should (eq class (syntax-class (aref (syntax-table) char))))
-              (unless (and (>= char ?0) (<= char ?9))
-                (should (eq class 1)))))))
-      (should (> checked 100)))))
+            (cond
+             ((memq char '(?\s ?\t ?\n))
+              (should (eq class (syntax-class (aref (syntax-table) char)))))
+             ((string-match-p "[[:alnum:]]" (string char))
+              (cl-incf words)
+              (should (eq class 2)))
+             (t (should (eq class 1)))))))
+      (should (> checked 100))
+      (should (> words 30)))))
+
+(defconst jsonyter-tests--notebook-open-bracket-then-code "\
+{
+ \"cells\": [
+  {\"cell_type\": \"code\", \"id\": \"aaa\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"total = compute(\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "Python notebook whose first cell ends inside an unclosed bracket.")
+
+(ert-deftest jsonyter-test-indentation-ignores-an-unfinished-earlier-cell ()
+  "A cell is indented as if it were a file of its own.
+An earlier cell's unclosed bracket used to be read as the context of the
+next cell, so its second line came out indented as a continuation (the
+\"RET indents too far at the start of an R cell\" report)."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (insert "x = 1\ny = 2")
+    (indent-according-to-mode)
+    (should (= (current-indentation) 0))
+    ;; Within the cell itself an open bracket still means a continuation.
+    (goto-char (point-max))
+    (insert "\nz = f(\n1")
+    (indent-according-to-mode)
+    (should (> (current-indentation) 0))
+    ;; And the first cell, which really is inside its bracket, is untouched.
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\n1")
+    (indent-according-to-mode)
+    (should (> (current-indentation) 0))))
+
+(ert-deftest jsonyter-test-indentation-is-only-narrowed-while-it-runs ()
+  "Indenting leaves the buffer widened and point where indentation put it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (insert "x = 1")
+    (indent-according-to-mode)
+    (should (= (point-min) 1))
+    (should (= (point-max) (1+ (buffer-size))))
+    (should (eolp))))
+
+(ert-deftest jsonyter-test-indentation-hook-leaves-with-the-mode ()
+  "Turning the notebook mode off takes the cell-narrowing advice with it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (should (advice--p indent-line-function))
+    (jsonyter-notebook-mode -1)
+    (should-not (advice--p indent-line-function))))
+
+(defconst jsonyter-tests--notebook-word-motion "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"m0\", \"metadata\": {},
+   \"source\": \"Intro text with several words.\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"c0\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\",
+                \"text\": \"output result line\\n\"}],
+   \"source\": \"alpha = 1\\n\"},
+  {\"cell_type\": \"raw\", \"id\": \"r0\", \"metadata\": {},
+   \"source\": \"Raw payload goes here\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"c1\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"beta = 2\\n\"},
+  {\"cell_type\": \"markdown\", \"id\": \"m1\", \"metadata\": {},
+   \"source\": \"Closing notes caf\\u00e9 r\\u00e9sum\\u00e9 42.\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "Python notebook: markdown, a code cell with output, raw, code, markdown.
+Every kind of span word motion used to run straight through, and a last
+cell that has no code cell after it to run into.")
+
+(defun jsonyter-tests--word-motion-failures (phrase)
+  "Where word motion over PHRASE, a run of words in the buffer, goes wrong.
+From the start of each word `forward-word' must stop at its end, and from
+the end `backward-word' must stop at its start: the same stops they make
+in a code cell or a plain buffer.  A list of descriptions, nil when it all
+holds."
+  (let (failures)
+    (goto-char (point-min))
+    (unless (search-forward phrase nil t)
+      (error "No %S in the buffer" phrase))
+    (let ((start (match-beginning 0)))
+      (dolist (word (split-string phrase "[^[:alnum:]]+" t))
+        (goto-char start)
+        (search-forward word)
+        (let ((word-start (match-beginning 0)) (word-end (match-end 0)))
+          (goto-char word-start)
+          (forward-word)
+          (unless (= (point) word-end)
+            (push (format "forward-word from the start of %S went to %d, not %d"
+                          word (point) word-end)
+                  failures))
+          (goto-char word-end)
+          (backward-word)
+          (unless (= (point) word-start)
+            (push (format "backward-word from the end of %S went to %d, not %d"
+                          word (point) word-start)
+                  failures)))))
+    (nreverse failures)))
+
+(ert-deftest jsonyter-test-word-motion-stops-in-prose-raw-and-output ()
+  "`forward-word' and `backward-word' stop at word boundaries in any span.
+Markdown, raw and rendered output text used to have no word characters,
+so the motions ran through the whole span to the next code cell, or to the
+start or end of the document.  Covers the last cell in the buffer, which
+has no code cell after it, and words with accents."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-word-motion
+    (syntax-propertize (point-max))
+    (dolist (phrase '("Intro text with several words"   ; markdown, then code
+                      "output result line"               ; rendered output
+                      "Raw payload goes here"            ; raw
+                      "Closing notes caf\u00e9 r\u00e9sum\u00e9 42"))     ; last cell
+      (should (equal (jsonyter-tests--word-motion-failures phrase) nil)))))
+
+(ert-deftest jsonyter-test-word-motion-does-not-leave-the-cell ()
+  "`kill-word' in a markdown cell kills the word, not the code cell below.
+Killing the first word after \"Intro \" used to take the rest of the cell and
+the first word of the code cell with it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-word-motion
+    (syntax-propertize (point-max))
+    (let ((m0 (car (jsonyter--nb-cells))))
+      (goto-char (overlay-start m0))
+      (search-forward "text")
+      (goto-char (match-beginning 0))
+      (kill-word 1)
+      (should (equal (buffer-substring-no-properties
+                      (overlay-start m0) (jsonyter--nb-source-end m0))
+                     "Intro  with several words.\n"))
+      (goto-char (point-min))
+      (should (search-forward "alpha = 1" nil t)))))
 
 (ert-deftest jsonyter-test-walking-back-over-a-cell-boundary-stops ()
   "A backward line walk from the first line of a cell reaches the top.
@@ -8583,6 +8731,82 @@ Everything is bound or restored, so the rest of the suite is untouched."
                 ((string-match-p "Call `jsonyter[^ ]*', then" raw)
                  (push (format "%s reads as instructions to an implementer" sym) problems)))))))))
     (should (equal (sort problems #'string<) nil))))
+
+;;;; Change tracking: a mirror of the buffer stays in step with output writes
+
+(defun jsonyter-tests--track-changes ()
+  "Make a mirror of this buffer that follows `after-change-functions'.
+What `lsp-mode' and `eglot' do to keep a language server's copy of the
+buffer: start from the text as it is, and on each change replace LEN
+characters at BEG with the text now there.  Returns a function that
+gives the mirror's current text.  `before-change-functions' calls are
+checked to arrive with the text still as the mirror has it."
+  (let ((mirror (buffer-substring-no-properties (point-min) (point-max)))
+        (pending nil))
+    (add-hook 'before-change-functions
+              (lambda (beg end)
+                (setq pending (list beg end))
+                ;; The text BEG..END is still in the buffer, as the mirror has it.
+                (should (equal (buffer-substring-no-properties beg end)
+                               (substring mirror (1- beg) (1- end)))))
+              nil t)
+    (add-hook 'after-change-functions
+              (lambda (beg end len)
+                (should (equal (car pending) beg))
+                (setq mirror (concat (substring mirror 0 (1- beg))
+                                     (buffer-substring-no-properties beg end)
+                                     (substring mirror (+ (1- beg) len)))))
+              nil t)
+    (lambda () mirror)))
+
+(ert-deftest jsonyter-test-output-writes-reach-change-trackers ()
+  "A language server's copy of the notebook stays equal to the buffer.
+Output is written into the buffer silently, which skips the change hooks,
+so a mirror kept up to date from them used to fall behind by the height
+of every output written: lines typed after a cell ran were then sent to
+the server at line numbers its copy did not have."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (let ((mirror (jsonyter-tests--track-changes))
+         (cells (jsonyter--nb-cells)))
+     (should (equal (funcall mirror) (buffer-substring-no-properties (point-min) (point-max))))
+     ;; A cell with output gains more, then has it replaced, then removed.
+     (dolist (text '("[1] 1 2 3\nline two\nline three\n" "short\n" ""))
+       (jsonyter--nb-set-output
+        (nth 1 cells)
+        (if (string-empty-p text) ""
+          (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text text))))
+       (should (equal (funcall mirror)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+     ;; The cell goes: its output first, silently, then its source.
+     (jsonyter--nb-set-output
+      (nth 1 cells)
+      (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "goes\nwith the cell\n")))
+     (jsonyter--nb-excise-cell (nth 1 cells))
+     (should (equal (funcall mirror)
+                    (buffer-substring-no-properties (point-min) (point-max)))))))
+
+(ert-deftest jsonyter-test-output-writes-do-not-dirty-or-undo ()
+  "Telling change trackers about a cell's output does not make it an edit.
+The buffer is not marked modified and nothing is added to the undo list."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (set-buffer-modified-p nil)
+   (setq buffer-undo-list nil)
+   (jsonyter--nb-set-output
+    (nth 1 (jsonyter--nb-cells))
+    (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "fresh\n")))
+   (should-not (buffer-modified-p))
+   (should (null buffer-undo-list))))
+
+(ert-deftest jsonyter-test-a-failing-change-hook-does-not-stop-output ()
+  "A tracker that signals cannot keep a cell's output from appearing."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (add-hook 'after-change-functions (lambda (&rest _) (error "boom")) nil t)
+   (let ((cell (nth 1 (jsonyter--nb-cells))))
+     (jsonyter--nb-set-output
+      cell (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "still here\n")))
+     (should (string-match-p "still here"
+                             (buffer-substring-no-properties (point-min) (point-max)))))))
+
 
 ;;;; Version
 
