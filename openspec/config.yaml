@@ -8,7 +8,12 @@ context: |
   (https://github.com/EGuthrieWasTaken/jsonyter).
 
   Tech stack:
-  - Emacs Lisp, single-file package: jsonyter.el (lexical-binding).
+  - Emacs Lisp package (lexical-binding), split into parts: jsonyter.el is
+    the entry point (header, `;; Version:`, requires) and jsonyter-custom,
+    -core, -repl, -attach, -notebook, -latex, -transfer, -sync, -script,
+    -org, -babel, -convert and -export hold the code.  Each part requires
+    what it uses and `declare-function`s anything in a part that loads
+    after it.
   - Minimum supported: Emacs 27.1, Org 9.4 (Package-Requires header).
     Don't use APIs newer than those without a fboundp/version guard.
   - Runtime dependency: the jsonyter bridge, 2.0.0 or newer.
@@ -26,7 +31,7 @@ context: |
     New behavior needs tests.
 
   Conventions:
-  - Every PR that touches jsonyter.el must bump the `;; Version:` header
+  - Every PR that touches jsonyter.el or any jsonyter-*.el must bump the `;; Version:` header
     to a never-before-used version (enforced by version-check.yml);
     release tags are vX.Y.Z and must match that header.
   - README.md is the user-facing manual; keep it in sync with behavior

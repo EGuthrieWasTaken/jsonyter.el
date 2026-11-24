@@ -8593,6 +8593,18 @@ Everything is bound or restored, so the rest of the suite is untouched."
     (and (re-search-forward "^;; Version: *\\([0-9][^ \t\n]*\\)" nil t)
          (match-string 1))))
 
+(defconst jsonyter-tests--parts
+  '("custom" "core" "repl" "attach" "notebook" "latex" "transfer" "sync"
+    "script" "org" "babel" "convert" "export")
+  "The parts jsonyter.el is split into, in the order it loads them.
+Each is the file \"jsonyter-NAME.el\".")
+
+(defun jsonyter-tests--part-files ()
+  "File names of jsonyter.el and every part it loads."
+  (cons "jsonyter.el"
+        (mapcar (lambda (part) (format "jsonyter-%s.el" part))
+                jsonyter-tests--parts)))
+
 (defmacro jsonyter-tests--with-fake-python (dir script &rest body)
   "Run BODY with DIR bound to a directory holding an executable \"fakepy\".
 SCRIPT is a shell script standing in for a Python interpreter.  Skipped
@@ -8615,6 +8627,53 @@ where there is no POSIX shell."
   (with-temp-file path (insert first-lines "\nprint('entry point')\n"))
   (set-file-modes path #o755))
 
+(ert-deftest jsonyter-test-every-part-is-loaded-by-the-main-file ()
+  "jsonyter.el requires every part, and the list above names every part."
+  (let ((on-disk (mapcar (lambda (f) (and (string-match "\\`jsonyter-\\(.+\\)\\.el\\'" f)
+                                          (match-string 1 f)))
+                         (directory-files
+                          (file-name-directory (locate-library "jsonyter.el" t))
+                          nil "\\`jsonyter-.+\\.el\\'"))))
+    (should (equal (sort (copy-sequence on-disk) #'string<)
+                   (sort (copy-sequence jsonyter-tests--parts) #'string<))))
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t))
+    (dolist (part jsonyter-tests--parts)
+      (goto-char (point-min))
+      (should (re-search-forward (format "^(require 'jsonyter-%s)$" part) nil t)))))
+
+(ert-deftest jsonyter-test-each-part-loads-on-its-own ()
+  "`(require 'jsonyter-PART)' works in a fresh Emacs, with nothing else loaded.
+A part may use another only after requiring it (or declaring its functions),
+so loading a part never depends on which one was loaded first.  Also checks
+that its user options landed in the `jsonyter' customization group."
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (dir (file-name-directory (locate-library "jsonyter.el" t))))
+    (dolist (part jsonyter-tests--parts)
+      (with-temp-buffer
+        (should (eq 0 (call-process
+                       emacs nil t nil "--batch" "-Q" "-L" dir
+                       "--eval" (format "(progn (require 'jsonyter-%s) (princ \"ok\"))" part))))
+        (should (equal (buffer-string) "ok"))))))
+
+(ert-deftest jsonyter-test-every-option-is-in-the-jsonyter-group ()
+  "No user option or face is left out of M-x customize-group RET jsonyter."
+  (let (loose)
+    (mapatoms
+     (lambda (sym)
+       (when (and (string-prefix-p "jsonyter" (symbol-name sym))
+                  (not (string-prefix-p "jsonyter-tests" (symbol-name sym)))
+                  ;; Mode hooks are never group members, here or anywhere.
+                  (not (string-suffix-p "-hook" (symbol-name sym)))
+                  (or (get sym 'standard-value) (get sym 'face-defface-spec))
+                  (not (let ((type (if (get sym 'standard-value) 'custom-variable 'custom-face))
+                             found)
+                         (dolist (g (get 'jsonyter 'custom-group))
+                           (when (and (eq (car g) sym) (eq (cadr g) type)) (setq found t)))
+                         found)))
+         (push sym loose))))
+    (should (equal (sort loose #'string<) nil))))
+
 (ert-deftest jsonyter-test-version-is-the-files-header ()
   "`jsonyter-version' (the variable) is the \"Version:\" header, not a copy."
   (should (string-match-p "\\`[0-9]+\\.[0-9]+\\.[0-9]+\\'" jsonyter-version))
@@ -8622,18 +8681,20 @@ where there is no POSIX shell."
 
 (ert-deftest jsonyter-test-version-is-baked-into-the-compiled-file ()
   "A compiled copy knows its version with the source gone.
-The version names the code that is loaded, so it is read when the file is
-compiled and not from the file on disk when it is asked for."
+The version names the code that is loaded, so it is read when the files are
+compiled and not from jsonyter.el on disk when it is asked for."
   (let* ((dir (make-temp-file "jsonyter-test-elc-" t))
          (emacs (expand-file-name invocation-name invocation-directory))
-         (source (expand-file-name "jsonyter.el" dir)))
+         (sources (mapcar (lambda (f) (expand-file-name f dir))
+                          (jsonyter-tests--part-files))))
     (unwind-protect
         (progn
-          (copy-file (locate-library "jsonyter.el" t) source)
-          (should (eq 0 (call-process emacs nil nil nil "--batch" "-Q" "-L" dir
-                                      "--eval" (format "(byte-compile-file %S)" source))))
-          (should (file-exists-p (expand-file-name "jsonyter.elc" dir)))
-          (delete-file source)
+          (dolist (source sources)
+            (copy-file (locate-library (file-name-nondirectory source) t) source))
+          (should (eq 0 (apply #'call-process emacs nil nil nil "--batch" "-Q" "-L" dir
+                               "-f" "batch-byte-compile" sources)))
+          (should (file-exists-p (expand-file-name "jsonyter-core.elc" dir)))
+          (mapc #'delete-file sources)
           (with-temp-buffer
             (should (eq 0 (call-process emacs nil t nil "--batch" "-Q" "-L" dir
                                         "--eval" "(progn (require 'jsonyter) (princ jsonyter-version))")))
@@ -8643,7 +8704,7 @@ compiled and not from the file on disk when it is asked for."
 (ert-deftest jsonyter-test-version-commands-are-autoloaded ()
   "`M-x jsonyter-version' works before anything else has loaded the package."
   (with-temp-buffer
-    (insert-file-contents (locate-library "jsonyter.el" t))
+    (insert-file-contents (locate-library "jsonyter-core.el" t))
     (dolist (name '("jsonyter-version" "jsonyter-version-full"))
       (goto-char (point-min))
       (should (re-search-forward

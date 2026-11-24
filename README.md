@@ -45,15 +45,16 @@ through the bridge (`jsonyter-notebook-export`), or to a plain
 Each release is a Git tag `vX.Y.Z`. Pinning to one keeps an upstream
 change from breaking your setup between updates.
 
-**Manual:** grab the single file at the tag and put it on your
-`load-path`:
+**Manual:** clone the tag and put the directory on your `load-path`. The
+package is `jsonyter.el` plus the `jsonyter-*.el` files beside it, so
+copy or clone all of them, not just one:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.6.0/jsonyter.el
+git clone --depth 1 --branch v2.6.0 https://github.com/EGuthrieWasTaken/jsonyter.el
 ```
 
 ```elisp
-(add-to-list 'load-path "/path/to/jsonyter")  ; the directory holding jsonyter.el
+(add-to-list 'load-path "/path/to/jsonyter.el")  ; the directory holding jsonyter.el
 (require 'jsonyter)  ; or autoload the jsonyter-start-* commands
 ```
 

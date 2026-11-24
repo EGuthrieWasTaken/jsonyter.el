@@ -25,6 +25,7 @@ on:
   pull_request:
     paths:
       - jsonyter.el
+      - jsonyter-*.el
       - README.md
 
 permissions:
@@ -126,7 +127,7 @@ jobs:
           EOF
           }
 
-          check_pattern "the curl download URL" 'EGuthrieWasTaken/jsonyter\.el/v[0-9]+\.[0-9]+\.[0-9]+/jsonyter\.el'
+          check_pattern "the manual install's git clone --branch" 'git clone --depth 1 --branch v[0-9]+\.[0-9]+\.[0-9]+ '
           check_pattern "package-vc-install's :rev" ':rev "v[0-9]+\.[0-9]+\.[0-9]+"'
           check_pattern "elpaca's :ref" ':ref "v[0-9]+\.[0-9]+\.[0-9]+"'
 
