@@ -30,6 +30,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'jsonyter-notebook)
+(require 'jsonyter-complete)
 (require 'jsonyter-sync)
 
 ;;;; Script cells (# %%)
@@ -129,6 +130,16 @@ nothing but surrounding blank lines is not called a change."
                ov (string-trim
                    (buffer-substring-no-properties start cell-end))))))))))
 
+(defun jsonyter--script-code-context ()
+  "The code context at point in a script: the `# %%' cell's code.
+nil on a cell's own `# %%' marker line, which is not code."
+  (pcase-let ((`(,start . ,end) (jsonyter--script-cell-bounds)))
+    (when (and (>= (point) start) (<= (point) end))
+      (list :code (buffer-substring-no-properties start end)
+            :pos (- (point) start)
+            :start start
+            :session (jsonyter--session)))))
+
 (defun jsonyter-script-run-cell (&optional advance)
   "Execute the script cell at point, showing its output inline.
 With ADVANCE, move to the next cell afterwards."
@@ -222,6 +233,7 @@ With ADVANCE, move to the next cell afterwards."
     (define-key map (kbd "C-c M-h") #'jsonyter-kernel-history)
     (define-key map (kbd "C-c M-O") #'jsonyter-script-clear-all-output)
     (define-key map (kbd "C-c C-y") #'jsonyter-sync)
+    (define-key map (kbd "C-c C-d") #'jsonyter-inspect)
     map)
   "Keymap for `jsonyter-script-mode'.")
 
@@ -243,10 +255,14 @@ actually save — is never touched.
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions
                   #'jsonyter--script-stale-after-change nil t)
+        ;; TAB completion, call hints and `C-c C-d' from the live kernel;
+        ;; see `jsonyter-completion-at-point'.
+        (jsonyter--completion-enable #'jsonyter--script-code-context)
         (jsonyter-mode 1))
     (jsonyter-script-clear-all-output)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--script-stale-after-change t)
+    (jsonyter--completion-disable)
     (jsonyter-mode -1)))
 
 ;;;###autoload

@@ -31,6 +31,7 @@
 (require 'subr-x)
 (require 'jsonyter-notebook)
 (require 'jsonyter-script)
+(require 'jsonyter-complete)
 
 ;;;; Org-mode source blocks (jy: sessions)
 
@@ -389,29 +390,31 @@ An alias for `jsonyter-org-run-block-and-advance'; see `jsonyter-org-run-cell'."
     (jsonyter-kernel-history (and n (prefix-numeric-value n))
                              (jsonyter--session-kernel-id session))))
 
-(defun jsonyter-org-inspect ()
-  "Show kernel documentation for the thing at point in a jy: block."
-  (interactive)
+(defun jsonyter--org-code-context ()
+  "The code context at point in an Org buffer: the body of a `jy:' block.
+nil outside such a block, in its header and footer lines, and when the
+block's session has not been created yet."
+  (when (jsonyter--org-in-jy-block-p)
+    (let ((el (org-element-at-point)))
+      (when (eq (org-element-type el) 'src-block)
+        (let* ((body-beg (save-excursion
+                           (goto-char (org-element-property :post-affiliated el))
+                           (forward-line 1)
+                           (point)))
+               (code (or (org-element-property :value el) ""))
+               (pos (- (point) body-beg))
+               (session (jsonyter--org-session-at-point 'noerror)))
+          (when (and session (>= pos 0) (<= pos (length code)))
+            (list :code code :pos pos :start body-beg :session session)))))))
+
+(defun jsonyter-org-inspect (&optional detailed)
+  "Show kernel documentation for the thing at point in a jy: block.
+With a prefix argument DETAILED, ask for more detail."
+  (interactive "P")
   (let ((session (jsonyter--org-session-at-point)))
     (unless (jsonyter--live-p session)
       (user-error "jsonyter: this block's kernel is not running"))
-    (let* ((el (org-element-at-point))
-           (body-beg (save-excursion
-                       (goto-char (org-element-property :begin el))
-                       (forward-line 1) (point)))
-           (code (or (org-element-property :value el) ""))
-           (pos (max 0 (min (length code) (- (point) body-beg))))
-           (reply (jsonyter--kernel-request
-                   "inspect"
-                   (list :kernel_id (jsonyter--session-kernel-id session)
-                         :code code :cursor_pos pos)))
-           (text (and (eq (plist-get reply :found) t)
-                      (jsonyter--mime (plist-get reply :data) :text/plain))))
-      (if (not text)
-          (message "jsonyter: no documentation found")
-        (with-help-window "*jsonyter-doc*"
-          (with-current-buffer standard-output
-            (insert (ansi-color-apply text))))))))
+    (jsonyter-inspect detailed)))
 
 ;;; Clearing shown output
 
@@ -734,6 +737,9 @@ session are left entirely to Org.
         (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions #'jsonyter--org-stale-after-change nil t)
+        ;; TAB completion, call hints and `C-c C-d' from the block's own
+        ;; kernel; see `jsonyter-completion-at-point'.
+        (jsonyter--completion-enable #'jsonyter--org-code-context)
         (jsonyter-mode 1)
         (jsonyter--org-scan-committed))
     (jsonyter-org-clear-all-output)
@@ -742,6 +748,7 @@ session are left entirely to Org.
     (setq jsonyter--org-committed nil)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--org-stale-after-change t)
+    (jsonyter--completion-disable)
     (jsonyter-mode -1)))
 
 ;;;###autoload

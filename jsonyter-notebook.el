@@ -42,6 +42,7 @@
 (declare-function jsonyter-script-clear-all-output "jsonyter-script")
 (declare-function json-encode-string "json" (string))
 (require 'jsonyter-repl)
+(require 'jsonyter-complete)
 (require 'jsonyter-attach)
 
 ;;;; Notebooks (.ipynb)
@@ -2072,6 +2073,7 @@ position the rearranged text starts at, for `jsonyter--forget-undo-after'."
     (define-key map (kbd "C-c C-x") #'jsonyter-notebook-export)
     (define-key map (kbd "C-c C-v") #'jsonyter-notebook-latex-preview-toggle)
     (define-key map (kbd "C-c C-y") #'jsonyter-sync)
+    (define-key map (kbd "C-c C-d") #'jsonyter-inspect)
     map)
   "Keymap for `jsonyter-notebook-mode'.")
 
@@ -2128,6 +2130,9 @@ font-lock, so undo and editing still see only the cell source.
         (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
         (add-hook 'after-change-functions
                   #'jsonyter--nb-stale-after-change nil t)
+        ;; TAB completion, call hints and `C-c C-d' from the live kernel,
+        ;; in code cells only; see `jsonyter-completion-at-point'.
+        (jsonyter--completion-enable #'jsonyter--nb-code-context)
         ;; Per-cell line numbers, when the user has line numbers on; see
         ;; `jsonyter-notebook-line-numbers'.
         (add-hook 'display-line-numbers-mode-hook
@@ -2145,10 +2150,26 @@ font-lock, so undo and editing still see only the cell source.
     (remove-hook 'write-contents-functions #'jsonyter-notebook-save t)
     (remove-hook 'kill-buffer-hook #'jsonyter--cleanup t)
     (remove-hook 'after-change-functions #'jsonyter--nb-stale-after-change t)
+    (jsonyter--completion-disable)
     (remove-hook 'display-line-numbers-mode-hook
                  #'jsonyter--nb-line-numbers-sync t)
     (jsonyter--nb-numbers-deactivate)
     (jsonyter-mode -1)))
+
+(defun jsonyter--nb-code-context ()
+  "The code context at point in a notebook: the code cell's source.
+nil in a markdown or raw cell, in a cell's rendered output, and between
+cells, none of which the kernel is to see."
+  (let ((cell (jsonyter--nb-cell-at)))
+    (when (and cell
+               (equal (overlay-get cell 'jsonyter-cell-type) "code"))
+      (let ((start (overlay-start cell))
+            (end (jsonyter--nb-source-end cell)))
+        (when (and (>= (point) start) (<= (point) end))
+          (list :code (buffer-substring-no-properties start end)
+                :pos (- (point) start)
+                :start start
+                :session (jsonyter--session)))))))
 
 (defun jsonyter--nb-indent-line-in-cell (indent-line &rest args)
   "Call INDENT-LINE (with ARGS) with the buffer narrowed to point's code cell.

@@ -38,6 +38,7 @@
 ;; a call to a `(setf image-property)' function that does not exist.
 (require 'image)
 (require 'jsonyter-core)
+(require 'jsonyter-complete)
 
 ;; Defined in other parts of the package, which load after this one.
 (declare-function jsonyter--nb-cells "jsonyter-notebook")
@@ -286,7 +287,7 @@ just one, otherwise a count like `:2 kernels' with a `!' if any is busy."
   (setq-local font-lock-fontify-region-function #'ignore)
   (setq-local font-lock-unfontify-region-function #'ignore)
   (setq mode-line-process '(:eval (jsonyter--mode-line-string)))
-  (add-hook 'completion-at-point-functions #'jsonyter-completion-at-point nil t)
+  (jsonyter--completion-enable #'jsonyter--repl-code-context)
   (add-hook 'kill-buffer-hook #'jsonyter--cleanup nil t)
   (jsonyter-mode 1))
 
@@ -624,7 +625,7 @@ Point is expected to be at `jsonyter--output-end'."
               (progn
                 (goto-char (point-max))
                 (insert "\n" (or (plist-get reply :indent) "")))
-            (jsonyter--execute code))))))))
+            (jsonyter--submit code))))))))
 
 (defconst jsonyter--is-complete-give-up 2
   "Consecutive `is_complete' failures before we stop asking.
@@ -674,7 +675,7 @@ of round trips rather than one per RET.  Any success resets the count."
    (t (let ((code (jsonyter--current-input)))
         (if (string-blank-p code)
             (message "jsonyter: nothing to send")
-          (jsonyter--execute code))))))
+          (jsonyter--submit code))))))
 
 (defun jsonyter-repl-newline ()
   "Insert a newline into the current input."
@@ -772,46 +773,46 @@ of round trips rather than one per RET.  Any success resets the count."
 
 ;;;; Completion and inspection
 
-(defun jsonyter-completion-at-point ()
-  "Kernel-backed `completion-at-point' function for the REPL."
-  (when (and (jsonyter--live-p)
-             (not (jsonyter--busy-p))
-             (marker-position jsonyter--input-start)
-             (>= (point) jsonyter--input-start))
-    (let* ((code (jsonyter--current-input))
-           (pos (- (point) jsonyter--input-start))
-           (reply (ignore-errors
-                    (jsonyter--kernel-request
-                     "complete"
-                     (list :kernel_id (jsonyter-current-kernel-id)
-                           :code code :cursor_pos pos)))))
-      (when (and reply (equal (plist-get reply :status) "ok"))
-        (let ((matches (plist-get reply :matches)))
-          (when matches
-            (list (+ jsonyter--input-start
-                     (or (plist-get reply :cursor_start) pos))
-                  (+ jsonyter--input-start
-                     (or (plist-get reply :cursor_end) pos))
-                  matches)))))))
+;; The machinery is shared with the notebook, script and Org surfaces
+;; and lives in jsonyter-complete.el; what is REPL-specific is where the
+;; code at point is, and `?name' help.
 
-(defun jsonyter-repl-inspect ()
-  "Show kernel documentation for the object at point."
-  (interactive)
-  (unless (jsonyter--live-p) (user-error "No live kernel in this buffer"))
-  (when (jsonyter--busy-p) (user-error "Kernel is busy"))
-  (let* ((code (jsonyter--current-input))
-         (pos (max 0 (min (length code) (- (point) jsonyter--input-start))))
-         (reply (jsonyter--kernel-request
-                 "inspect"
-                 (list :kernel_id (jsonyter-current-kernel-id)
-                       :code code :cursor_pos pos)))
-         (text (and (eq (plist-get reply :found) t)
-                    (jsonyter--mime (plist-get reply :data) :text/plain))))
+(defun jsonyter--repl-code-context ()
+  "The code context at point in a REPL: the input at the prompt.
+nil before there is a prompt, and when point is above it."
+  (when (and (marker-position jsonyter--input-start)
+             (>= (point) jsonyter--input-start))
+    (list :code (jsonyter--current-input)
+          :pos (- (point) jsonyter--input-start)
+          :start (marker-position jsonyter--input-start)
+          :session (jsonyter--session)
+          ;; TAB here is pressed on purpose.
+          :patient t)))
+
+(defun jsonyter-repl-inspect (&optional detailed)
+  "Show kernel documentation for the object at point.
+With a prefix argument DETAILED, ask for more detail."
+  (interactive "P")
+  (jsonyter-inspect detailed))
+
+(defun jsonyter--submit (code)
+  "Run CODE at the prompt: as help if it is `?name' shorthand, else in the kernel.
+See `jsonyter-help-shorthand'.  The shorthand is answered from the kernel's
+documentation without running anything; when there is none to show, CODE
+goes to the kernel as typed."
+  (let ((text (jsonyter--help-shorthand-text (jsonyter--session) code)))
     (if (not text)
-        (message "jsonyter: no documentation found")
-      (with-help-window "*jsonyter-doc*"
-        (with-current-buffer standard-output
-          (insert (ansi-color-apply text)))))))
+        (jsonyter--execute code)
+      (jsonyter--history-add code)
+      (setq jsonyter--history-index -1
+            jsonyter--history-stash nil
+            jsonyter--clear-pending nil)
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert "\n")
+        (add-text-properties jsonyter--input-start (point) '(read-only t)))
+      (jsonyter--show-doc text)
+      (jsonyter--insert-prompt))))
 
 ;;;; Kernel control
 

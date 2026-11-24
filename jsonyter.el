@@ -3,7 +3,7 @@
 ;; Author: Ethan Guthrie
 ;; Assisted-by: Claude:claude-fable-5
 ;; Assisted-by: Claude:claude-sonnet-5
-;; Version: 2.6.0
+;; Version: 2.7.0
 ;; Package-Requires: ((emacs "27.1") (org "9.4"))
 ;; Keywords: languages, processes, jupyter
 ;; URL: https://github.com/EGuthrieWasTaken/jsonyter.el
@@ -106,6 +106,7 @@
 ;;
 ;;   jsonyter-custom     user options (`M-x customize-group jsonyter') and faces
 ;;   jsonyter-core       sessions, versions, tokens, the bridge process
+;;   jsonyter-complete   kernel completion, call hints, `C-c C-d' help
 ;;   jsonyter-repl       REPL buffers, output rendering, history, completion
 ;;   jsonyter-attach     attaching to a kernel that is already running
 ;;   jsonyter-notebook   rendered .ipynb notebooks
@@ -123,6 +124,7 @@
 ;; The parts, in load order; each requires the parts it depends on.
 (require 'jsonyter-custom)
 (require 'jsonyter-core)
+(require 'jsonyter-complete)
 (require 'jsonyter-repl)
 (require 'jsonyter-attach)
 (require 'jsonyter-notebook)
