@@ -45,15 +45,16 @@ through the bridge (`jsonyter-notebook-export`), or to a plain
 Each release is a Git tag `vX.Y.Z`. Pinning to one keeps an upstream
 change from breaking your setup between updates.
 
-**Manual:** grab the single file at the tag and put it on your
-`load-path`:
+**Manual:** clone the tag and put the directory on your `load-path`. The
+package is `jsonyter.el` plus the `jsonyter-*.el` files beside it, so
+copy or clone all of them, not just one:
 
 ```bash
-curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.6.0/jsonyter.el
+git clone --depth 1 --branch v2.7.0 https://github.com/EGuthrieWasTaken/jsonyter.el
 ```
 
 ```elisp
-(add-to-list 'load-path "/path/to/jsonyter")  ; the directory holding jsonyter.el
+(add-to-list 'load-path "/path/to/jsonyter.el")  ; the directory holding jsonyter.el
 (require 'jsonyter)  ; or autoload the jsonyter-start-* commands
 ```
 
@@ -61,7 +62,7 @@ curl -O https://raw.githubusercontent.com/EGuthrieWasTaken/jsonyter.el/v2.6.0/js
 
 ```elisp
 (package-vc-install
- '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.6.0"))
+ '(jsonyter :url "https://github.com/EGuthrieWasTaken/jsonyter.el" :rev "v2.7.0"))
 ```
 
 **[elpaca](https://github.com/progfolio/elpaca):** pin the recipe to the
@@ -69,7 +70,7 @@ tag with `:ref`:
 
 ```elisp
 (use-package jsonyter
-  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.6.0"))
+  :ensure (:host github :repo "EGuthrieWasTaken/jsonyter.el" :ref "v2.7.0"))
 ```
 
 **[straight.el](https://github.com/radian-software/straight.el):** install
@@ -134,7 +135,7 @@ instead of the script:
 jsonyter Python package that `jsonyter-command` starts:
 
 ```
-jsonyter.el v2.6.0 running on jsonyter v2.1.1
+jsonyter.el v2.7.0 running on jsonyter v2.1.1
 ```
 
 `M-x jsonyter-version-full` adds what a bug report needs: the file Emacs
@@ -218,6 +219,13 @@ the command line, where `ps` would expose it to every local user:
 | `jsonyter-remote-root` | `nil` | The server's `root_dir` as an absolute path (or an alist keyed by server URL), for the case where the working-directory probe cannot place a kernel that runs outside `root_dir`. |
 | `jsonyter-download-directory` | `nil` | Default local destination for `jsonyter-download-file`; `nil` means the invoking buffer's directory. |
 | `jsonyter-remote-confirm-delete` | `t` | Whether `jsonyter-remote-dired` asks before deleting marked entries. |
+| `jsonyter-completion-position` | `first` | Put kernel completion before (`first`) or after (`last`) the language's own `completion-at-point-functions`. |
+| `jsonyter-completion-timeout` | `2` | Seconds to wait for a kernel completion outside the REPL, so an idle-triggered popup cannot freeze typing. |
+| `jsonyter-completion-backoff` | `10` | Seconds kernel completion stays quiet in a buffer after it timed out. |
+| `jsonyter-completion-arguments-first` | `t` | Inside a call, list the argument names before other candidates. |
+| `jsonyter-completion-argument-regexps` | ends in `=` | Per-language regexps telling an argument name from other candidates. |
+| `jsonyter-help-shorthand` | `t` | Answer `?name` / `??name` (and Python's `name?`) in a REPL from the kernel's documentation. |
+| `jsonyter-eldoc` | `nil` | Show the signature of the call point is in, from the kernel, through Eldoc (Emacs 28+). |
 
 ## Usage
 
@@ -236,7 +244,7 @@ Keys in the REPL buffer:
 | `RET` | Send input; if the kernel reports it incomplete (`is_complete`), continue on an indented new line instead |
 | `M-RET` / `C-RET` | Force-send even if incomplete |
 | `C-j` | Literal newline |
-| `TAB` | Kernel-backed `completion-at-point` |
+| `TAB` | Kernel-backed `completion-at-point`; inside a call, the call's arguments come first — see [Completion, call hints and help](#completion-call-hints-and-help) |
 | `M-p` / `M-n` | Input history |
 | `C-c C-c` | Interrupt the kernel |
 | `C-c C-r` | Restart the kernel, same id, all state lost (`jsonyter-restart`, aka `jsonyter-kernel-restart`) |
@@ -244,7 +252,7 @@ Keys in the REPL buffer:
 | `C-c C-l` | Reconnect to this buffer's kernel after a dropped connection |
 | `C-c C-j` | Attach this buffer to any kernel running on the server |
 | `C-c M-h` | Show the kernel's most recent commands |
-| `C-c C-d` | Documentation for the thing at point (`inspect`) |
+| `C-c C-d` | Documentation for the thing at point (`inspect`); `C-u` for more detail |
 | `C-c C-k` | Unstick a REPL stuck at "kernel is busy" — Emacs-side only, the kernel keeps running (`jsonyter-unstick`) |
 | `C-c M-o` | Clear output above the prompt |
 
@@ -257,6 +265,52 @@ genuinely working; interrupt it with `C-c C-c` if it is not.
 
 Code that calls `input()` prompts in the minibuffer (passwords use
 `read-passwd`).
+
+### Completion, call hints and help
+
+Kernel-backed completion works wherever there is code and a running
+kernel: a REPL, a notebook's code cells, `# %%` script cells and `jy:`
+blocks in Org. It is `jsonyter-completion-at-point`, on
+`completion-at-point-functions` in those buffers, so whatever you already
+use to complete (`TAB`, company, corfu) uses it. The kernel knows the live
+session — the columns of a data frame, an object you made a moment ago,
+the packages installed on a remote server — which a language server or the
+language's own completion cannot.
+
+- **It never starts a kernel**, and it says nothing while the kernel is
+  busy, so a keystroke cannot launch or stall anything. Run a cell first.
+- **Outside the REPL it gives up quickly.** An idle-triggered popup may ask
+  on every keystroke, so a kernel that does not answer within
+  `jsonyter-completion-timeout` (2 s) is left alone for
+  `jsonyter-completion-backoff` seconds. A REPL, where `TAB` is pressed on
+  purpose, waits as long as `jsonyter-request-timeout`.
+- **Order.** By default the kernel is asked first and the language's own
+  completion is the fallback when it has nothing; set
+  `jsonyter-completion-position` to `last` for the other way round. Either
+  way, when the kernel has no candidate for what you typed the next
+  function on the list gets its turn.
+- **`TAB` in a cell** is the language mode's indentation. Set
+  `tab-always-indent` to `complete` to have it indent first and complete
+  when the line is already indented.
+- **In a call, arguments come first.** Right after the `(` or a `,` of a
+  call such as `rnorm(`, the function's argument names are listed ahead of
+  the other candidates, as in RStudio; typing a prefix still reaches
+  everything. Which candidates count as arguments is
+  `jsonyter-completion-argument-regexps` (by default, those ending in `=`).
+  Candidates are annotated with the kernel's idea of their type when it
+  sends one.
+- **Signatures.** Set `jsonyter-eldoc` to `t` and Eldoc shows the
+  signature of the call point is in, from the kernel's own documentation
+  (one request per function name).
+- **Documentation.** `C-c C-d` (`jsonyter-inspect`) shows the kernel's
+  documentation for the thing at point in `*jsonyter-doc*`, in all four
+  places; `C-u C-c C-d` asks for more detail.
+- **`?name` in a REPL.** An input that is just `?rnorm` or `??rnorm` (or,
+  in Python, `len?` / `len??`) is not run: the kernel is asked for the
+  documentation and it is shown in the same window as `C-c C-d`. The
+  execution count does not move. If the kernel has no documentation for the
+  name the input is sent as typed, so nothing is lost. `jsonyter-help-shorthand`
+  turns it off or limits it to some languages.
 
 ## Output
 
@@ -439,12 +493,19 @@ first run.
 
 Cell source is ordinary buffer text, edited in the notebook language's own
 major mode — `python-mode`, `ess-r-mode`, and so on, per
-`jsonyter-notebook-language-modes` — so syntax highlighting, indentation
-and completion are the language's own. Cell prompts and cell boundaries
+`jsonyter-notebook-language-modes` — so syntax highlighting and
+indentation are the language's own, and completion is the language's
+plus the live kernel's (see [Completion, call hints and
+help](#completion-call-hints-and-help)). A cell is indented as if it were
+a file of its own: an earlier cell that ends inside a bracket does not
+make the next cell's first lines continuation lines. Cell prompts and cell boundaries
 live in **overlays**; a cell's **output is buffer text**, written in
 after its source, which is what lets point move through it — and so lets
 a plot taller than the window be scrolled through a line at a time
 rather than jumped over.
+
+Word motion (`forward-word`, `M-d`, `M-DEL`, Meow's word commands, ...)
+works inside markdown, raw and output text exactly as it does in code.
 
 Output being text does not make it part of the document. It is
 `read-only`, so no stray edit can corrupt it (selecting and copying it
@@ -475,6 +536,7 @@ refresh.
 | `C-c M-h` | Show the kernel's most recent commands |
 | `C-c M-o` / `C-c M-O` | Clear this cell's output / all output |
 | `C-c C-k` | Start the kernel explicitly |
+| `C-c C-d` | Documentation for the thing at point in a code cell (`inspect`); `C-u` for more detail |
 | `C-c C-i` / `C-c C-a` | Insert a cell below / above (`C-u` for markdown, `C-u C-u` for raw) |
 | `C-c C-w` | Delete the cell at point |
 | `C-c C-t` | Cycle the cell code → markdown → raw → code |
@@ -518,6 +580,33 @@ These were named `jsonyter-notebook-insert-cell-below` and so on through
 `M-x jsonyter-clear` clears every output in the buffer and blanks the
 execution counts, leaving the notebook as though nothing had been run. It
 does the equivalent thing in a REPL or script buffer too.
+
+### Language servers (`lsp-mode`, `eglot`)
+
+A notebook buffer is rendered text — markdown prose, code and outputs
+together — in the language's major mode, so a hook such as
+`(add-hook 'ess-r-mode-hook #'lsp)` starts a language server on it and
+hands it that text as if it were one file. jsonyter keeps the server's
+copy in step: a cell's output is written into the buffer without touching
+the undo history or the modified flag, and that write is reported to
+`before-change-functions` and `after-change-functions` like any other
+edit, so a server that follows them never holds a copy that is shorter
+than the buffer. (Before 2.7 it was not, and the line numbers a server
+was sent for everything below an executed cell were off by the height of
+the output above.)
+
+The server still sees the whole document as one file, so its
+diagnostics and formatting treat prose and output as code. To leave it out
+of notebooks, turn it off in the notebook mode's own hook:
+
+```elisp
+(add-hook 'jsonyter-notebook-mode-hook
+          (lambda () (when jsonyter-notebook-mode (lsp-disconnect))))   ; or (eglot-shutdown ...)
+```
+
+Likewise `lsp-enable-on-type-formatting` is worth setting to `nil` in
+notebooks if you keep the server, since it reformats from the server's view
+of the file.
 
 ### Cell types: code, markdown, raw
 
@@ -943,7 +1032,8 @@ variants, per `jsonyter-script-cell-regexp`).
 actually contain cell markers. Keys mirror the notebook: `C-RET` run,
 `S-RET` run and advance, `C-c C-n`/`C-c C-p` to move between cells,
 `C-c C-c` interrupt, `C-c M-O` clear all output, `C-c C-l`/`C-c C-j`
-reconnect or attach to a kernel.
+reconnect or attach to a kernel, `C-c C-d` documentation. `TAB`
+completion is kernel-backed there too, once the kernel is running.
 
 Output appears inline in overlays, so **the file's text is never
 touched** and saving stays completely ordinary. That is also the one
@@ -1034,7 +1124,7 @@ unaffected.
 | `C-c C-r` | Restart the session at point, same id, all state lost |
 | `C-c C-l` / `C-c C-j` | Reconnect / attach this session to a kernel |
 | `C-c M-h` | Kernel history for the session at point |
-| `C-c C-d` | Documentation for the thing at point (`inspect`) |
+| `C-c C-d` | Documentation for the thing at point (`inspect`); `C-u` for more detail |
 | `C-c M-o` / `C-c M-O` | Clear this block's output / all overlay output |
 | `C-c C-s` | Commit this block's output to `#+RESULTS:` |
 | `C-c C-M-s` | Commit every shown output in the buffer |
@@ -1362,6 +1452,16 @@ obsolete aliases for one release.
 Streaming and the final reply are reconciled by count: the bridge repeats
 every streamed output in the final `outputs` list, so jsonyter.el renders
 only the tail past what it already drew.
+
+## Source layout
+
+`jsonyter.el` is the entry point: it holds the package header (and the
+version) and loads the rest, so `(require 'jsonyter)` is all a
+configuration needs. The code lives in `jsonyter-*.el` beside it —
+`custom` (user options), `core` (sessions, bridge process), `complete`
+(completion and help), `repl`, `attach`, `notebook`, `latex`, `transfer`,
+`sync`, `script`, `org`, `babel`, `convert` and `export` — each requiring
+what it uses. Install the directory, not just one file.
 
 ## Tests
 

@@ -41,9 +41,9 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
 
-      - name: Attach jsonyter.el to the release
+      - name: Attach jsonyter.el and its parts (jsonyter-*.el) to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release upload "${{ github.event.release.tag_name }}" jsonyter.el
+          gh release upload "${{ github.event.release.tag_name }}" jsonyter.el jsonyter-*.el
           --clobber --repo "${{ github.repository }}"

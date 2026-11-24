@@ -959,25 +959,173 @@ then back over whitespace and comments) and skip blanks."
       (cl-incf steps))
     (and (< steps limit) steps)))
 
-(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-syntax ()
+(ert-deftest jsonyter-test-prose-and-output-keep-whitespace-and-word-syntax ()
   "Whitespace in prose and output keeps the language's own syntax.
-Every other character there is punctuation; a space, a tab and a newline
-are what the major mode's syntax table says they are."
+A letter or digit is a word constituent, so word motion has boundaries
+to stop at.  Every other character there is punctuation, so none of it
+can open a string, a comment or a pair."
   (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-prose-then-code
     (syntax-propertize (point-max))
     (let ((spans (jsonyter--nb-non-code-spans (point-min) (point-max)))
-          (checked 0))
+          (checked 0)
+          (words 0))
       (should (>= (length spans) 2))
       (dolist (span spans)
         (dolist (pos (number-sequence (car span) (1- (cdr span))))
           (let ((char (char-after pos))
                 (class (syntax-class (syntax-after pos))))
             (cl-incf checked)
-            (if (memq char '(?\s ?\t ?\n))
-                (should (eq class (syntax-class (aref (syntax-table) char))))
-              (unless (and (>= char ?0) (<= char ?9))
-                (should (eq class 1)))))))
-      (should (> checked 100)))))
+            (cond
+             ((memq char '(?\s ?\t ?\n))
+              (should (eq class (syntax-class (aref (syntax-table) char)))))
+             ((string-match-p "[[:alnum:]]" (string char))
+              (cl-incf words)
+              (should (eq class 2)))
+             (t (should (eq class 1)))))))
+      (should (> checked 100))
+      (should (> words 30)))))
+
+(defconst jsonyter-tests--notebook-open-bracket-then-code "\
+{
+ \"cells\": [
+  {\"cell_type\": \"code\", \"id\": \"aaa\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"total = compute(\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"bbb\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "Python notebook whose first cell ends inside an unclosed bracket.")
+
+(ert-deftest jsonyter-test-indentation-ignores-an-unfinished-earlier-cell ()
+  "A cell is indented as if it were a file of its own.
+An earlier cell's unclosed bracket used to be read as the context of the
+next cell, so its second line came out indented as a continuation (the
+\"RET indents too far at the start of an R cell\" report)."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (insert "x = 1\ny = 2")
+    (indent-according-to-mode)
+    (should (= (current-indentation) 0))
+    ;; Within the cell itself an open bracket still means a continuation.
+    (goto-char (point-max))
+    (insert "\nz = f(\n1")
+    (indent-according-to-mode)
+    (should (> (current-indentation) 0))
+    ;; And the first cell, which really is inside its bracket, is untouched.
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\n1")
+    (indent-according-to-mode)
+    (should (> (current-indentation) 0))))
+
+(ert-deftest jsonyter-test-indentation-is-only-narrowed-while-it-runs ()
+  "Indenting leaves the buffer widened and point where indentation put it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (goto-char (overlay-start (nth 1 (jsonyter--nb-cells))))
+    (insert "x = 1")
+    (indent-according-to-mode)
+    (should (= (point-min) 1))
+    (should (= (point-max) (1+ (buffer-size))))
+    (should (eolp))))
+
+(ert-deftest jsonyter-test-indentation-hook-leaves-with-the-mode ()
+  "Turning the notebook mode off takes the cell-narrowing advice with it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-open-bracket-then-code
+    (should (advice--p indent-line-function))
+    (jsonyter-notebook-mode -1)
+    (should-not (advice--p indent-line-function))))
+
+(defconst jsonyter-tests--notebook-word-motion "\
+{
+ \"cells\": [
+  {\"cell_type\": \"markdown\", \"id\": \"m0\", \"metadata\": {},
+   \"source\": \"Intro text with several words.\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"c0\", \"execution_count\": 1,
+   \"metadata\": {},
+   \"outputs\": [{\"output_type\": \"stream\", \"name\": \"stdout\",
+                \"text\": \"output result line\\n\"}],
+   \"source\": \"alpha = 1\\n\"},
+  {\"cell_type\": \"raw\", \"id\": \"r0\", \"metadata\": {},
+   \"source\": \"Raw payload goes here\\n\"},
+  {\"cell_type\": \"code\", \"id\": \"c1\", \"execution_count\": null,
+   \"metadata\": {}, \"outputs\": [], \"source\": \"beta = 2\\n\"},
+  {\"cell_type\": \"markdown\", \"id\": \"m1\", \"metadata\": {},
+   \"source\": \"Closing notes caf\\u00e9 r\\u00e9sum\\u00e9 42.\\n\"}
+ ],
+ \"metadata\": {\"kernelspec\": {\"display_name\": \"Python 3\",
+                            \"language\": \"python\", \"name\": \"python3\"}},
+ \"nbformat\": 4,
+ \"nbformat_minor\": 5
+}
+"
+  "Python notebook: markdown, a code cell with output, raw, code, markdown.
+Every kind of span word motion used to run straight through, and a last
+cell that has no code cell after it to run into.")
+
+(defun jsonyter-tests--word-motion-failures (phrase)
+  "Where word motion over PHRASE, a run of words in the buffer, goes wrong.
+From the start of each word `forward-word' must stop at its end, and from
+the end `backward-word' must stop at its start: the same stops they make
+in a code cell or a plain buffer.  A list of descriptions, nil when it all
+holds."
+  (let (failures)
+    (goto-char (point-min))
+    (unless (search-forward phrase nil t)
+      (error "No %S in the buffer" phrase))
+    (let ((start (match-beginning 0)))
+      (dolist (word (split-string phrase "[^[:alnum:]]+" t))
+        (goto-char start)
+        (search-forward word)
+        (let ((word-start (match-beginning 0)) (word-end (match-end 0)))
+          (goto-char word-start)
+          (forward-word)
+          (unless (= (point) word-end)
+            (push (format "forward-word from the start of %S went to %d, not %d"
+                          word (point) word-end)
+                  failures))
+          (goto-char word-end)
+          (backward-word)
+          (unless (= (point) word-start)
+            (push (format "backward-word from the end of %S went to %d, not %d"
+                          word (point) word-start)
+                  failures)))))
+    (nreverse failures)))
+
+(ert-deftest jsonyter-test-word-motion-stops-in-prose-raw-and-output ()
+  "`forward-word' and `backward-word' stop at word boundaries in any span.
+Markdown, raw and rendered output text used to have no word characters,
+so the motions ran through the whole span to the next code cell, or to the
+start or end of the document.  Covers the last cell in the buffer, which
+has no code cell after it, and words with accents."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-word-motion
+    (syntax-propertize (point-max))
+    (dolist (phrase '("Intro text with several words"   ; markdown, then code
+                      "output result line"               ; rendered output
+                      "Raw payload goes here"            ; raw
+                      "Closing notes caf\u00e9 r\u00e9sum\u00e9 42"))     ; last cell
+      (should (equal (jsonyter-tests--word-motion-failures phrase) nil)))))
+
+(ert-deftest jsonyter-test-word-motion-does-not-leave-the-cell ()
+  "`kill-word' in a markdown cell kills the word, not the code cell below.
+Killing the first word after \"Intro \" used to take the rest of the cell and
+the first word of the code cell with it."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-word-motion
+    (syntax-propertize (point-max))
+    (let ((m0 (car (jsonyter--nb-cells))))
+      (goto-char (overlay-start m0))
+      (search-forward "text")
+      (goto-char (match-beginning 0))
+      (kill-word 1)
+      (should (equal (buffer-substring-no-properties
+                      (overlay-start m0) (jsonyter--nb-source-end m0))
+                     "Intro  with several words.\n"))
+      (goto-char (point-min))
+      (should (search-forward "alpha = 1" nil t)))))
 
 (ert-deftest jsonyter-test-walking-back-over-a-cell-boundary-stops ()
   "A backward line walk from the first line of a cell reaches the top.
@@ -8584,6 +8732,603 @@ Everything is bound or restored, so the rest of the suite is untouched."
                  (push (format "%s reads as instructions to an implementer" sym) problems)))))))))
     (should (equal (sort problems #'string<) nil))))
 
+;;;; Change tracking: a mirror of the buffer stays in step with output writes
+
+(defun jsonyter-tests--track-changes ()
+  "Make a mirror of this buffer that follows `after-change-functions'.
+What `lsp-mode' and `eglot' do to keep a language server's copy of the
+buffer: start from the text as it is, and on each change replace LEN
+characters at BEG with the text now there.  Returns a function that
+gives the mirror's current text.  `before-change-functions' calls are
+checked to arrive with the text still as the mirror has it."
+  (let ((mirror (buffer-substring-no-properties (point-min) (point-max)))
+        (pending nil))
+    (add-hook 'before-change-functions
+              (lambda (beg end)
+                (setq pending (list beg end))
+                ;; The text BEG..END is still in the buffer, as the mirror has it.
+                (should (equal (buffer-substring-no-properties beg end)
+                               (substring mirror (1- beg) (1- end)))))
+              nil t)
+    (add-hook 'after-change-functions
+              (lambda (beg end len)
+                (should (equal (car pending) beg))
+                (setq mirror (concat (substring mirror 0 (1- beg))
+                                     (buffer-substring-no-properties beg end)
+                                     (substring mirror (+ (1- beg) len)))))
+              nil t)
+    (lambda () mirror)))
+
+(ert-deftest jsonyter-test-output-writes-reach-change-trackers ()
+  "A language server's copy of the notebook stays equal to the buffer.
+Output is written into the buffer silently, which skips the change hooks,
+so a mirror kept up to date from them used to fall behind by the height
+of every output written: lines typed after a cell ran were then sent to
+the server at line numbers its copy did not have."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (let ((mirror (jsonyter-tests--track-changes))
+         (cells (jsonyter--nb-cells)))
+     (should (equal (funcall mirror) (buffer-substring-no-properties (point-min) (point-max))))
+     ;; A cell with output gains more, then has it replaced, then removed.
+     (dolist (text '("[1] 1 2 3\nline two\nline three\n" "short\n" ""))
+       (jsonyter--nb-set-output
+        (nth 1 cells)
+        (if (string-empty-p text) ""
+          (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text text))))
+       (should (equal (funcall mirror)
+                      (buffer-substring-no-properties (point-min) (point-max)))))
+     ;; The cell goes: its output first, silently, then its source.
+     (jsonyter--nb-set-output
+      (nth 1 cells)
+      (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "goes\nwith the cell\n")))
+     (jsonyter--nb-excise-cell (nth 1 cells))
+     (should (equal (funcall mirror)
+                    (buffer-substring-no-properties (point-min) (point-max)))))))
+
+(ert-deftest jsonyter-test-output-writes-do-not-dirty-or-undo ()
+  "Telling change trackers about a cell's output does not make it an edit.
+The buffer is not marked modified and nothing is added to the undo list."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (set-buffer-modified-p nil)
+   (setq buffer-undo-list nil)
+   (jsonyter--nb-set-output
+    (nth 1 (jsonyter--nb-cells))
+    (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "fresh\n")))
+   (should-not (buffer-modified-p))
+   (should (null buffer-undo-list))))
+
+(ert-deftest jsonyter-test-reported-output-writes-keep-the-outputs-faces ()
+  "Running the change hooks over a write does not let font-lock repaint output.
+`jit-lock' hangs its refontification off `after-change-functions', which
+an output write now runs; the output's own faces and its read-only block
+must come out of that exactly as they went in."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+    (font-lock-mode 1)
+    (font-lock-ensure)
+    (let ((cell (jsonyter-tests--cell 0)))
+      (jsonyter--nb-set-output
+       cell (jsonyter--nb-render-string
+             (list :type "stream" :name "stderr" :text "oops 'quoted \"text\"\n")))
+      (let* ((beg (marker-position (overlay-get cell 'jsonyter-source-end)))
+             (end (overlay-end cell))
+             (faces (lambda ()
+                      (cl-loop for pos from beg below end
+                               collect (get-text-property pos 'face)))))
+        (let ((before (funcall faces)))
+          (should (cl-some #'identity before))
+          (font-lock-ensure)
+          (should (equal (funcall faces) before))
+          (should (get-text-property beg 'read-only))
+          (should (get-text-property (1- end) 'read-only)))))))
+
+(ert-deftest jsonyter-test-a-failing-change-hook-does-not-stop-output ()
+  "A tracker that signals cannot keep a cell's output from appearing."
+  (jsonyter-tests--with-notebook-json jsonyter-tests--notebook-with-outputs
+   (add-hook 'after-change-functions (lambda (&rest _) (error "boom")) nil t)
+   (let ((cell (nth 1 (jsonyter--nb-cells))))
+     (jsonyter--nb-set-output
+      cell (jsonyter--nb-render-string (list :type "stream" :name "stdout" :text "still here\n")))
+     (should (string-match-p "still here"
+                             (buffer-substring-no-properties (point-min) (point-max)))))))
+
+
+;;;; Kernel completion, call hints and `?name' help
+
+(defvar jsonyter-tests--requests nil
+  "Requests the fake kernel has received, newest first, as (METHOD . PARAMS).")
+
+(defvar jsonyter-tests--kernel-busy nil
+  "Whether the fake kernel is busy.")
+
+(defmacro jsonyter-tests--with-fake-kernel (replies &rest body)
+  "Run BODY with the kernel stubbed: live, idle unless busy, and answering.
+REPLIES is an alist from a request's method to its reply, or to a
+function of the request's parameters.  Requests are recorded in
+`jsonyter-tests--requests'.  Starting a kernel or a bridge is an error."
+  (declare (indent 1) (debug t))
+  `(let ((jsonyter-tests--requests nil))
+     (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) t))
+               ((symbol-function 'jsonyter--busy-p)
+                (lambda (&rest _) jsonyter-tests--kernel-busy))
+               ((symbol-function 'jsonyter--request-sync)
+                (lambda (method params &rest _)
+                  (push (cons method params) jsonyter-tests--requests)
+                  (let ((reply (cdr (assoc method ,replies))))
+                    (if (functionp reply) (funcall reply params) reply))))
+               ((symbol-function 'jsonyter--kernel-request)
+                (lambda (method params) (jsonyter--request-sync method params)))
+               ((symbol-function 'jsonyter--connect-kernel)
+                (lambda (&rest _) (error "completion must not start a kernel")))
+               ((symbol-function 'jsonyter--ensure-live-bridge)
+                (lambda (&rest _) (error "completion must not start a bridge"))))
+       ,@body)))
+
+(defun jsonyter-tests--attach-fake-session ()
+  "Give this buffer a session bound to a kernel id, as a run would have."
+  (setq-local jsonyter--session-key '("python" . ""))
+  (setf (jsonyter--session-kernel-id (jsonyter--session-put jsonyter--session-key))
+        "kid"))
+
+(defmacro jsonyter-tests--with-kernel-notebook (&rest body)
+  "Like `jsonyter-tests--with-notebook', with a kernel session attached."
+  (declare (indent 0) (debug t))
+  `(jsonyter-tests--with-notebook
+     (jsonyter-tests--attach-fake-session)
+     ,@body))
+
+(defmacro jsonyter-tests--with-kernel-notebook-json (json &rest body)
+  "Like `jsonyter-tests--with-notebook-json', with a kernel session attached."
+  (declare (indent 1) (debug t))
+  `(jsonyter-tests--with-notebook-json ,json
+     (jsonyter-tests--attach-fake-session)
+     ,@body))
+
+(defconst jsonyter-tests--print-matches
+  '(:status "ok" :matches ("print" "printf") :cursor_start 6 :cursor_end 9)
+  "A kernel's answer to completing `pri' as the second line of a cell.")
+
+(defun jsonyter-tests--kill-doc-buffer ()
+  "Kill the help buffer the documentation commands use."
+  (when (get-buffer "*jsonyter-doc*") (kill-buffer "*jsonyter-doc*")))
+
+(ert-deftest jsonyter-test-notebook-completes-in-a-code-cell ()
+  "TAB in a code cell completes from the live kernel, as the REPL does.
+The kernel gets the cell's code and point's offset into it, and the
+result replaces the span the kernel named."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\npri")
+    (jsonyter-tests--with-fake-kernel `(("complete" . ,jsonyter-tests--print-matches))
+      (let ((capf (jsonyter-completion-at-point)))
+        (should capf)
+        (should (equal (nth 2 capf) '("print" "printf")))
+        (should (= (nth 0 capf) (- (point) 3)))
+        (should (= (nth 1 capf) (point)))
+        (should (eq (plist-get (nthcdr 3 capf) :exclusive) 'no))
+        (let ((request (car jsonyter-tests--requests)))
+          (should (equal (car request) "complete"))
+          (should (equal (plist-get (cdr request) :code) "x = 1\npri\n"))
+          (should (= (plist-get (cdr request) :cursor_pos) 9)))))))
+
+(ert-deftest jsonyter-test-notebook-completion-leaves-other-spans-alone ()
+  "No completion, and no question to the kernel, in markdown or in output."
+  (jsonyter-tests--with-kernel-notebook-json jsonyter-tests--notebook-with-outputs
+    (jsonyter-tests--with-fake-kernel `(("complete" . ,jsonyter-tests--print-matches))
+      (let ((cell (jsonyter-tests--cell 0)))
+        ;; Inside the rendered output of the first code cell.
+        (goto-char (+ (marker-position (overlay-get cell 'jsonyter-source-end)) 3))
+        (should (null (jsonyter-completion-at-point))))
+      (should (null jsonyter-tests--requests))))
+  (jsonyter-tests--with-kernel-notebook
+    (jsonyter-tests--with-fake-kernel `(("complete" . ,jsonyter-tests--print-matches))
+      ;; The third cell is markdown.
+      (goto-char (+ (overlay-start (jsonyter-tests--cell 2)) 2))
+      (should (null (jsonyter-completion-at-point)))
+      (should (null jsonyter-tests--requests)))))
+
+(ert-deftest jsonyter-test-completion-never-starts-a-kernel-or-waits-on-a-busy-one ()
+  "No kernel running means no completion, not a kernel; busy means none too."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (jsonyter-tests--with-fake-kernel `(("complete" . ,jsonyter-tests--print-matches))
+      (let ((jsonyter-tests--kernel-busy t))
+        (should (null (jsonyter-completion-at-point))))
+      (cl-letf (((symbol-function 'jsonyter--live-p) (lambda (&rest _) nil)))
+        (should (null (jsonyter-completion-at-point))))
+      (should (null jsonyter-tests--requests)))))
+
+(ert-deftest jsonyter-test-completion-gives-up-quietly-and-backs-off ()
+  "A kernel that does not answer in time is left alone for a while.
+Outside the REPL an idle-triggered UI may be asking, so one timeout must
+not become a freeze on every keystroke."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (let ((calls 0) (jsonyter-completion-backoff 10))
+      (jsonyter-tests--with-fake-kernel
+          `(("complete" . ,(lambda (_) (cl-incf calls) (error "timed out"))))
+        (should (null (jsonyter-completion-at-point)))
+        (should (= calls 1))
+        (should (null (jsonyter-completion-at-point)))
+        (should (= calls 1))
+        (should (= (plist-get (cdr (car jsonyter-tests--requests)) :timeout)
+                   jsonyter-completion-timeout))
+        ;; When the pause is over it asks again.
+        (setq jsonyter--completion-backoff-until (- (float-time) 1))
+        (should (null (jsonyter-completion-at-point)))
+        (should (= calls 2))))))
+
+(ert-deftest jsonyter-test-repl-completion-is-patient-and-never-backs-off ()
+  "In a REPL TAB was pressed on purpose: the long timeout, and no pause."
+  (jsonyter-tests--with-live-repl
+    (insert "pri")
+    (let ((jsonyter-request-timeout 15))
+      (jsonyter-tests--with-fake-kernel
+          '(("complete" . (:status "ok" :matches ("print" "printf")
+                           :cursor_start 0 :cursor_end 3)))
+        (let ((capf (jsonyter-completion-at-point)))
+          (should (equal (nth 2 capf) '("print" "printf")))
+          (should (= (nth 0 capf) jsonyter--input-start)))))
+    (jsonyter-tests--with-fake-kernel
+        `(("complete" . ,(lambda (_) (error "timed out"))))
+      (should (null (jsonyter-completion-at-point)))
+      (should (null jsonyter--completion-backoff-until)))))
+
+(ert-deftest jsonyter-test-script-completes-in-a-cell-but-not-on-its-marker ()
+  "`# %%' cells complete from the kernel; the marker line is not code."
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (jsonyter--session-put jsonyter--session-key)
+    (insert "# %%\nprint(1)\n# %%\npri\n")
+    (jsonyter-tests--with-fake-kernel
+        '(("complete" . (:status "ok" :matches ("print" "printf")
+                         :cursor_start 0 :cursor_end 3)))
+      (goto-char (1- (point-max)))
+      (let ((capf (jsonyter-completion-at-point)))
+        (should (equal (nth 2 capf) '("print" "printf")))
+        (should (= (nth 1 capf) (point)))
+        (should (equal (plist-get (cdr (car jsonyter-tests--requests)) :code)
+                       "pri\n")))
+      (goto-char (point-min))
+      (should (null (jsonyter-completion-at-point))))))
+
+(ert-deftest jsonyter-test-org-completes-in-a-jy-block-only ()
+  "Inside a `jy:' block body, completion uses the block's kernel.
+On the block's header and footer lines, and outside blocks, it does not."
+  (jsonyter-tests--with-org-file
+      "Some prose.\n#+begin_src python :session jy:main\npri\n#+end_src\n"
+    (jsonyter--session-put '("python" . "main"))
+    (jsonyter-tests--with-fake-kernel
+        '(("complete" . (:status "ok" :matches ("print" "printf")
+                         :cursor_start 0 :cursor_end 3)))
+      (goto-char (point-min))
+      (search-forward "pri")
+      (let ((capf (jsonyter-completion-at-point)))
+        (should (equal (nth 2 capf) '("print" "printf")))
+        (should (= (nth 1 capf) (point)))
+        (should (= (nth 0 capf) (- (point) 3)))
+        (should (equal (plist-get (cdr (car jsonyter-tests--requests)) :code)
+                       "pri\n")))
+      (setq jsonyter-tests--requests nil)
+      (goto-char (point-min))
+      (should (null (jsonyter-completion-at-point)))
+      (search-forward "#+begin_src")
+      (should (null (jsonyter-completion-at-point)))
+      (goto-char (point-max))
+      (should (null (jsonyter-completion-at-point)))
+      (should (null jsonyter-tests--requests)))))
+
+(ert-deftest jsonyter-test-completion-position-is-an-option ()
+  "Kernel completion goes before the language's own, or after it."
+  (with-temp-buffer
+    (let ((jsonyter-completion-position 'first))
+      (jsonyter--completion-enable #'ignore))
+    (should (eq (car completion-at-point-functions) 'jsonyter-completion-at-point))
+    (jsonyter--completion-disable)
+    (should-not (memq 'jsonyter-completion-at-point completion-at-point-functions)))
+  (with-temp-buffer
+    (let ((jsonyter-completion-position 'last))
+      (jsonyter--completion-enable #'ignore))
+    (should (eq (car (last completion-at-point-functions))
+                'jsonyter-completion-at-point))))
+
+(ert-deftest jsonyter-test-call-scanning ()
+  "Which parenthesis a call is in, and whether an argument is being named."
+  (should (= (jsonyter--call-open-paren "rnorm(" 6) 5))
+  (should (null (jsonyter--call-open-paren "(1 + " 5)))     ; grouping, not a call
+  (should (= (jsonyter--call-open-paren "f(a, b" 6) 1))
+  (should (= (jsonyter--call-open-paren "f(')', " 7) 1))    ; a string's bracket
+  (should (= (jsonyter--call-open-paren "f(# (\nx, " 9) 1))   ; a comment's
+  (should (= (jsonyter--call-open-paren "x[f(" 4) 3))
+  (should (null (jsonyter--call-open-paren "x[1, " 5)))     ; a subscript
+  (should (= (jsonyter--call-open-paren "f(a)(" 5) 4))      ; the call of a result
+  (should (null (jsonyter--call-open-paren "f(a) + " 7)))   ; closed again
+  (should (jsonyter--completing-argument-p "print(se" 6))
+  (should (jsonyter--completing-argument-p "print(1, se" 9))
+  (should (jsonyter--completing-argument-p "print(\n  se" 9))
+  (should-not (jsonyter--completing-argument-p "x = se" 4))
+  (should-not (jsonyter--completing-argument-p "print(a=se" 8))    ; a value
+  (should-not (jsonyter--completing-argument-p "print(len(x)se" 12)))
+
+(defun jsonyter-tests--sorted (capf candidates)
+  "CANDIDATES as CAPF's completion table would have them displayed."
+  (let ((sort (completion-metadata-get
+               (completion-metadata "" (nth 2 capf) nil)
+               'display-sort-function)))
+    (if sort (funcall sort candidates) candidates)))
+
+(ert-deftest jsonyter-test-completion-in-a-call-puts-arguments-first ()
+  "Right after `(' or `,' the call's argument names lead, as in RStudio.
+Everything else is still offered."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\nprint(")
+    (let ((matches '("abs" "all" "sep=" "end=" "set")))
+      (jsonyter-tests--with-fake-kernel
+          `(("complete" . (:status "ok" :matches ,matches
+                           :cursor_start 12 :cursor_end 12)))
+        (let ((capf (jsonyter-completion-at-point)))
+          (should (functionp (nth 2 capf)))
+          (should (equal (sort (all-completions "" (nth 2 capf)) #'string<)
+                         (sort (copy-sequence matches) #'string<)))
+          (should (equal (jsonyter-tests--sorted capf matches)
+                         '("sep=" "end=" "abs" "all" "set")))
+          ;; A prefix still reaches the other names.
+          (should (equal (all-completions "se" (nth 2 capf)) '("sep=" "set"))))
+        ;; Off, or outside a call, the order is the kernel's.
+        (let ((jsonyter-completion-arguments-first nil))
+          (should (equal (nth 2 (jsonyter-completion-at-point)) matches)))))
+    ;; Not in a call, an argument-looking name gets no special place.
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\npri")
+    (jsonyter-tests--with-fake-kernel
+        '(("complete" . (:status "ok" :matches ("sep=" "print")
+                         :cursor_start 6 :cursor_end 9)))
+      (should (equal (nth 2 (jsonyter-completion-at-point)) '("sep=" "print"))))))
+
+(ert-deftest jsonyter-test-argument-regexps-are-per-language ()
+  "R's kernel completes `sep = ', Python's `sep='; either is an argument."
+  (should (string-match-p (jsonyter--argument-regexp "python") "sep="))
+  (should (string-match-p (jsonyter--argument-regexp "r") "sep = "))
+  (should-not (string-match-p (jsonyter--argument-regexp "r") "sep"))
+  (let ((jsonyter-completion-argument-regexps
+         '(("julia" . "!\\'") (t . "=\\'"))))
+    (should (string-match-p (jsonyter--argument-regexp "Julia") "push!"))
+    (should-not (string-match-p (jsonyter--argument-regexp "python") "push!"))))
+
+(ert-deftest jsonyter-test-completion-shows-the-kernels-types ()
+  "Each candidate is annotated with its type, and carries its signature."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\npri")
+    (jsonyter-tests--with-fake-kernel
+        `(("complete"
+           . (:status "ok" :matches ("print" "printf") :cursor_start 6 :cursor_end 9
+              :metadata (:_jupyter_types_experimental
+                         ((:start 6 :end 9 :text "print" :type "function"
+                           :signature "(*args, sep=' ')")
+                          (:start 6 :end 9 :text "printf" :type "instance"))))))
+      (let* ((capf (jsonyter-completion-at-point))
+             (props (nthcdr 3 capf)))
+        (should (equal (funcall (plist-get props :annotation-function) "print")
+                       " function"))
+        (should (equal (funcall (plist-get props :company-docsig) "print")
+                       "(*args, sep=' ')"))
+        (should (null (funcall (plist-get props :company-docsig) "printf")))
+        (should (null (funcall (plist-get props :annotation-function) "other")))))))
+
+;;;; Documentation from every surface
+
+(ert-deftest jsonyter-test-notebook-and-script-bind-doc-lookup ()
+  "`C-c C-d' shows documentation in notebooks and scripts, as in REPLs and Org."
+  (should (eq (lookup-key jsonyter-notebook-mode-map (kbd "C-c C-d")) 'jsonyter-inspect))
+  (should (eq (lookup-key jsonyter-script-mode-map (kbd "C-c C-d")) 'jsonyter-inspect)))
+
+(ert-deftest jsonyter-test-inspect-in-a-notebook-cell ()
+  "`jsonyter-inspect' asks about the code cell at point, with more detail on request."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (forward-char 2)
+    (jsonyter-tests--with-fake-kernel
+        '(("inspect" . (:found t :data (:text/plain "Signature: len(obj)"))))
+      (jsonyter-inspect)
+      (let ((params (cdr (car jsonyter-tests--requests))))
+        (should (equal (plist-get params :code) "x = 1\n"))
+        (should (= (plist-get params :cursor_pos) 2))
+        (should-not (plist-member params :detail_level)))
+      (with-current-buffer "*jsonyter-doc*"
+        (should (string-match-p "len(obj)" (buffer-string))))
+      (jsonyter-inspect '(4))
+      (should (= (plist-get (cdr (car jsonyter-tests--requests)) :detail_level) 1))
+      (jsonyter-tests--kill-doc-buffer)
+      ;; Not in code the kernel sees: a markdown cell.
+      (goto-char (+ (overlay-start (jsonyter-tests--cell 2)) 2))
+      (should-error (jsonyter-inspect) :type 'user-error))))
+
+(ert-deftest jsonyter-test-inspect-in-a-script-cell ()
+  (with-temp-buffer
+    (python-mode)
+    (jsonyter-script-mode 1)
+    (setq-local jsonyter--session-key '("python" . ""))
+    (jsonyter--session-put jsonyter--session-key)
+    (insert "# %%\nlen(x)\n")
+    (goto-char (point-min))
+    (search-forward "len")
+    (jsonyter-tests--with-fake-kernel
+        '(("inspect" . (:found t :data (:text/plain "script docs"))))
+      (jsonyter-inspect)
+      (should (equal (plist-get (cdr (car jsonyter-tests--requests)) :code) "len(x)\n"))
+      (should (= (plist-get (cdr (car jsonyter-tests--requests)) :cursor_pos) 3))
+      (jsonyter-tests--kill-doc-buffer))))
+
+;;;; Call signatures in the echo area
+
+(ert-deftest jsonyter-test-eldoc-shows-the-signature-of-the-call-at-point ()
+  "Inside `print(', the signature is the first line of the kernel's answer.
+Asked once per function: a second look at the same call is not a request."
+  (jsonyter-tests--with-kernel-notebook
+    (goto-char (point-min))
+    (end-of-line)
+    (insert "\nprint(1, ")
+    (let (shown)
+      (jsonyter-tests--with-fake-kernel
+          '(("inspect" . (:found t :data (:text/plain
+                                          "Signature: print(*args, sep=' ')\nDocstring: more"))))
+        (should (jsonyter-eldoc-function
+                 (lambda (doc &rest args) (setq shown (cons doc args)))))
+        (should (equal (car shown) "print(*args, sep=' ')"))
+        (should (equal (plist-get (cdr shown) :thing) "print"))
+        (let ((params (cdr (car jsonyter-tests--requests))))
+          ;; Asked about the function: point just after its `('.
+          (should (equal (plist-get params :code) "x = 1\nprint(1, \n"))
+          (should (= (plist-get params :cursor_pos) 12)))
+        (setq shown nil)
+        (jsonyter-eldoc-function (lambda (doc &rest _) (setq shown doc)))
+        (should (equal shown "print(*args, sep=' ')"))
+        (should (= (length jsonyter-tests--requests) 1))
+        ;; Outside a call there is nothing to say and nothing to ask.
+        (goto-char (point-min))
+        (setq shown nil)
+        (should-not (jsonyter-eldoc-function (lambda (doc &rest _) (setq shown doc))))
+        (should (null shown))
+        (should (= (length jsonyter-tests--requests) 1))))))
+
+(ert-deftest jsonyter-test-eldoc-is-opt-in ()
+  "Eldoc is registered only when `jsonyter-eldoc' asks for it."
+  (skip-unless (boundp 'eldoc-documentation-functions))
+  (with-temp-buffer
+    (jsonyter--completion-enable #'ignore)
+    (should-not (memq 'jsonyter-eldoc-function eldoc-documentation-functions))
+    (jsonyter--completion-disable)
+    (let ((jsonyter-eldoc t))
+      (jsonyter--completion-enable #'ignore))
+    (should (memq 'jsonyter-eldoc-function eldoc-documentation-functions))
+    (jsonyter--completion-disable)
+    (should-not (memq 'jsonyter-eldoc-function eldoc-documentation-functions))))
+
+;;;; `?name' help in a REPL
+
+(ert-deftest jsonyter-test-help-shorthand-parsing ()
+  "Only a lone `?name' (or Python's `name?') is shorthand."
+  (should (equal (jsonyter--help-shorthand-parse "?rnorm" "r") '("rnorm" . 0)))
+  (should (equal (jsonyter--help-shorthand-parse "??rnorm" "r") '("rnorm" . 1)))
+  (should (equal (jsonyter--help-shorthand-parse "  ? stats::rnorm  " "R") '("stats::rnorm" . 0)))
+  (should (equal (jsonyter--help-shorthand-parse "?len" "python") '("len" . 0)))
+  (should (equal (jsonyter--help-shorthand-parse "len?" "python") '("len" . 0)))
+  (should (equal (jsonyter--help-shorthand-parse "np.mean??" "python") '("np.mean" . 1)))
+  ;; The suffix form is IPython's alone.
+  (should (null (jsonyter--help-shorthand-parse "rnorm?" "r")))
+  ;; Anything but the bare form goes to the kernel.
+  (dolist (code '("?" "??" "?rnorm(3)" "x ? y" "?a\n?b" "?a\nx <- 1" "help(rnorm)"
+                  "x <- ?rnorm" "print(1)" "" "a?b"))
+    (should (null (jsonyter--help-shorthand-parse code "r")))
+    (should (null (jsonyter--help-shorthand-parse code "python")))))
+
+(ert-deftest jsonyter-test-help-shorthand-can-be-restricted ()
+  (let ((jsonyter-help-shorthand nil))
+    (should (null (jsonyter--help-shorthand-parse "?len" "python"))))
+  (let ((jsonyter-help-shorthand '("r")))
+    (should (jsonyter--help-shorthand-parse "?rnorm" "R"))
+    (should (null (jsonyter--help-shorthand-parse "?len" "python")))))
+
+(ert-deftest jsonyter-test-repl-answers-question-mark-help-from-the-kernel ()
+  "`?len' shows the documentation and runs nothing.
+Nothing is sent to be executed, the prompt comes back with the same
+execution count, and the input is in the history."
+  (jsonyter-tests--with-live-repl
+    (insert "?len")
+    (let (executed requests)
+      (jsonyter-tests--with-fake-kernel
+          '(("inspect" . (:found t :data (:text/plain "len(obj, /)\nReturn the number"))))
+        (cl-letf (((symbol-function 'jsonyter--execute)
+                   (lambda (code) (setq executed code))))
+          (jsonyter-repl-send))
+        (setq requests jsonyter-tests--requests))
+      (should (null executed))
+      (should (equal (mapcar #'car requests) '("inspect")))
+      (should (equal (plist-get (cdar requests) :code) "len"))
+      (should (= (plist-get (cdar requests) :detail_level) 0))
+      (should (string-match-p "In \\[1\\]: \\'" (buffer-string)))
+      (should (equal (jsonyter--current-input) ""))
+      (should (equal (car jsonyter--history) "?len"))
+      (should (= jsonyter--execution-count 0))
+      (with-current-buffer "*jsonyter-doc*"
+        (should (string-match-p "Return the number" (buffer-string))))
+      (jsonyter-tests--kill-doc-buffer))))
+
+(ert-deftest jsonyter-test-repl-help-asks-for-the-name-and-detail ()
+  "`??name' in an R REPL asks the kernel about `name' with more detail."
+  (jsonyter-tests--with-live-repl
+    (setf (jsonyter--session-language (jsonyter--session)) "r")
+    (insert "??rnorm")
+    (let (request)
+      (jsonyter-tests--with-fake-kernel
+          '(("inspect" . (:found t :data (:text/plain "rnorm help"))))
+        (jsonyter-repl-send)
+        (setq request (cl-find "inspect" jsonyter-tests--requests
+                               :key #'car :test #'equal)))
+      (should (equal (plist-get (cdr request) :code) "rnorm"))
+      (should (= (plist-get (cdr request) :cursor_pos) 5))
+      (should (= (plist-get (cdr request) :detail_level) 1))
+      (jsonyter-tests--kill-doc-buffer))))
+
+(ert-deftest jsonyter-test-repl-help-falls-back-to-sending-the-input ()
+  "When the kernel has no documentation, `?name' is run as typed.
+SAS answers `inspect' with `aborted', and a kernel may not know a name."
+  (dolist (reply (list '(:found :json-false) '(:status "aborted") nil))
+    (jsonyter-tests--with-live-repl
+      (insert "?mystery")
+      (let (executed)
+        (jsonyter-tests--with-fake-kernel
+            `(("inspect" . ,reply))
+          (cl-letf (((symbol-function 'jsonyter--execute)
+                     (lambda (code) (setq executed code))))
+            (jsonyter-repl-send)))
+        (should (equal executed "?mystery"))
+        (should-not (get-buffer "*jsonyter-doc*")))))
+  ;; An error from the kernel is the same.
+  (jsonyter-tests--with-live-repl
+    (insert "?mystery")
+    (let (executed)
+      (jsonyter-tests--with-fake-kernel
+          `(("inspect" . ,(lambda (_) (error "boom"))))
+        (cl-letf (((symbol-function 'jsonyter--execute)
+                   (lambda (code) (setq executed code))))
+          (jsonyter-repl-send)))
+      (should (equal executed "?mystery")))))
+
+(ert-deftest jsonyter-test-repl-help-leaves-other-input-alone ()
+  "Input that is not bare help shorthand is never asked about."
+  (jsonyter-tests--with-live-repl
+    (insert "help(len)")
+    (let (executed)
+      (jsonyter-tests--with-fake-kernel
+          '(("inspect" . (:found t :data (:text/plain "never shown"))))
+        (cl-letf (((symbol-function 'jsonyter--execute)
+                   (lambda (code) (setq executed code))))
+          (jsonyter-repl-send))
+        (should (null jsonyter-tests--requests)))
+      (should (equal executed "help(len)")))))
+
+(ert-deftest jsonyter-test-repl-help-is-off-when-disabled ()
+  (jsonyter-tests--with-live-repl
+    (insert "?len")
+    (let (executed (jsonyter-help-shorthand nil))
+      (jsonyter-tests--with-fake-kernel
+          '(("inspect" . (:found t :data (:text/plain "never shown"))))
+        (cl-letf (((symbol-function 'jsonyter--execute)
+                   (lambda (code) (setq executed code))))
+          (jsonyter-repl-send))
+        (should (null jsonyter-tests--requests)))
+      (should (equal executed "?len")))))
+
 ;;;; Version
 
 (defun jsonyter-tests--header-version ()
@@ -8592,6 +9337,18 @@ Everything is bound or restored, so the rest of the suite is untouched."
     (insert-file-contents (locate-library "jsonyter.el" t) nil 0 4096)
     (and (re-search-forward "^;; Version: *\\([0-9][^ \t\n]*\\)" nil t)
          (match-string 1))))
+
+(defconst jsonyter-tests--parts
+  '("custom" "core" "complete" "repl" "attach" "notebook" "latex" "transfer" "sync"
+    "script" "org" "babel" "convert" "export")
+  "The parts jsonyter.el is split into, in the order it loads them.
+Each is the file \"jsonyter-NAME.el\".")
+
+(defun jsonyter-tests--part-files ()
+  "File names of jsonyter.el and every part it loads."
+  (cons "jsonyter.el"
+        (mapcar (lambda (part) (format "jsonyter-%s.el" part))
+                jsonyter-tests--parts)))
 
 (defmacro jsonyter-tests--with-fake-python (dir script &rest body)
   "Run BODY with DIR bound to a directory holding an executable \"fakepy\".
@@ -8615,6 +9372,53 @@ where there is no POSIX shell."
   (with-temp-file path (insert first-lines "\nprint('entry point')\n"))
   (set-file-modes path #o755))
 
+(ert-deftest jsonyter-test-every-part-is-loaded-by-the-main-file ()
+  "jsonyter.el requires every part, and the list above names every part."
+  (let ((on-disk (mapcar (lambda (f) (and (string-match "\\`jsonyter-\\(.+\\)\\.el\\'" f)
+                                          (match-string 1 f)))
+                         (directory-files
+                          (file-name-directory (locate-library "jsonyter.el" t))
+                          nil "\\`jsonyter-.+\\.el\\'"))))
+    (should (equal (sort (copy-sequence on-disk) #'string<)
+                   (sort (copy-sequence jsonyter-tests--parts) #'string<))))
+  (with-temp-buffer
+    (insert-file-contents (locate-library "jsonyter.el" t))
+    (dolist (part jsonyter-tests--parts)
+      (goto-char (point-min))
+      (should (re-search-forward (format "^(require 'jsonyter-%s)$" part) nil t)))))
+
+(ert-deftest jsonyter-test-each-part-loads-on-its-own ()
+  "`(require 'jsonyter-PART)' works in a fresh Emacs, with nothing else loaded.
+A part may use another only after requiring it (or declaring its functions),
+so loading a part never depends on which one was loaded first.  Also checks
+that its user options landed in the `jsonyter' customization group."
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (dir (file-name-directory (locate-library "jsonyter.el" t))))
+    (dolist (part jsonyter-tests--parts)
+      (with-temp-buffer
+        (should (eq 0 (call-process
+                       emacs nil t nil "--batch" "-Q" "-L" dir
+                       "--eval" (format "(progn (require 'jsonyter-%s) (princ \"ok\"))" part))))
+        (should (equal (buffer-string) "ok"))))))
+
+(ert-deftest jsonyter-test-every-option-is-in-the-jsonyter-group ()
+  "No user option or face is left out of M-x customize-group RET jsonyter."
+  (let (loose)
+    (mapatoms
+     (lambda (sym)
+       (when (and (string-prefix-p "jsonyter" (symbol-name sym))
+                  (not (string-prefix-p "jsonyter-tests" (symbol-name sym)))
+                  ;; Mode hooks are never group members, here or anywhere.
+                  (not (string-suffix-p "-hook" (symbol-name sym)))
+                  (or (get sym 'standard-value) (get sym 'face-defface-spec))
+                  (not (let ((type (if (get sym 'standard-value) 'custom-variable 'custom-face))
+                             found)
+                         (dolist (g (get 'jsonyter 'custom-group))
+                           (when (and (eq (car g) sym) (eq (cadr g) type)) (setq found t)))
+                         found)))
+         (push sym loose))))
+    (should (equal (sort loose #'string<) nil))))
+
 (ert-deftest jsonyter-test-version-is-the-files-header ()
   "`jsonyter-version' (the variable) is the \"Version:\" header, not a copy."
   (should (string-match-p "\\`[0-9]+\\.[0-9]+\\.[0-9]+\\'" jsonyter-version))
@@ -8622,18 +9426,20 @@ where there is no POSIX shell."
 
 (ert-deftest jsonyter-test-version-is-baked-into-the-compiled-file ()
   "A compiled copy knows its version with the source gone.
-The version names the code that is loaded, so it is read when the file is
-compiled and not from the file on disk when it is asked for."
+The version names the code that is loaded, so it is read when the files are
+compiled and not from jsonyter.el on disk when it is asked for."
   (let* ((dir (make-temp-file "jsonyter-test-elc-" t))
          (emacs (expand-file-name invocation-name invocation-directory))
-         (source (expand-file-name "jsonyter.el" dir)))
+         (sources (mapcar (lambda (f) (expand-file-name f dir))
+                          (jsonyter-tests--part-files))))
     (unwind-protect
         (progn
-          (copy-file (locate-library "jsonyter.el" t) source)
-          (should (eq 0 (call-process emacs nil nil nil "--batch" "-Q" "-L" dir
-                                      "--eval" (format "(byte-compile-file %S)" source))))
-          (should (file-exists-p (expand-file-name "jsonyter.elc" dir)))
-          (delete-file source)
+          (dolist (source sources)
+            (copy-file (locate-library (file-name-nondirectory source) t) source))
+          (should (eq 0 (apply #'call-process emacs nil nil nil "--batch" "-Q" "-L" dir
+                               "-f" "batch-byte-compile" sources)))
+          (should (file-exists-p (expand-file-name "jsonyter-core.elc" dir)))
+          (mapc #'delete-file sources)
           (with-temp-buffer
             (should (eq 0 (call-process emacs nil t nil "--batch" "-Q" "-L" dir
                                         "--eval" "(progn (require 'jsonyter) (princ jsonyter-version))")))
@@ -8643,7 +9449,7 @@ compiled and not from the file on disk when it is asked for."
 (ert-deftest jsonyter-test-version-commands-are-autoloaded ()
   "`M-x jsonyter-version' works before anything else has loaded the package."
   (with-temp-buffer
-    (insert-file-contents (locate-library "jsonyter.el" t))
+    (insert-file-contents (locate-library "jsonyter-core.el" t))
     (dolist (name '("jsonyter-version" "jsonyter-version-full"))
       (goto-char (point-min))
       (should (re-search-forward
